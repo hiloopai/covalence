@@ -1,0 +1,40 @@
+# Keeps main identical in hiloopai/covalence and hiloopai/covalence-dev, in
+# both directions. Each repository pushes its main to the other with a deploy
+# key that may write only there. A diverged main fails the job; it never forces.
+name: Sync main
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-main
+
+jobs:
+  sync:
+    # The organization and the two repositories by id, so forks and renames
+    # never push anywhere: 1419632160 is covalence, 1382624821 covalence-dev.
+    if: >-
+      github.repository_owner_id == '291932505' &&
+      contains(fromJSON('["1419632160", "1382624821"]'), github.repository_id)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - env:
+          DEPLOY_KEY: ${{ secrets.SYNC_DEPLOY_KEY }}
+          TARGET: ${{ format('{0}/{1}', github.repository_owner, github.repository_id == '1419632160' && 'covalence-dev' || 'covalence') }}
+          SSH_AUTH_SOCK: /tmp/ssh-agent.sock
+        run: |
+          ssh-agent -a "$SSH_AUTH_SOCK" > /dev/null
+          ssh-add - <<< "$DEPLOY_KEY"
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git push "git@github.com:$TARGET.git" HEAD:refs/heads/main
