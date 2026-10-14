@@ -1,0 +1,24 @@
+[package]
+name = "covalence-blob-trait"
+description = "The blob trait: bytes read by range"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/covalence-blob-trait"
+keywords = ["blob", "bytes", "range", "cid", "content-addressing"]
+categories = ["data-structures"]
+publish = true
+
+[dependencies]
+covalence-lib-cid.workspace = true
+covalence-lib-data.workspace = true
+covalence-lib-error.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

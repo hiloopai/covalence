@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve the toolchain and Cargo configuration from this checkout too.
+cd -- "$repo_root"
+exec cargo run --quiet --locked --manifest-path "$repo_root/Cargo.toml" \
+  --package covalence-tools-glu --bin glu -- "$@"

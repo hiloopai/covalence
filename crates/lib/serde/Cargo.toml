@@ -1,0 +1,21 @@
+[package]
+name = "covalence-lib-serde"
+description = "Serialization traits and derives for Covalence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/covalence-lib-serde"
+keywords = ["serde", "serialization"]
+categories = ["encoding"]
+publish = true
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

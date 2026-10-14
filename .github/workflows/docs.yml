@@ -1,0 +1,125 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, reopened, synchronize, closed]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@b85815f71a6de0ddee80b8a80a98d43f4bcc66c7 # v31
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.34.8/install
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the Rust docs
+        run: nix develop --no-update-lock-file --command ./bin/glu doc
+      # rustdoc writes no workspace index without unstable flags, so list the
+      # crates on a small root page.
+      - name: Assemble the site
+        run: |
+          mkdir site
+          cp -R target/doc site/rust
+          rm -f site/rust/.lock
+          touch site/.nojekyll
+          {
+            echo '<!doctype html>'
+            echo '<meta charset="utf-8">'
+            echo '<title>Covalence docs</title>'
+            echo '<h1>Covalence docs</h1>'
+            echo "<p>Built from ${GITHUB_SHA}.</p>"
+            echo '<h2>Rust crates</h2>'
+            echo '<ul>'
+            for index in site/rust/*/index.html; do
+              crate="$(basename "$(dirname "$index")")"
+              echo "<li><a href=\"rust/$crate/\">$crate</a></li>"
+            done
+            echo '</ul>'
+          } > site/index.html
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docs
+          path: site
+          include-hidden-files: true
+          if-no-files-found: error
+
+  # Previews live on the gh-pages branch under pr/pr-<number>/. Pushing works
+  # whether or not Pages is enabled; the link only resolves once it is.
+  preview:
+    needs: build
+    if: >-
+      !cancelled()
+      && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && (needs.build.result == 'success' || github.event.action == 'closed')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pages: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - if: github.event.action != 'closed'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: docs
+          path: site
+      # Private Pages sites have a generated address, so ask for it. Before
+      # Pages is enabled this finds nothing and the action guesses a public one.
+      - name: Find the Pages address
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! url="$(gh api "repos/$GH_REPO/pages" --jq .html_url)"; then
+            url=""
+          fi
+          url="${url#https://}"
+          echo "base=${url%/}" >> "$GITHUB_OUTPUT"
+      - uses: rossjrw/pr-preview-action@ffa7509e91a3ec8dfc2e5536c4d5c1acdf7a6de9 # v1.8.1
+        with:
+          source-dir: site
+          umbrella-dir: pr
+          pages-base-url: ${{ steps.pages.outputs.base }}
+          qr-code: false
+
+  publish:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: docs
+          path: site
+      - uses: JamesIves/github-pages-deploy-action@fa24774553152dd7873cd16ebd8d959b010c5445 # v4.9.0
+        with:
+          folder: site
+          branch: gh-pages
+          clean-exclude: /pr/

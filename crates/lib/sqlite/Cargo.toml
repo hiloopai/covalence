@@ -1,0 +1,24 @@
+[package]
+name = "covalence-lib-sqlite"
+description = "SQLite for Covalence, built from source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/covalence-lib-sqlite"
+keywords = ["sqlite", "rusqlite"]
+categories = ["database"]
+publish = true
+
+[features]
+hooks = ["rusqlite/hooks"]
+
+[dependencies]
+rusqlite = { version = "0.40.2", features = ["blob", "bundled", "functions"] }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

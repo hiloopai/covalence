@@ -1,0 +1,20 @@
+[package]
+name = "covalence-lib-cli"
+description = "Shared command-line parsing tools for Covalence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["cli", "clap"]
+categories = ["command-line-interface"]
+publish = false
+
+[dependencies]
+clap.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

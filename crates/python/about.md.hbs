@@ -1,0 +1,19 @@
+# Third-party licenses
+
+The `covalence` Python package compiles these Rust crates into its native
+module. Their licenses follow, each with the crates that use it.
+
+{{#each licenses}}
+## {{{name}}}
+
+Used by:
+
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}
+{{/each}}
+
+```text
+{{{text}}}
+```
+
+{{/each}}

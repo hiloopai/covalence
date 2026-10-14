@@ -1,0 +1,5 @@
+repo = "https://github.com/multiformats/multicodec"
+commit = "8d9e9b3b3d376ee86179fc6c866f6e56f74fa167"
+path = "table.csv"
+retrieved = "2026-10-05"
+license = "MIT"

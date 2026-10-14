@@ -1,0 +1,25 @@
+# Read the Docs builds the Python API docs from docs/python.
+# https://docs.readthedocs.com/platform/stable/config-file/v2.html
+version: 2
+
+build:
+  os: ubuntu-24.04
+  tools:
+    python: "3.13"
+    # Read the Docs installs Rust with rustup and offers 1.96 at most; the
+    # job below installs the toolchain rust-toolchain.toml pins.
+    rust: "1.96"
+  jobs:
+    pre_install:
+      - rustup toolchain install
+
+python:
+  install:
+    # pip builds the package with maturin, pinned in its pyproject.toml.
+    - method: pip
+      path: crates/python
+    - requirements: docs/python/requirements.txt
+
+sphinx:
+  configuration: docs/python/conf.py
+  fail_on_warning: true

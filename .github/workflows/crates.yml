@@ -1,0 +1,47 @@
+name: Crates
+
+# A v<version> tag publishes the crates to crates.io; python-wheels.yml
+# publishes the Python package from the same tag.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # Only hiloopai/covalence publishes; forks and other copies never do.
+  publish:
+    if: github.repository == 'hiloopai/covalence'
+    runs-on: ubuntu-24.04
+    # A first release of 17 new crates waits about 2 hours for crates.io's
+    # rate limit; see .github/scripts/publish-crates.py.
+    timeout-minutes: 240
+    # CARGO_REGISTRY_TOKEN is a secret of this environment, whose deployment
+    # rule admits only v* tags, so jobs on other refs cannot read it.
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Check the tag against the workspace version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(python3 -I -c \
+            'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["workspace"]["package"]["version"])' \
+            Cargo.toml)"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match the workspace version $version"
+            exit 1
+          fi
+      - uses: cachix/install-nix-action@b85815f71a6de0ddee80b8a80a98d43f4bcc66c7 # v31
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.34.8/install
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      # Publishes every member without `publish = false`, in dependency order,
+      # skipping versions already on crates.io and retrying after rate limits.
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: nix develop --no-update-lock-file --command python3 -I .github/scripts/publish-crates.py

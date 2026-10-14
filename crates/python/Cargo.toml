@@ -1,0 +1,36 @@
+[package]
+name = "covalence-python"
+description = "Python bindings for Covalence, built as the covalence package"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+extension-module = ["covalence-lib-python/extension-module"]
+
+[dependencies]
+blake3.workspace = true
+covalence-blob-trait.workspace = true
+covalence-cas-kv.workspace = true
+covalence-cas-memory.workspace = true
+covalence-cas-sqlite.workspace = true
+covalence-cas-trait.workspace = true
+covalence-kv-memory.workspace = true
+covalence-kv-s3.workspace = true
+covalence-kv-trait.workspace = true
+covalence-lib-cid.workspace = true
+covalence-lib-dasl = { workspace = true, features = ["json"] }
+covalence-lib-data.workspace = true
+covalence-lib-python = { path = "../lib/python" }
+pep440_rs = { version = "0.7.3", default-features = false }
+tempfile = "3"
+
+[lints]
+workspace = true

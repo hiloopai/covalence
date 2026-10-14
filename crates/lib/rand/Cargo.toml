@@ -1,0 +1,25 @@
+[package]
+name = "covalence-lib-rand"
+description = "Randomness facade"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/covalence-lib-rand"
+keywords = ["random", "rand"]
+categories = ["algorithms"]
+publish = true
+
+[dependencies]
+rand = "0.9.5"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+# wasm32-unknown-unknown builds target JavaScript hosts.
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

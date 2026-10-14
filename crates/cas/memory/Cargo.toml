@@ -1,0 +1,27 @@
+[package]
+name = "covalence-cas-memory"
+description = "An in-memory content-addressed store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/covalence-cas-memory"
+keywords = ["cas", "content-addressing", "cid", "storage", "in-memory"]
+categories = ["database-implementations"]
+publish = true
+
+[dependencies]
+covalence-cas-trait.workspace = true
+covalence-lib-cid.workspace = true
+covalence-lib-dasl.workspace = true
+covalence-lib-data.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+pollster = "1.0.1"

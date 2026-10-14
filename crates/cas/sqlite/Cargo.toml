@@ -1,0 +1,32 @@
+[package]
+name = "covalence-cas-sqlite"
+description = "A content-addressed store in SQLite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/covalence-cas-sqlite"
+keywords = ["cas", "content-addressing", "cid", "storage", "sqlite"]
+categories = ["database-implementations"]
+publish = true
+
+[dependencies]
+covalence-cas-trait.workspace = true
+covalence-lib-cid.workspace = true
+covalence-lib-dasl.workspace = true
+covalence-lib-data.workspace = true
+covalence-lib-error.workspace = true
+covalence-lib-sqlite.workspace = true
+
+[dev-dependencies]
+covalence-lib-rand.workspace = true
+covalence-lib-sqlite = { workspace = true, features = ["hooks"] }
+pollster = "1.0.1"
+tempfile = "3.27.0"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

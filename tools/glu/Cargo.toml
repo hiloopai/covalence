@@ -1,0 +1,25 @@
+[package]
+name = "covalence-tools-glu"
+description = "Small development command dispatcher for Covalence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["task-runner", "development"]
+categories = ["development-tools"]
+publish = false
+
+[[bin]]
+name = "glu"
+path = "src/main.rs"
+
+[dependencies]
+covalence-lib-cli.workspace = true
+covalence-lib-error = { workspace = true, features = ["fancy"] }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

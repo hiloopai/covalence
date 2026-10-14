@@ -1,0 +1,23 @@
+[package]
+name = "covalence-kv-trait"
+description = "The key-value store trait"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/covalence-kv-trait"
+keywords = ["key-value", "kv", "storage"]
+categories = ["database"]
+publish = true
+
+[dependencies]
+covalence-lib-dasl.workspace = true
+covalence-lib-data.workspace = true
+covalence-lib-error.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

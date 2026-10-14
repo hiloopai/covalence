@@ -1,0 +1,38 @@
+[package]
+name = "covalence-cas-kv"
+description = "A content-addressed store over a key-value store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/covalence-cas-kv"
+keywords = ["cas", "content-addressing", "cid", "storage", "key-value"]
+categories = ["database-implementations"]
+publish = true
+
+[dependencies]
+blake3.workspace = true
+covalence-cas-trait.workspace = true
+covalence-kv-trait.workspace = true
+covalence-lib-cid.workspace = true
+covalence-lib-dasl.workspace = true
+covalence-lib-data.workspace = true
+covalence-lib-error.workspace = true
+data-encoding = "2.11.1"
+
+[dev-dependencies]
+covalence-kv-memory.workspace = true
+covalence-kv-s3.workspace = true
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+pollster = "1.0.1"
+s3s = "0.17"
+s3s-fs = "0.17"
+tempfile = "3"
+tokio = { version = "1", features = ["net", "rt", "sync"] }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

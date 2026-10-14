@@ -1,0 +1,27 @@
+[package]
+name = "covalence-cas-trait"
+description = "The content-addressed storage traits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/covalence-cas-trait"
+keywords = ["cas", "content-addressing", "cid", "storage"]
+categories = ["database"]
+publish = true
+
+[dependencies]
+covalence-lib-cid.workspace = true
+covalence-lib-dasl.workspace = true
+covalence-lib-data.workspace = true
+covalence-lib-error.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+pollster = "1.0.1"

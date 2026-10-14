@@ -1,0 +1,26 @@
+[package]
+name = "covalence-kv-memory"
+description = "An in-memory key-value store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/covalence-kv-memory"
+keywords = ["key-value", "kv", "storage", "in-memory"]
+categories = ["database-implementations"]
+publish = true
+
+[dependencies]
+covalence-kv-trait.workspace = true
+covalence-lib-dasl.workspace = true
+covalence-lib-data.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+pollster = "1.0.1"

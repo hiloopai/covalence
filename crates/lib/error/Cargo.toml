@@ -1,0 +1,26 @@
+[package]
+name = "covalence-lib-error"
+description = "Shared typed errors and diagnostic tools for Covalence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/covalence-lib-error"
+keywords = ["error", "diagnostics", "snafu", "miette"]
+categories = ["rust-patterns"]
+publish = true
+
+[features]
+default = []
+fancy = ["miette/fancy"]
+
+[dependencies]
+miette.workspace = true
+snafu.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
