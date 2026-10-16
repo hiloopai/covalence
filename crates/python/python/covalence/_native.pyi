@@ -428,18 +428,20 @@ class Cas:
           memory.
         """
     def put_from(self, cid: Cid, chunks: Iterable[_BytesLike], length: int) -> Cid:
-        """Store `length` bytes from the iterable `chunks`, which must hash to `cid`, and return its raw BLAKE3 CID.
+        """Store a block identified by `cid` from `chunks` and return its raw BLAKE3 CID.
 
         For bytes that arrive in pieces, such as a request body, without
         holding them all at once.
 
         - `cid` must be a BLAKE3 CID of any codec; another hash raises
           ValueError.
-        - `chunks` yields bytes or bytearray. It is read in order, and once
-          more after `length` bytes, to check that it ends there.
-        - Bytes that do not hash to `cid` raise IntegrityError; `chunks`
-          holding fewer or more than `length` bytes raises ValueError; an
-          exception from `chunks` propagates as it is. Each stores nothing.
+        - `chunks` yields bytes or bytearray. Before a new block is stored,
+          its bytes must match `length` and `cid`, and the iterable must end there.
+        - A store may return an existing block without consuming all of
+          `chunks`. Unread bytes and source errors are not checked.
+        - While consuming input, a hash mismatch raises IntegrityError; too
+          few or too many bytes raises ValueError; a source exception propagates
+          unchanged. These failures publish no new block.
           If cleanup also fails, raises StoreError with the source exception
           as its `__cause__` and the cleanup failure in its message.
         - `Cas.kv` over `Kv.s3` streams the bytes up in parts, holding about as

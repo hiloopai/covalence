@@ -146,12 +146,15 @@ pip install covalence==0.1.0.dev3
 
 - `Cas.put_file(path)` stores a file and returns its raw BLAKE3 `Cid`, as
   `put` does.
-- `Cas.put_from(cid, chunks, length)` stores `length` bytes from an iterable
-  of bytes, such as a request body, which must hash to the BLAKE3 `cid`, and
-  returns its raw BLAKE3 `Cid`. It checks that `chunks` ends after `length`
-  bytes before the last of them is stored, so bytes that do not hash to
-  `cid` (`IntegrityError`), too few or too many bytes (`ValueError`), or an
-  exception from `chunks` (raised as it is) store nothing.
+- `Cas.put_from(cid, chunks, length)` stores a block from an iterable of
+  bytes, such as a request body, and returns its raw BLAKE3 `Cid`. Before a
+  new block is stored, its bytes must match `length` and the BLAKE3 `cid`,
+  and `chunks` must end there. A store may return an existing block without
+  consuming all the input; unread bytes and source errors are not checked.
+  While consuming input, a hash mismatch (`IntegrityError`), too few or too
+  many bytes (`ValueError`), or a source exception publish no new block.
+  Source exceptions propagate unchanged unless cleanup also fails, in which
+  case `StoreError` reports that failure with the source as its `__cause__`.
 - `Cas.get_file(cid, path)` writes the block to a file and returns its
   length, or `None` if missing.
 - `put_file`, `put_from` and `get_file` stream on `Cas.kv` over `Kv.s3`,
