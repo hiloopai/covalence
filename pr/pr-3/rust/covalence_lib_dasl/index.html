@@ -1,0 +1,94 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="covalence-lib-dasl"><title>covalence_lib_dasl - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="covalence_lib_dasl" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01) (built from a source tarball)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate covalence_lib_dasl</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../covalence_lib_dasl/index.html">covalence_<wbr>lib_<wbr>dasl</a><span class="version">0.1.0-dev.3</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#covalence-lib-dasl" title="covalence-lib-dasl">covalence-lib-dasl</a><ul><li><a href="#terms" title="Terms">Terms</a></li><li><a href="#values" title="Values">Values</a></li><li><a href="#encoding-and-decoding" title="Encoding and decoding">Encoding and decoding</a></li><li><a href="#cids-and-facts" title="CIDs and facts">CIDs and facts</a></li><li><a href="#json" title="JSON">JSON</a></li><li><a href="#specs-and-tests" title="Specs and tests">Specs and tests</a></li><li><a href="#example" title="Example">Example</a></li></ul></li></ul><h3><a href="#structs">Crate Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#constants" title="Constants">Constants</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>covalence_<wbr>lib_<wbr>dasl</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/covalence_lib_dasl/lib.rs.html#1-176">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><h2 id="covalence-lib-dasl"><a class="doc-anchor" href="#covalence-lib-dasl">§</a>covalence-lib-dasl</h2>
+<p>DASL values and their DRISL encoding.</p>
+<h3 id="terms"><a class="doc-anchor" href="#terms">§</a>Terms</h3>
+<ul>
+<li><a href="https://dasl.ing/">DASL</a> is a small family of specs for content-addressed
+data.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc8949">CBOR</a> is a binary format like
+JSON. Each item starts with a head giving its type and a length or value.</li>
+<li><a href="https://dasl.ing/drisl.html">DRISL</a> is DASL’s binary encoding, a strict
+subset of CBOR.</li>
+<li>A <a href="https://dasl.ing/cid.html">DASL CID</a> names bytes by their hash and codec
+(DRISL or raw). <a href="https://dasl.ing/bdasl.html">BDASL</a> adds BLAKE3 hashes.</li>
+<li>An <code>Event</code> is one CBOR head and its payload. Lists and maps give their length
+up front.</li>
+<li>A <code>Fact</code> (from <code>covalence-lib-cid</code>) is bytes already checked against their
+CID.</li>
+<li>The CAS is the content-addressed store (<code>covalence-cas-trait</code>), which reads
+stored bytes back as facts with <code>get_fact</code>.</li>
+<li><a href="https://atproto.com/specs/data-model">ATProto</a> is the AT Protocol, used by
+Bluesky.</li>
+</ul>
+<h3 id="values"><a class="doc-anchor" href="#values">§</a>Values</h3>
+<ul>
+<li><code>Value</code> is the DASL data model without floats. Links are <code>Cid&lt;Bdasl&gt;</code> from
+<code>covalence-lib-cid</code>.</li>
+<li>Integers are i64. <code>decode</code> rejects DRISL integers outside that range.</li>
+<li>Floats give <code>Error::Float</code>, following the ATProto data model.</li>
+<li>Nesting is limited to <code>MAX_DEPTH</code> (126). Dropping a much deeper hand-built
+value can still overflow the stack.</li>
+<li>There is no size limit. Callers bound input size.</li>
+</ul>
+<h3 id="encoding-and-decoding"><a class="doc-anchor" href="#encoding-and-decoding">§</a>Encoding and decoding</h3>
+<ul>
+<li><code>Value::encode_to</code> streams DRISL to any <code>io::Write</code>, such as a hasher, after
+checking the whole value. <code>Value::encode</code> collects it into a <code>Vec</code>.</li>
+<li><code>Value::decode</code> reads exactly one DRISL value. It rejects:
+<ul>
+<li>non-minimal heads and indefinite lengths;</li>
+<li>unsorted or duplicate map keys;</li>
+<li>tags other than 42, and CIDs that are not DASL CIDs;</li>
+<li>trailing bytes.</li>
+</ul>
+</li>
+<li><code>Value::events</code> lists a value’s events in the order <code>encode</code> writes them.
+<code>Event::encode</code> writes one event.</li>
+<li><code>Builder</code> checks events and builds the value. <code>decode</code> reads bytes as events
+into a <code>Builder</code>, so both reject the same input.</li>
+<li><code>Value::links</code> lists links in the order <code>encode</code> writes them. <code>Links::new</code>
+lists the links in any sequence of events.</li>
+</ul>
+<h3 id="cids-and-facts"><a class="doc-anchor" href="#cids-and-facts">§</a>CIDs and facts</h3>
+<ul>
+<li><code>Value::cid</code> is the BLAKE3 DRISL CID of the encoding.</li>
+<li><code>Value::from_fact</code> decodes a checked <code>Fact</code>, such as one from the CAS
+<code>get_fact</code>:
+<ul>
+<li>DRISL decodes;</li>
+<li>raw bytes are <code>Value::Bytes</code>;</li>
+<li>other codecs give <code>Error::Codec</code>.</li>
+</ul>
+</li>
+<li><code>Value::from_cid_bytes</code> checks bytes against a CID first.</li>
+</ul>
+<h3 id="json"><a class="doc-anchor" href="#json">§</a>JSON</h3>
+<p>The <code>json</code> feature adds <code>Value::to_json</code> and <code>Value::from_json</code>.</p>
+<ul>
+<li>Links are <code>{"$link": "&lt;CID&gt;"}</code>.</li>
+<li>Bytes are unpadded <code>{"$bytes": "..."}</code>; padded bytes are rejected.</li>
+<li>Any other map with a <code>$link</code> or <code>$bytes</code> key is rejected.</li>
+<li><code>to_json</code> writes keys in DRISL order.</li>
+<li>In <code>from_json</code>, fractions, exponents and <code>-0</code> give <code>Error::Float</code>, and
+integers outside i64 give <code>Error::Json</code>.</li>
+</ul>
+<h3 id="specs-and-tests"><a class="doc-anchor" href="#specs-and-tests">§</a>Specs and tests</h3>
+<ul>
+<li>Follows the 2026-10-01 editions of <a href="https://dasl.ing/drisl.html">DRISL</a>,
+<a href="https://dasl.ing/cid.html">DASL CIDs</a> and <a href="https://dasl.ing/bdasl.html">BDASL</a>.</li>
+<li>Tests run 85 vectors from the <a href="https://github.com/hyphacoop/dasl-testing">DASL test suite</a>
+(see <code>tests/fixtures</code>), seven of them valid DRISL that must be rejected:
+integers outside i64 and floats.</li>
+<li>Tests also replay <code>tests/vectors</code>: CID parsing and printing, and DRISL and
+JSON decoding and encoding, against our Lean model.</li>
+</ul>
+<h3 id="example"><a class="doc-anchor" href="#example">§</a>Example</h3>
+<p><a href="enum.Value.html#method.from_fact" title="associated function covalence_lib_dasl::Value::from_fact"><code>Value::from_fact</code></a> decodes a checked [<code>Fact</code>], and <a href="enum.Value.html#method.cid" title="method covalence_lib_dasl::Value::cid"><code>Value::cid</code></a> names a
+value.</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>covalence_lib_cid::Fact;
+<span class="kw">use </span>covalence_lib_dasl::Value;
+<span class="kw">let </span>value = Value::List(<span class="macro">vec!</span>[Value::Integer(<span class="number">42</span>), Value::String(<span class="string">"hello"</span>.into())]);
+<span class="macro">assert_eq!</span>(Value::decode(<span class="kw-2">&amp;</span>value.encode()<span class="question-mark">?</span>)<span class="question-mark">?</span>, value);
+<span class="kw">let </span>fact = Fact::new(value.cid()<span class="question-mark">?</span>, value.encode()<span class="question-mark">?</span>.into())<span class="question-mark">?</span>;
+<span class="macro">assert_eq!</span>(Value::from_fact(<span class="kw-2">&amp;</span>fact)<span class="question-mark">?</span>, value);</code></pre></div></div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.Builder.html" title="struct covalence_lib_dasl::Builder">Builder</a></dt><dd>Builds a value from events pushed one at a time, as <a href="enum.Value.html#method.decode" title="associated function covalence_lib_dasl::Value::decode"><code>Value::decode</code></a> does.</dd><dt><a class="struct" href="struct.Events.html" title="struct covalence_lib_dasl::Events">Events</a></dt><dd>Iterator returned by <a href="enum.Value.html#method.events" title="method covalence_lib_dasl::Value::events"><code>Value::events</code></a>.</dd><dt><a class="struct" href="struct.Links.html" title="struct covalence_lib_dasl::Links">Links</a></dt><dd>The links in a sequence of events, in order, as <a href="enum.Value.html#method.links" title="method covalence_lib_dasl::Value::links"><code>Value::links</code></a> lists them.</dd></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.Error.html" title="enum covalence_lib_dasl::Error">Error</a></dt><dd>Errors from encoding and decoding values.</dd><dt><a class="enum" href="enum.Event.html" title="enum covalence_lib_dasl::Event">Event</a></dt><dd>One step of a value, in the order <a href="enum.Value.html#method.encode" title="method covalence_lib_dasl::Value::encode"><code>Value::encode</code></a> writes it.</dd><dt><a class="enum" href="enum.Value.html" title="enum covalence_lib_dasl::Value">Value</a></dt><dd>A DASL value. There are no floats.</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.MAX_DEPTH.html" title="constant covalence_lib_dasl::MAX_DEPTH">MAX_<wbr>DEPTH</a></dt><dd>The deepest nesting of lists and maps that encoding and decoding accept.
+A scalar has depth 0 and <code>[]</code> has depth 1.</dd></dl></section></div></main></body></html>

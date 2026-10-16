@@ -1,0 +1,95 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The content-addressed storage traits."><title>covalence_cas_trait - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="covalence_cas_trait" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01) (built from a source tarball)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate covalence_cas_trait</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../covalence_cas_trait/index.html">covalence_<wbr>cas_<wbr>trait</a><span class="version">0.1.0-dev.3</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#enums">Crate Items</a></h3><ul class="block"><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#traits" title="Traits">Traits</a></li><li><a href="#functions" title="Functions">Functions</a></li><li><a href="#types" title="Type Aliases">Type Aliases</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>covalence_<wbr>cas_<wbr>trait</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/covalence_cas_trait/lib.rs.html#1-574">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The content-addressed storage traits.</p>
+<p>A content-addressed store (CAS) keeps blocks of bytes under keys computed
+from the bytes. Keys are usually <a href="https://dasl.ing/cid.html">CIDs</a>: a CID
+names a hash function, the hash’s digest of the bytes, and a codec saying
+how to read them. A [<code>Fact</code>] is bytes checked to hash to a CID’s digest.</p>
+<ul>
+<li><a href="https://dasl.ing/">DASL</a> (Data-Addressed Structures &amp; Links) is a small
+set of specs for content-addressed data: CIDs, and DRISL for structured
+values. A DASL value here is null, a boolean, an integer, bytes, a
+string, a list, a map with string keys, or a CID link.</li>
+<li><a href="https://dasl.ing/drisl.html">DRISL</a> is DASL’s deterministic CBOR
+encoding, so equal values encode to equal bytes and get equal CIDs.</li>
+</ul>
+<p>Each operation is its own trait, generic over the key type, so a store can
+answer several key types:</p>
+<ul>
+<li><a href="trait.Get.html" title="trait covalence_cas_trait::Get"><code>Get</code></a> and <a href="trait.Put.html" title="trait covalence_cas_trait::Put"><code>Put</code></a> are sync; <a href="trait.AsyncGet.html" title="trait covalence_cas_trait::AsyncGet"><code>AsyncGet</code></a> and <a href="trait.AsyncPut.html" title="trait covalence_cas_trait::AsyncPut"><code>AsyncPut</code></a> are their
+async twins. As in Python, each async method is its sync name prefixed
+with <code>a</code>: <code>get</code> and <code>aget</code>, <code>put</code> and <code>aput</code>.</li>
+<li><a href="trait.Cas.html" title="trait covalence_cas_trait::Cas"><code>Cas</code></a> combines them over [<code>Cid</code>]. Hold a store as <code>Arc&lt;dyn Cas&gt;</code> (or
+take <code>&amp;dyn Cas</code>) rather than being generic; <a href="trait.Cas.html#method.into_dyn" title="method covalence_cas_trait::Cas::into_dyn"><code>Cas::into_dyn</code></a> makes one.</li>
+<li><a href="trait.Cas.html#method.info" title="method covalence_cas_trait::Cas::info"><code>Cas::info</code></a> and <a href="trait.Cas.html#method.stats" title="method covalence_cas_trait::Cas::stats"><code>Cas::stats</code></a> describe a store, for debugging, as a
+DASL value.</li>
+<li>Stores live in their own crates, such as <code>covalence-cas-memory</code>.</li>
+</ul>
+<p>Reads come at three levels:</p>
+<ul>
+<li><code>get_unchecked</code>: the fast path; the store need not check its answer.</li>
+<li><code>get</code>: what the store vouches for. Checking means different things for
+different stores (a table of facts needs none, a remote store hashes), so
+stores override it; by default it is <code>get_unchecked</code>.</li>
+<li><code>get_fact</code>, in <a href="trait.GetExt.html" title="trait covalence_cas_trait::GetExt"><code>GetExt</code></a>: always checked, and cannot be overridden. It
+checks that the store’s [<code>Fact</code>] has the key’s hash and digest, then
+returns it under exactly the key asked for. A fact proves only the hash
+and digest; the codec says how to read the bytes, so asking for a DRISL
+CID gives a fact for that DRISL CID, however the store keeps the bytes.</li>
+</ul>
+<p><a href="trait.AsyncGet.html" title="trait covalence_cas_trait::AsyncGet"><code>AsyncGet</code></a> and <a href="trait.AsyncGetExt.html" title="trait covalence_cas_trait::AsyncGetExt"><code>AsyncGetExt</code></a> mirror these.</p>
+<p>Sizes and byte ranges come at the first two levels, as <code>size_unchecked</code>
+and <code>get_range_unchecked</code>, and <code>size</code> and <code>get_range</code>. By default they
+fetch the whole value and measure or slice it; stores with native ranges
+override them. Nothing in these traits checks a size or a range against
+its key, as <code>get_fact</code> checks bytes.</p>
+<p><a href="trait.Cas.html#method.put_from" title="method covalence_cas_trait::Cas::put_from"><code>Cas::put_from</code></a> and <a href="trait.Cas.html#method.get_to" title="method covalence_cas_trait::Cas::get_to"><code>Cas::get_to</code></a> move a block between the store and a
+reader or writer, checked; by default they hold it in memory, and stores
+that can stream override them.</p>
+<p>A store needs only <code>get_unchecked</code>, <code>aget_unchecked</code>, <code>put</code> and <code>aput</code>;
+the defaults supply the rest. Here a store answers with corrupted bytes:
+<code>get</code> passes them on, as it does by default, but <code>get_fact</code> catches them.</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>std::{collections::HashMap, sync::RwLock};
+
+<span class="kw">use </span>covalence_cas_trait::{
+    AsyncGet, AsyncPut, Cas, CasFuture, Error, Get, GetExt, Put, ready,
+};
+<span class="kw">use </span>covalence_lib_cid::{Blake3, Cid};
+<span class="kw">use </span>covalence_lib_data::Bytes;
+
+<span class="attr">#[derive(Default)]
+</span><span class="kw">struct </span>Map(RwLock&lt;HashMap&lt;Cid, Bytes&gt;&gt;);
+
+<span class="kw">impl </span>Get <span class="kw">for </span>Map {
+    <span class="kw">fn </span>get_unchecked(<span class="kw-2">&amp;</span><span class="self">self</span>, key: <span class="kw-2">&amp;</span>Cid) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="prelude-ty">Option</span>&lt;Bytes&gt;, Error&gt; {
+        <span class="prelude-val">Ok</span>(<span class="self">self</span>.<span class="number">0</span>.read().unwrap().get(key).cloned())
+    }
+}
+<span class="kw">impl </span>AsyncGet <span class="kw">for </span>Map {
+    <span class="kw">fn </span>aget_unchecked&lt;<span class="lifetime">'a</span>&gt;(<span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="self">self</span>, key: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>Cid) -&gt; CasFuture&lt;<span class="lifetime">'a</span>, <span class="prelude-ty">Option</span>&lt;Bytes&gt;&gt; {
+        ready(<span class="self">self</span>.get_unchecked(key))
+    }
+}
+<span class="kw">impl </span>Put <span class="kw">for </span>Map {
+    <span class="kw">fn </span>put(<span class="kw-2">&amp;</span><span class="self">self</span>, bytes: Bytes) -&gt; <span class="prelude-ty">Result</span>&lt;Cid, Error&gt; {
+        <span class="kw">let </span>key = Blake3::of(<span class="kw-2">&amp;</span>bytes).into();
+        <span class="self">self</span>.<span class="number">0</span>.write().unwrap().insert(key, bytes);
+        <span class="prelude-val">Ok</span>(key)
+    }
+}
+<span class="kw">impl </span>AsyncPut <span class="kw">for </span>Map {
+    <span class="kw">fn </span>aput(<span class="kw-2">&amp;</span><span class="self">self</span>, bytes: Bytes) -&gt; CasFuture&lt;<span class="lifetime">'_</span>, Cid&gt; {
+        ready(<span class="self">self</span>.put(bytes))
+    }
+}
+<span class="kw">impl </span>Cas <span class="kw">for </span>Map {}
+
+<span class="kw">let </span>store = Map::default();
+<span class="kw">let </span>cid = store.put(<span class="string">"hello"</span>.into())<span class="question-mark">?</span>;
+<span class="macro">assert_eq!</span>(store.size(<span class="kw-2">&amp;</span>cid)<span class="question-mark">?</span>, <span class="prelude-val">Some</span>(<span class="number">5</span>));
+<span class="macro">assert_eq!</span>(store.get_range(<span class="kw-2">&amp;</span>cid, <span class="number">1</span>, <span class="number">3</span>)<span class="question-mark">?</span>.unwrap(), <span class="string">"ell"</span>);
+<span class="macro">assert_eq!</span>(store.get_fact(<span class="kw-2">&amp;</span>cid)<span class="question-mark">?</span>.unwrap().bytes(), <span class="string">"hello"</span>);
+
+store.<span class="number">0</span>.write().unwrap().insert(cid, <span class="string">"jello"</span>.into());
+<span class="macro">assert_eq!</span>(store.get(<span class="kw-2">&amp;</span>cid)<span class="question-mark">?</span>.unwrap(), <span class="string">"jello"</span>);
+<span class="macro">assert!</span>(<span class="macro">matches!</span>(store.get_fact(<span class="kw-2">&amp;</span>cid), <span class="prelude-val">Err</span>(Error::Check { .. })));</code></pre></div></div></details><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.Error.html" title="enum covalence_cas_trait::Error">Error</a></dt><dd>Errors from reading, checking and storing. Large payloads are boxed to
+keep it small.</dd><dt><a class="enum" href="enum.Op.html" title="enum covalence_cas_trait::Op">Op</a></dt><dd>A store operation, named in <a href="enum.Error.html#variant.Unsupported" title="variant covalence_cas_trait::Error::Unsupported"><code>Error::Unsupported</code></a>.</dd></dl><h2 id="traits" class="section-header">Traits<a href="#traits" class="anchor">§</a></h2><dl class="item-table"><dt><a class="trait" href="trait.AsyncGet.html" title="trait covalence_cas_trait::AsyncGet">Async<wbr>Get</a></dt><dd>Reads, async.</dd><dt><a class="trait" href="trait.AsyncGetExt.html" title="trait covalence_cas_trait::AsyncGetExt">Async<wbr>GetExt</a></dt><dd>Checked async reads, for every <a href="trait.AsyncGet.html" title="trait covalence_cas_trait::AsyncGet"><code>AsyncGet</code></a>. Stores cannot override them.</dd><dt><a class="trait" href="trait.AsyncPut.html" title="trait covalence_cas_trait::AsyncPut">Async<wbr>Put</a></dt><dd>Writes, async.</dd><dt><a class="trait" href="trait.Cas.html" title="trait covalence_cas_trait::Cas">Cas</a></dt><dd>A store of bytes by CID, sync and async.</dd><dt><a class="trait" href="trait.Get.html" title="trait covalence_cas_trait::Get">Get</a></dt><dd>Reads, blocking.</dd><dt><a class="trait" href="trait.GetExt.html" title="trait covalence_cas_trait::GetExt">GetExt</a></dt><dd>Checked blocking reads, for every <a href="trait.Get.html" title="trait covalence_cas_trait::Get"><code>Get</code></a>. Stores cannot override them.</dd><dt><a class="trait" href="trait.Key.html" title="trait covalence_cas_trait::Key">Key</a></dt><dd>A key stores can be asked for.</dd><dt><a class="trait" href="trait.Put.html" title="trait covalence_cas_trait::Put">Put</a></dt><dd>Writes, blocking.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.map.html" title="fn covalence_cas_trait::map">map</a></dt><dd>A DASL map from <code>entries</code>, for <a href="trait.Cas.html#method.info" title="method covalence_cas_trait::Cas::info"><code>Cas::info</code></a> and <a href="trait.Cas.html#method.stats" title="method covalence_cas_trait::Cas::stats"><code>Cas::stats</code></a>.</dd><dt><a class="fn" href="fn.ready.html" title="fn covalence_cas_trait::ready">ready</a></dt><dd>A <a href="type.CasFuture.html" title="type covalence_cas_trait::CasFuture"><code>CasFuture</code></a> already holding <code>result</code>.</dd></dl><h2 id="types" class="section-header">Type Aliases<a href="#types" class="anchor">§</a></h2><dl class="item-table"><dt><a class="type" href="type.CasFuture.html" title="type covalence_cas_trait::CasFuture">CasFuture</a></dt><dd>The future an async store method returns.</dd></dl></section></div></main></body></html>

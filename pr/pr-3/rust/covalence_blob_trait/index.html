@@ -1,0 +1,136 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="covalence-blob-trait"><title>covalence_blob_trait - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="covalence_blob_trait" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01) (built from a source tarball)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate covalence_blob_trait</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../covalence_blob_trait/index.html">covalence_<wbr>blob_<wbr>trait</a><span class="version">0.1.0-dev.3</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#covalence-blob-trait" title="covalence-blob-trait">covalence-blob-trait</a><ul><li><a href="#terms" title="Terms">Terms</a></li><li><a href="#blobs" title="Blobs">Blobs</a></li><li><a href="#ranges" title="Ranges">Ranges</a></li><li><a href="#checked-and-unchecked-facts" title="Checked and unchecked facts">Checked and unchecked facts</a></li><li><a href="#examples" title="Examples">Examples</a></li></ul></li></ul><h3><a href="#structs">Crate Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#traits" title="Traits">Traits</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>covalence_<wbr>blob_<wbr>trait</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/covalence_blob_trait/lib.rs.html#1-283">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><h2 id="covalence-blob-trait"><a class="doc-anchor" href="#covalence-blob-trait">§</a>covalence-blob-trait</h2>
+<p>The blob trait: bytes read whole or by range.</p>
+<h3 id="terms"><a class="doc-anchor" href="#terms">§</a>Terms</h3>
+<ul>
+<li>A blob is a sequence of bytes that can be read whole or by range, such as
+bytes in memory, a file or an object in remote storage.</li>
+<li>A <a href="https://github.com/multiformats/cid">CID</a> names bytes by their hash. Its
+multihash is the hash function and the digest; its codec says how to read
+the bytes. <code>covalence-lib-cid</code> defines both.</li>
+<li>A fact (<code>Fact</code> from <code>covalence-lib-cid</code>) is bytes together with a CID whose
+digest they were checked to hash to. Facts check the multihash, not the
+codec.</li>
+</ul>
+<h3 id="blobs"><a class="doc-anchor" href="#blobs">§</a>Blobs</h3>
+<ul>
+<li><code>Blob</code> has <code>size</code>, <code>read_range</code> and <code>read_all</code>. Only <code>size</code> and
+<code>read_range</code> must be written; <code>read_all</code> reads the range from 0 to <code>size</code>.</li>
+<li>Blobs are untrusted: a backend may report any size and return any bytes.
+Callers that need particular content check it, for example with
+<code>BlobExt::fact</code>.</li>
+<li><code>Bytes</code> is a blob whose ranges share its storage.</li>
+<li><code>Slice</code> is a range of another blob. Slices of slices point at the blob under
+them, so they do not nest.</li>
+<li><code>Arc&lt;dyn Blob&gt;</code> is a blob that forwards every method, overrides included.</li>
+<li>Other blobs, such as files, live in their own crates.</li>
+</ul>
+<h3 id="ranges"><a class="doc-anchor" href="#ranges">§</a>Ranges</h3>
+<p><code>read_range(start, len)</code> returns:</p>
+<ul>
+<li><code>len</code> bytes from <code>start</code>, or fewer only where the blob ends;</li>
+<li>nothing at or past the end;</li>
+<li>bytes up to the end if <code>start + len</code> is beyond <code>u64::MAX</code>.</li>
+</ul>
+<p>Implementations must not return fewer bytes before the end: one that reads in
+parts loops until done.</p>
+<h3 id="checked-and-unchecked-facts"><a class="doc-anchor" href="#checked-and-unchecked-facts">§</a>Checked and unchecked facts</h3>
+<p>A blob turns its bytes into a fact for a CID in two steps:</p>
+<ul>
+<li><code>Blob::fact_unchecked</code> is the step a blob may override, for example to
+return a fact it already has without hashing again. By default it reads the
+blob once with <code>read_all</code>, copies the bytes, and checks the copy against the
+CID. “Unchecked” means no one checks that an override returns a fact for the
+CID asked for.</li>
+<li><code>BlobExt::fact</code> is the checked step. It calls <code>fact_unchecked</code> and then
+checks the result. It is defined once for every blob, so no blob can
+override it.</li>
+</ul>
+<p><code>BlobExt::fact(cid)</code> returns:</p>
+<ul>
+<li><code>Some(fact)</code>, with <code>fact.claim() == cid</code>, when the blob’s bytes hash to
+<code>cid</code>’s digest. A fact with the same multihash but another codec is
+relabelled to <code>cid</code>.</li>
+<li><code>None</code> when <code>fact_unchecked</code> returns <code>None</code>. By default that means the bytes
+do not hash to <code>cid</code>. A blob claims no CID, so other content is not an
+error.</li>
+<li><code>Error::Mismatch</code> when <code>fact_unchecked</code> returns a fact with another
+multihash.</li>
+<li><code>Error::Check</code> when the bytes must be checked against <code>cid</code> but
+<code>covalence-lib-cid</code> cannot compute its digest, such as for an unknown hash
+function or a truncated digest.</li>
+<li>The read’s error when the default <code>fact_unchecked</code> fails to read. An
+override may handle a failed read differently.</li>
+</ul>
+<p>What this does and does not guarantee:</p>
+<ul>
+<li>Every fact is true: only <code>covalence-lib-cid</code> builds facts, and it hashes or
+checks the bytes first.</li>
+<li>A fact from <code>BlobExt::fact</code> is for exactly the CID asked for.</li>
+<li>The default copies what it reads before hashing, so later writes under the
+blob cannot change the fact.</li>
+<li>An override may still return <code>None</code> for content that matches, or a fact
+whose bytes differ from what <code>read_range</code> returns. Facts built from
+storage that can change, such as a memory map, are only as stable as that
+storage.</li>
+</ul>
+<p>A <code>Fact</code> is itself a blob. Asked for a CID with its own multihash, it returns
+itself, relabelled, without hashing again; for any other CID it hashes its
+bytes and checks them.</p>
+<h3 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h3>
+<p>Reading by range:</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>std::sync::Arc;
+
+<span class="kw">use </span>covalence_blob_trait::{Blob, Slice};
+<span class="kw">use </span>covalence_lib_data::Bytes;
+
+<span class="kw">let </span>blob: Arc&lt;<span class="kw">dyn </span>Blob&gt; = Arc::new(Bytes::from_static(<span class="string">b"hello world"</span>));
+<span class="macro">assert_eq!</span>(blob.size()<span class="question-mark">?</span>, <span class="number">11</span>);
+<span class="macro">assert_eq!</span>(blob.read_range(<span class="number">6</span>, <span class="number">100</span>)<span class="question-mark">?</span>, <span class="string">"world"</span>);
+<span class="macro">assert_eq!</span>(blob.read_range(<span class="number">20</span>, <span class="number">1</span>)<span class="question-mark">?</span>, <span class="string">""</span>);
+<span class="macro">assert_eq!</span>(blob.read_all()<span class="question-mark">?</span>, <span class="string">"hello world"</span>);
+
+<span class="kw">let </span>world = Slice::new(blob, <span class="number">6</span>, u64::MAX);
+<span class="macro">assert_eq!</span>(world.size()<span class="question-mark">?</span>, <span class="number">5</span>);
+<span class="macro">assert_eq!</span>(world.slice(<span class="number">1</span>, <span class="number">3</span>).read_all()<span class="question-mark">?</span>, <span class="string">"orl"</span>);</code></pre></div>
+<p>Checked facts, relabelled to the codec asked for:</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>covalence_blob_trait::{Blob, BlobExt};
+<span class="kw">use </span>covalence_lib_cid::{Blake3, Cid32, Format};
+<span class="kw">use </span>covalence_lib_data::Bytes;
+
+<span class="kw">let </span>blob = Bytes::from_static(<span class="string">b"hello"</span>);
+<span class="kw">let </span>cid = Cid32::from(Blake3::of(<span class="string">b"hello"</span>));
+<span class="kw">let </span>fact = blob.fact(<span class="kw-2">&amp;</span>cid)<span class="question-mark">?</span>.expect(<span class="string">"the bytes hash to the CID"</span>);
+<span class="macro">assert_eq!</span>(fact.bytes(), <span class="string">"hello"</span>);
+<span class="macro">assert_eq!</span>(fact.read_range(<span class="number">1</span>, <span class="number">3</span>)<span class="question-mark">?</span>, <span class="string">"ell"</span>);
+<span class="macro">assert!</span>(blob.fact(<span class="kw-2">&amp;</span>Blake3::of(<span class="string">b"other"</span>).into())<span class="question-mark">?</span>.is_none());
+
+<span class="kw">let </span>drisl = Cid32::new(Format::DRISL_BLAKE3, cid.digest())<span class="question-mark">?</span>;
+<span class="macro">assert_eq!</span>(fact.fact(<span class="kw-2">&amp;</span>drisl)<span class="question-mark">?</span>.expect(<span class="string">"the same multihash"</span>).claim(), <span class="kw-2">&amp;</span>drisl);</code></pre></div>
+<p>An override that returns a fact for other content is caught by the checked
+step:</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>covalence_blob_trait::{Blob, BlobExt, Error};
+<span class="kw">use </span>covalence_lib_cid::{Blake3, Cid, Fact};
+<span class="kw">use </span>covalence_lib_data::Bytes;
+
+<span class="kw">struct </span>Liar(Bytes);
+
+<span class="kw">impl </span>Blob <span class="kw">for </span>Liar {
+    <span class="kw">fn </span>size(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Result</span>&lt;u64, Error&gt; {
+        <span class="self">self</span>.<span class="number">0</span>.size()
+    }
+    <span class="kw">fn </span>read_range(<span class="kw-2">&amp;</span><span class="self">self</span>, start: u64, len: u64) -&gt; <span class="prelude-ty">Result</span>&lt;Bytes, Error&gt; {
+        <span class="self">self</span>.<span class="number">0</span>.read_range(start, len)
+    }
+    <span class="kw">fn </span>fact_unchecked(<span class="kw-2">&amp;</span><span class="self">self</span>, _cid: <span class="kw-2">&amp;</span>Cid) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="prelude-ty">Option</span>&lt;Fact&gt;, Error&gt; {
+        <span class="prelude-val">Ok</span>(<span class="prelude-val">Some</span>(Fact::&lt;Blake3&gt;::of(Bytes::from_static(<span class="string">b"other"</span>)).widen()))
+    }
+}
+
+<span class="kw">let </span>blob = Liar(Bytes::from_static(<span class="string">b"hello"</span>));
+<span class="kw">let </span>cid = Blake3::of(<span class="string">b"hello"</span>).into();
+<span class="macro">assert!</span>(blob.fact_unchecked(<span class="kw-2">&amp;</span>cid)<span class="question-mark">?</span>.is_some());
+<span class="macro">assert!</span>(<span class="macro">matches!</span>(blob.fact(<span class="kw-2">&amp;</span>cid), <span class="prelude-val">Err</span>(Error::Mismatch)));</code></pre></div></div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.Slice.html" title="struct covalence_blob_trait::Slice">Slice</a></dt><dd>Up to <code>len</code> bytes of another blob from <code>start</code>, read relative to <code>start</code>.</dd></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.Error.html" title="enum covalence_blob_trait::Error">Error</a></dt><dd>Errors from reading a blob and checking its facts.</dd></dl><h2 id="traits" class="section-header">Traits<a href="#traits" class="anchor">§</a></h2><dl class="item-table"><dt><a class="trait" href="trait.Blob.html" title="trait covalence_blob_trait::Blob">Blob</a></dt><dd>Bytes read whole or by range. See the <a href="index.html" title="mod covalence_blob_trait">crate docs</a> for the range
+contract and for checked and unchecked facts.</dd><dt><a class="trait" href="trait.BlobExt.html" title="trait covalence_blob_trait::BlobExt">BlobExt</a></dt><dd>Checked facts, for every <a href="trait.Blob.html" title="trait covalence_blob_trait::Blob"><code>Blob</code></a>. Blobs cannot override them.</dd></dl></section></div></main></body></html>

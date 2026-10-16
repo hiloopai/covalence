@@ -1,0 +1,57 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The key-value store trait."><title>covalence_kv_trait - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="covalence_kv_trait" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01) (built from a source tarball)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate covalence_kv_trait</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../covalence_kv_trait/index.html">covalence_<wbr>kv_<wbr>trait</a><span class="version">0.1.0-dev.3</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#enums">Crate Items</a></h3><ul class="block"><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#traits" title="Traits">Traits</a></li><li><a href="#functions" title="Functions">Functions</a></li><li><a href="#types" title="Type Aliases">Type Aliases</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>covalence_<wbr>kv_<wbr>trait</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/covalence_kv_trait/lib.rs.html#1-343">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The key-value store trait.</p>
+<p>A key-value (KV) store maps byte-string keys to byte values, and a put
+replaces any earlier value. <a href="trait.Kv.html" title="trait covalence_kv_trait::Kv"><code>Kv</code></a> is the trait every store implements.</p>
+<ul>
+<li>Sync methods <code>get</code>, <code>put</code> and <code>exists</code>, and async twins named as in
+Python: the sync name prefixed with <code>a</code>, so <code>aget</code>, <code>aput</code> and <code>aexists</code>.</li>
+<li><code>Kv</code> is object safe: every method returns the shared <a href="enum.Error.html" title="enum covalence_kv_trait::Error"><code>Error</code></a>, and async
+ones a boxed <a href="type.KvFuture.html" title="type covalence_kv_trait::KvFuture"><code>KvFuture</code></a>. Hold a store as <code>Arc&lt;dyn Kv&gt;</code> (or take
+<code>&amp;dyn Kv</code>) rather than being generic; <a href="trait.Kv.html#method.into_dyn" title="method covalence_kv_trait::Kv::into_dyn"><code>Kv::into_dyn</code></a> makes one.</li>
+<li><a href="trait.Kv.html#method.size" title="method covalence_kv_trait::Kv::size"><code>Kv::size</code></a> and <a href="trait.Kv.html#method.get_range" title="method covalence_kv_trait::Kv::get_range"><code>Kv::get_range</code></a> fetch the whole value and measure or
+slice it by default; stores with native ranges override them.</li>
+<li><a href="trait.Kv.html#method.put_from" title="method covalence_kv_trait::Kv::put_from"><code>Kv::put_from</code></a> and <a href="trait.Kv.html#method.get_to" title="method covalence_kv_trait::Kv::get_to"><code>Kv::get_to</code></a> move a value between the store and a
+reader or writer. By default they hold it in memory; stores that can
+stream override them. They have no async twins: readers and writers block.</li>
+<li><a href="trait.Kv.html#method.put_new" title="method covalence_kv_trait::Kv::put_new"><code>Kv::put_new</code></a>, <a href="trait.Kv.html#method.put_new_from" title="method covalence_kv_trait::Kv::put_new_from"><code>Kv::put_new_from</code></a> and <a href="trait.Kv.html#method.aput_new" title="method covalence_kv_trait::Kv::aput_new"><code>Kv::aput_new</code></a> store a value
+only under a key that holds none. By default they ask <a href="trait.Kv.html#method.exists" title="method covalence_kv_trait::Kv::exists"><code>Kv::exists</code></a>
+first, so two callers racing on one key may both store; stores that can
+create atomically override them.</li>
+<li>Stores live in their own crates, such as <code>covalence-kv-memory</code> and
+<code>covalence-kv-s3</code>.</li>
+</ul>
+<p>A store needs only <code>get</code>, <code>put</code>, <code>aget</code> and <code>aput</code>; the defaults supply
+the rest:</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>std::{collections::BTreeMap, sync::RwLock};
+
+<span class="kw">use </span>covalence_kv_trait::{Error, Kv, KvFuture, ready};
+<span class="kw">use </span>covalence_lib_data::Bytes;
+
+<span class="attr">#[derive(Default)]
+</span><span class="kw">struct </span>Map(RwLock&lt;BTreeMap&lt;Vec&lt;u8&gt;, Bytes&gt;&gt;);
+
+<span class="kw">impl </span>Kv <span class="kw">for </span>Map {
+    <span class="kw">fn </span>get(<span class="kw-2">&amp;</span><span class="self">self</span>, key: <span class="kw-2">&amp;</span>[u8]) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="prelude-ty">Option</span>&lt;Bytes&gt;, Error&gt; {
+        <span class="prelude-val">Ok</span>(<span class="self">self</span>.<span class="number">0</span>.read().unwrap().get(key).cloned())
+    }
+    <span class="kw">fn </span>put(<span class="kw-2">&amp;</span><span class="self">self</span>, key: <span class="kw-2">&amp;</span>[u8], value: Bytes) -&gt; <span class="prelude-ty">Result</span>&lt;(), Error&gt; {
+        <span class="self">self</span>.<span class="number">0</span>.write().unwrap().insert(key.to_vec(), value);
+        <span class="prelude-val">Ok</span>(())
+    }
+    <span class="kw">fn </span>aget&lt;<span class="lifetime">'a</span>&gt;(<span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="self">self</span>, key: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>[u8]) -&gt; KvFuture&lt;<span class="lifetime">'a</span>, <span class="prelude-ty">Option</span>&lt;Bytes&gt;&gt; {
+        ready(<span class="self">self</span>.get(key))
+    }
+    <span class="kw">fn </span>aput&lt;<span class="lifetime">'a</span>&gt;(<span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="self">self</span>, key: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>[u8], value: Bytes) -&gt; KvFuture&lt;<span class="lifetime">'a</span>, ()&gt; {
+        ready(<span class="self">self</span>.put(key, value))
+    }
+}
+
+<span class="kw">let </span>store = Map::default().into_dyn();
+store.put(<span class="string">b"greeting"</span>, <span class="string">"hello"</span>.into())<span class="question-mark">?</span>;
+<span class="macro">assert_eq!</span>(store.size(<span class="string">b"greeting"</span>)<span class="question-mark">?</span>, <span class="prelude-val">Some</span>(<span class="number">5</span>));
+<span class="macro">assert_eq!</span>(store.get_range(<span class="string">b"greeting"</span>, <span class="number">1</span>, <span class="number">3</span>)<span class="question-mark">?</span>.unwrap(), <span class="string">"ell"</span>);
+<span class="comment">// Ranges stop at the end of the value; a missing key is `None`.
+</span><span class="macro">assert_eq!</span>(store.get_range(<span class="string">b"greeting"</span>, <span class="number">3</span>, <span class="number">10</span>)<span class="question-mark">?</span>.unwrap(), <span class="string">"lo"</span>);
+<span class="macro">assert_eq!</span>(store.get_range(<span class="string">b"greeting"</span>, <span class="number">9</span>, <span class="number">1</span>)<span class="question-mark">?</span>.unwrap(), <span class="string">""</span>);
+<span class="macro">assert_eq!</span>(store.get_range(<span class="string">b"missing"</span>, <span class="number">0</span>, <span class="number">1</span>)<span class="question-mark">?</span>, <span class="prelude-val">None</span>);
+<span class="macro">assert!</span>(!store.exists(<span class="string">b"missing"</span>)<span class="question-mark">?</span>);</code></pre></div></div></details><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.Error.html" title="enum covalence_kv_trait::Error">Error</a></dt><dd>Errors from reading and storing.</dd><dt><a class="enum" href="enum.Op.html" title="enum covalence_kv_trait::Op">Op</a></dt><dd>A store operation, named in <a href="enum.Error.html#variant.Unsupported" title="variant covalence_kv_trait::Error::Unsupported"><code>Error::Unsupported</code></a>.</dd></dl><h2 id="traits" class="section-header">Traits<a href="#traits" class="anchor">§</a></h2><dl class="item-table"><dt><a class="trait" href="trait.Kv.html" title="trait covalence_kv_trait::Kv">Kv</a></dt><dd>A store of byte values by byte-string key, sync and async.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.ready.html" title="fn covalence_kv_trait::ready">ready</a></dt><dd>A <a href="type.KvFuture.html" title="type covalence_kv_trait::KvFuture"><code>KvFuture</code></a> already holding <code>result</code>.</dd></dl><h2 id="types" class="section-header">Type Aliases<a href="#types" class="anchor">§</a></h2><dl class="item-table"><dt><a class="type" href="type.KvFuture.html" title="type covalence_kv_trait::KvFuture">KvFuture</a></dt><dd>The future an async store method returns.</dd></dl></section></div></main></body></html>
