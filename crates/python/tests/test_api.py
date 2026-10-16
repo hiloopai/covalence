@@ -11,6 +11,7 @@ import sqlite3
 import tempfile
 import unittest
 import threading
+import time
 import uuid
 from collections import UserDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -483,9 +484,22 @@ class KvTests(ApiCase):
 class FakeS3(BaseHTTPRequestHandler):
     """Path-style S3 objects in `server.objects`, recording each request's
     method, path and query in `server.requests`, refusing the methods in
-    `server.denied` with 403, and answering a GET's `Range` with its bytes."""
+    `server.denied` with 403, and answering a GET's `Range` with its bytes.
+    `server.peak` is the most requests it has served at once, each taking at
+    least `server.delay` seconds."""
 
     def handle_request(self, body):
+        with self.server.lock:
+            self.server.live += 1
+            self.server.peak = max(self.server.peak, self.server.live)
+        try:
+            time.sleep(self.server.delay)
+            self.serve(body)
+        finally:
+            with self.server.lock:
+                self.server.live -= 1
+
+    def serve(self, body):
         url = urlsplit(self.path)
         self.server.requests.append((self.command, url.path, parse_qs(url.query)))
         if self.command in self.server.denied:
@@ -494,7 +508,13 @@ class FakeS3(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if self.command == "PUT":
-            self.server.objects[url.path] = self.rfile.read(int(self.headers["Content-Length"]))
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            if self.headers["If-None-Match"] == "*" and url.path in self.server.objects:
+                self.send_response(412)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.server.objects[url.path] = body
             data = b""
         elif url.path in self.server.objects:
             data = self.server.objects[url.path]
@@ -532,10 +552,32 @@ class FakeS3(BaseHTTPRequestHandler):
         pass
 
 
+class MultipartFailureS3(BaseHTTPRequestHandler):
+    """Create an upload, then record whether its abort succeeds."""
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        self.server.requests.append((self.command, self.path))
+        data = b'<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><UploadId>failed-source-upload</UploadId></InitiateMultipartUploadResult>'
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_DELETE(self):
+        self.server.requests.append((self.command, self.path))
+        self.send_response(403 if self.server.abort_denied else 204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
 class S3Tests(ApiCase):
     def setUp(self):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeS3)
         self.server.objects, self.server.requests, self.server.denied = {}, [], set()
+        self.server.lock, self.server.live, self.server.peak, self.server.delay = threading.Lock(), 0, 0, 0
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -594,6 +636,37 @@ class S3Tests(ApiCase):
         digest = base64.b32encode(cid.digest).decode().lower().rstrip("=")
         self.assertEqual(list(self.server.objects), [f"/bucket/p/blocks/blake3/{digest}/bytes"])
 
+    def test_stream_source_exception_survives_multipart_cleanup(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), MultipartFailureS3)
+        server.requests = []
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        os.environ.update(
+            AWS_ACCESS_KEY_ID="key", AWS_SECRET_ACCESS_KEY="secret",
+            AWS_ENDPOINT_URL=f"http://127.0.0.1:{server.server_address[1]}",
+        )
+        cas = Cas.kv(Kv.s3("bucket", region="us-east-1"))
+        for denied in (False, True):
+            with self.subTest(abort_denied=denied):
+                server.abort_denied = denied
+                source = RuntimeError("source disconnected")
+
+                def chunks():
+                    raise source
+                    yield b""
+
+                with self.assertRaises(StoreError if denied else RuntimeError) as raised:
+                    cas.put_from(Cid.of(b"unused"), chunks(), 9 << 20)
+                if denied:
+                    self.assertIs(raised.exception.__cause__, source)
+                    self.assertIn("failed-source-upload", str(raised.exception))
+                    self.assertIn("403", str(raised.exception))
+                else:
+                    self.assertIs(raised.exception, source)
+                self.assertEqual([request[0] for request in server.requests], ["POST", "DELETE"])
+                server.requests.clear()
+
     def test_cas_put_needs_only_write_access(self):
         # Without s3:ListBucket, S3 answers a HEAD for a missing key with 403.
         os.environ.update(AWS_ACCESS_KEY_ID="key", AWS_SECRET_ACCESS_KEY="secret")
@@ -639,6 +712,27 @@ class S3Tests(ApiCase):
             self.assertEqual(target.read_bytes(), data)
             self.assertEqual(os.listdir(directory), ["target"])
 
+    def test_concurrency_bounds_the_parts_in_flight(self):
+        # Several 8 MiB ranges from a slow server, so they overlap when they may.
+        self.server.delay = 0.2
+        data = os.urandom(3 * (8 << 20) + 5)
+        cid = Cid.of(data)
+        path = f"/bucket/p/blake3/{base64.b32encode(cid.digest).decode().lower().rstrip('=')}/bytes"
+        self.server.objects[path] = data
+        os.environ.update(AWS_ACCESS_KEY_ID="key", AWS_SECRET_ACCESS_KEY="secret")
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory, "target")
+            # The first range gives the size; the other three then move at once, or one at a time.
+            for concurrency, peak in ((None, 3), (1, 1)):
+                with self.subTest(concurrency=concurrency):
+                    self.server.peak = 0
+                    cas = Cas.kv(Kv.s3("s3://bucket/p", region="us-east-1", concurrency=concurrency))
+                    self.assertEqual(cas.get_file(cid, target), len(data))
+                    self.assertEqual(target.read_bytes(), data)
+                    self.assertEqual(self.server.peak, peak)
+        with self.assertRaises(OverflowError):
+            Kv.s3("s3://bucket/p", region="us-east-1", concurrency=-1)
+
     def test_failures(self):
         self.assert_fails(Kv.s3, "s3://bucket/p", "q")
         self.assert_fails(Kv.s3, "bucket/p")
@@ -672,6 +766,26 @@ class RealS3Tests(ApiCase):
         self.assertEqual(cas.put_value(value), value.cid())
         self.assertEqual(cas.get_fact(value.cid()).value(), value)
         self.assertEqual(cas.missing([cid, value.cid(), Cid.of(b"three")]), [Cid.of(b"three")])
+
+    def test_streams_in_parts_with_racing_writers(self):
+        location = os.environ["COVALENCE_TEST_S3"].rstrip("/") + f"/{uuid.uuid4()}/"
+        cas = Cas.kv(Kv.s3(location), "cas")
+        # Over the 8 MiB part size, so this uses a multipart upload.
+        data = os.urandom(20 << 20)
+        cid = Cid.of(data)
+        chunks = lambda: (data[i : i + (1 << 20)] for i in range(0, len(data), 1 << 20))
+        with self.assertRaises(IntegrityError):
+            cas.put_from(Cid.of(b"other"), chunks(), len(data))
+        self.assertFalse(cas.has(cid))
+        results = []
+        racers = [threading.Thread(target=lambda: results.append(cas.put_from(cid, chunks(), len(data)))) for _ in range(4)]
+        for racer in racers:
+            racer.start()
+        for racer in racers:
+            racer.join()
+        self.assertEqual(results, [cid] * 4)
+        self.assertEqual(cas.get(cid), data)
+        self.assertEqual(cas.put(b"small"), cas.put(b"small"))
 
 
 class CasTests(ApiCase):
@@ -758,6 +872,49 @@ class CasTests(ApiCase):
                     self.assertEqual(Cid.of_file(empty), Cid.of(b""))
                     self.assertEqual(cas.get_file(Cid.of(b""), empty), 0)
             self.assertEqual(sorted(os.listdir(directory)), sorted(["empty", "source", *self.stores()]))
+
+    def test_put_from(self):
+        data = bytes(range(256)) * 4099
+        cid = Cid.of(data)
+        for name, cas in self.stores().items():
+            with self.subTest(store=name):
+                chunks = (data[i : i + 1000] for i in range(0, len(data), 1000))
+                self.assertEqual(cas.put_from(cid, chunks, len(data)), cid)
+                self.assertEqual(cas.get(cid), data)
+                drisl = Cid.from_parts("dag-cbor", "blake3", Cid.of(b"two").digest)
+                self.assertEqual(cas.put_from(drisl, [b"", bytearray(b"tw"), b"o"], 3), Cid.of(b"two"))
+                self.assertEqual(cas.put_from(Cid.of(b""), iter([b""]), 0), Cid.of(b""))
+                self.assertEqual(cas.get(Cid.of(b"")), b"")
+
+    def test_put_from_stores_nothing_it_cannot_vouch_for(self):
+        def failing():
+            yield b"thr"
+            raise RuntimeError("the client went away")
+
+        three = Cid.of(b"three")
+        for name, cas in self.stores().items():
+            with self.subTest(store=name):
+                with self.assertRaises(IntegrityError):
+                    cas.put_from(three, [b"other"], 5)
+                with self.assertRaisesRegex(ValueError, "fewer"):
+                    cas.put_from(three, [b"thr"], 5)
+                with self.assertRaisesRegex(ValueError, "more"):
+                    cas.put_from(three, [b"thr", b"ee!"], 5)
+                with self.assertRaisesRegex(ValueError, "more"):
+                    cas.put_from(three, [b"three", b"!"], 5)
+                with self.assertRaisesRegex(ValueError, "more"):
+                    cas.put_from(Cid.of(b""), [b"!"], 0)
+                with self.assertRaisesRegex(RuntimeError, "went away"):
+                    cas.put_from(three, failing(), 5)
+                self.assertEqual(cas.missing([three, Cid.of(b"other")]), [three, Cid.of(b"other")])
+                self.assert_fails(cas.put_from, Cid.of(b"three", "sha256"), [b"three"], 5)
+                with self.assertRaises(TypeError):
+                    cas.put_from(three, ["three"], 5)
+                with self.assertRaises(TypeError):
+                    cas.put_from(three, 3, 5)
+                with self.assertRaises(OverflowError):
+                    cas.put_from(three, [b"three"], -1)
+                self.assertFalse(cas.has(three))
 
     def test_get_file_keeps_the_permissions_it_replaces(self):
         cas = Cas.memory()

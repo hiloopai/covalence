@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from os import PathLike
 from typing import Any, Literal, Self, TypeAlias, final
 
@@ -253,11 +253,14 @@ class Kv:
     def memory() -> Kv:
         """A new, empty store in memory."""
     @staticmethod
-    def s3(location: str, prefix: str | None = None, *, region: str | None = None, profile: str | None = None) -> Kv:
+    def s3(location: str, prefix: str | None = None, *, region: str | None = None, profile: str | None = None, concurrency: int | None = None) -> Kv:
         """A store in S3, configured as the AWS SDKs are.
 
         `location` is an `s3://bucket/prefix/` URL, or a bucket name with
         `prefix`. `region` and `profile` override the SDK configuration.
+        `concurrency` is how many 8 MiB parts of one value move at once (16 by
+        default; 0 counts as 1), which bounds the memory a streamed value
+        holds.
 
         - An invalid location, a URL with `prefix` too, or no region raises
           ValueError.
@@ -423,6 +426,24 @@ class Cas:
           IntegrityError, and if the file got shorter OSError, storing nothing.
         - `Cas.kv` over `Kv.s3` streams the file; other stores read it into
           memory.
+        """
+    def put_from(self, cid: Cid, chunks: Iterable[_BytesLike], length: int) -> Cid:
+        """Store `length` bytes from the iterable `chunks`, which must hash to `cid`, and return its raw BLAKE3 CID.
+
+        For bytes that arrive in pieces, such as a request body, without
+        holding them all at once.
+
+        - `cid` must be a BLAKE3 CID of any codec; another hash raises
+          ValueError.
+        - `chunks` yields bytes or bytearray. It is read in order, and once
+          more after `length` bytes, to check that it ends there.
+        - Bytes that do not hash to `cid` raise IntegrityError; `chunks`
+          holding fewer or more than `length` bytes raises ValueError; an
+          exception from `chunks` propagates as it is. Each stores nothing.
+          If cleanup also fails, raises StoreError with the source exception
+          as its `__cause__` and the cleanup failure in its message.
+        - `Cas.kv` over `Kv.s3` streams the bytes up in parts, holding about as
+          many parts as upload at once; other stores hold them in memory.
         """
     def get(self, cid: Cid) -> bytes | None:
         """The bytes under `cid`, checked against it, or None if missing."""
