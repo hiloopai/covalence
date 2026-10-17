@@ -58,6 +58,11 @@ pip install covalence==0.1.0.dev3
 - `Cid.of` hashes with `"blake3"` and `"raw"` by default.
 - `Cid.of_file(path)` is the raw BLAKE3 `Cid` of a file, as `Cas.put_file`
   returns it, without storing it or reading the file into memory.
+- `Cid.of_fileobj(file, max_bytes=..., expected_length=...)` hashes an
+  already-open, seekable binary file object once from offset zero, without
+  storing it or holding it in memory. It uses the same bounded reader as
+  `Cas.put_fileobj`, and leaves the caller's source open at EOF on success.
+  Keep that source unchanged and exclusively owned until it returns.
 
 ## Values
 
@@ -160,10 +165,29 @@ pip install covalence==0.1.0.dev3
   case `StoreError` reports that failure with the source as its `__cause__`.
 - `Cas.get_file(cid, path)` writes the block to a file and returns its
   length, or `None` if missing.
-- `put_file`, `put_from` and `get_file` stream on `Cas.kv` over `Kv.s3`,
+- `Cas.put_fileobj(file, max_bytes=..., expected_length=...)` stores a
+  caller-owned, seekable binary file object. It reads from offset zero twice,
+  checks the complete source on both passes even when deduplicating, and
+  leaves it open at EOF on success. The caller must keep the source unchanged
+  and exclusively owned until it returns; the method creates no snapshot.
+  `max_bytes` caps the accepted source length; `expected_length`, if given,
+  must match it exactly. A length violation raises `ValueError` before a new
+  block is published. A pass may read one extra byte to check the end.
+- `Cas.get_to(cid, writer, max_bytes=..., expected_length=...)` writes to a
+  caller-owned binary file object and returns the length, or `None` if missing.
+  It checks all bytes against the CID, caps the bytes the writer accepts, and
+  checks the optional exact length. It handles short writes and never seeks,
+  flushes or closes the writer. A failure may leave partial or unchecked bytes
+  there: write to private staging and publish only after a successful return.
+- These limits govern source length and output bytes, not the memory a backend
+  uses before reading or writing. Python callback transfers are at most 1 MiB.
+- `put_file`, `put_fileobj`, `put_from`, `get_file` and `get_to` stream on `Cas.kv` over `Kv.s3`,
   holding up to 16 parts of 8 MiB (128 MiB) at a time, or as many as
-  `Kv.s3(..., concurrency=n)` says; blocks over 78 GiB go up in larger parts. Other stores, including `Cas.kv(Kv.memory())`, hold
-  the block in memory.
+  `Kv.s3(..., concurrency=n)` says; blocks over 78 GiB go up in larger parts.
+  Other stores, including `Cas.kv(Kv.memory())`, hold the block in memory.
+- A create-only write can reuse a block without checking its stored bytes.
+  Returning a CID does not freshly verify an existing block: use a checked
+  read, such as `get_to`, when that guarantee is needed.
 - `put_file` reads the file twice, to hash it and to store it, and stores the
   bytes it hashed. If they changed in between it raises `IntegrityError`,
   and if the file got shorter `OSError`, storing nothing either way. Bytes
@@ -173,6 +197,28 @@ pip install covalence==0.1.0.dev3
   missing block or a failed check (`IntegrityError`) leaves `path` as it
   was. The new file has the permissions of the file it replaces, or those
   the umask gives a new file.
+
+Use an already-open file without exposing its path:
+
+```pycon
+>>> import io
+>>> source = io.BytesIO(b"hello")
+>>> cid = cas.put_fileobj(source, max_bytes=5, expected_length=5)
+>>> sink = io.BytesIO()
+>>> cas.get_to(cid, sink, max_bytes=5, expected_length=5)
+5
+>>> sink.getvalue()
+b'hello'
+>>> Cid.of_fileobj(sink, max_bytes=5, expected_length=5) == cid
+True
+
+```
+
+An integer file descriptor can be wrapped with `os.fdopen(os.dup(fd), "wb",
+buffering=0)` for downloads, or `"rb"` for uploads. Close that wrapper when
+finished; the original descriptor remains open. Duplicates share a file
+position, so the caller must also keep the original descriptor exclusively
+owned during the operation.
 
 ## Blobs and facts
 
