@@ -3,7 +3,7 @@ members = ["crates/lib/error", "crates/lib/cli", "tools/glu", "crates/lib/serde"
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0-dev.3"
+version = "0.1.0-dev.4"
 edition = "2024"
 rust-version = "1.98"
 license = "CC0-1.0 OR MIT OR Apache-2.0"
@@ -17,22 +17,22 @@ miette = "7.6.0"
 sha2 = "0.11.0"
 snafu = "0.9.2"
 # Published crates, at the workspace version so the set moves together.
-covalence-blob-trait = { path = "crates/blob/trait", version = "=0.1.0-dev.3" }
-covalence-cas-kv = { path = "crates/cas/kv", version = "=0.1.0-dev.3" }
-covalence-cas-memory = { path = "crates/cas/memory", version = "=0.1.0-dev.3" }
-covalence-cas-sqlite = { path = "crates/cas/sqlite", version = "=0.1.0-dev.3" }
-covalence-cas-trait = { path = "crates/cas/trait", version = "=0.1.0-dev.3" }
-covalence-kv-memory = { path = "crates/kv/memory", version = "=0.1.0-dev.3" }
-covalence-kv-s3 = { path = "crates/kv/s3", version = "=0.1.0-dev.3" }
-covalence-kv-trait = { path = "crates/kv/trait", version = "=0.1.0-dev.3" }
-covalence-lib-cid = { path = "crates/lib/cid", version = "=0.1.0-dev.3" }
-covalence-lib-cli = { path = "crates/lib/cli", version = "=0.1.0-dev.3" }
-covalence-lib-dasl = { path = "crates/lib/dasl", version = "=0.1.0-dev.3" }
-covalence-lib-data = { path = "crates/lib/data", version = "=0.1.0-dev.3" }
-covalence-lib-error = { path = "crates/lib/error", version = "=0.1.0-dev.3" }
-covalence-lib-rand = { path = "crates/lib/rand", version = "=0.1.0-dev.3" }
-covalence-lib-serde = { path = "crates/lib/serde", version = "=0.1.0-dev.3" }
-covalence-lib-sqlite = { path = "crates/lib/sqlite", version = "=0.1.0-dev.3" }
+covalence-blob-trait = { path = "crates/blob/trait", version = "=0.1.0-dev.4" }
+covalence-cas-kv = { path = "crates/cas/kv", version = "=0.1.0-dev.4" }
+covalence-cas-memory = { path = "crates/cas/memory", version = "=0.1.0-dev.4" }
+covalence-cas-sqlite = { path = "crates/cas/sqlite", version = "=0.1.0-dev.4" }
+covalence-cas-trait = { path = "crates/cas/trait", version = "=0.1.0-dev.4" }
+covalence-kv-memory = { path = "crates/kv/memory", version = "=0.1.0-dev.4" }
+covalence-kv-s3 = { path = "crates/kv/s3", version = "=0.1.0-dev.4" }
+covalence-kv-trait = { path = "crates/kv/trait", version = "=0.1.0-dev.4" }
+covalence-lib-cid = { path = "crates/lib/cid", version = "=0.1.0-dev.4" }
+covalence-lib-cli = { path = "crates/lib/cli", version = "=0.1.0-dev.4" }
+covalence-lib-dasl = { path = "crates/lib/dasl", version = "=0.1.0-dev.4" }
+covalence-lib-data = { path = "crates/lib/data", version = "=0.1.0-dev.4" }
+covalence-lib-error = { path = "crates/lib/error", version = "=0.1.0-dev.4" }
+covalence-lib-rand = { path = "crates/lib/rand", version = "=0.1.0-dev.4" }
+covalence-lib-serde = { path = "crates/lib/serde", version = "=0.1.0-dev.4" }
+covalence-lib-sqlite = { path = "crates/lib/sqlite", version = "=0.1.0-dev.4" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
