@@ -402,6 +402,8 @@ class Cas:
         - The digest is the BLAKE3 digest in lowercase unpadded base32.
         - A trailing `/` on `prefix` is optional; an invalid prefix raises
           ValueError.
+        - Never replaces a block `kv` already holds: on `Kv.s3` each write is
+          conditional, so concurrent writers of one block race safely.
         """
     def put(self, data: _BytesLike) -> Cid:
         """Store `data` and return its raw BLAKE3 CID.

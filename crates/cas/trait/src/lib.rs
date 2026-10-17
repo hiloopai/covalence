@@ -350,10 +350,14 @@ pub trait Cas: Get + Put + AsyncGet + AsyncPut {
     }
 
     /// Store the next `len` bytes of `reader`, whose raw BLAKE3 CID is `cid`,
-    /// and return the key [`Put::put_fact`] would. Reads no further; stores
-    /// nothing and fails with [`Error::Check`] if the bytes have another CID,
-    /// or with [`Error::Io`] if `reader` fails or ends early. Reads them into
-    /// memory by default; stores that can stream override it.
+    /// and return the key [`Put::put_fact`] would.
+    ///
+    /// - A store may return an existing block without consuming all of
+    ///   `reader`; unread bytes are not checked.
+    /// - Otherwise, reads exactly `len` bytes and no further. Stores nothing
+    ///   and fails with [`Error::Check`] if the bytes have another CID, or
+    ///   with [`Error::Io`] if `reader` fails or ends early.
+    /// - Reads into memory by default; stores that can stream override it.
     fn put_from(&self, cid: Blake3, reader: &mut dyn Read, len: u64) -> Result<Cid, Error> {
         let mut bytes = Vec::new();
         let read = reader

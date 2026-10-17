@@ -13,6 +13,10 @@
 //! - [`Kv::put_from`] and [`Kv::get_to`] move a value between the store and a
 //!   reader or writer. By default they hold it in memory; stores that can
 //!   stream override them. They have no async twins: readers and writers block.
+//! - [`Kv::put_new`], [`Kv::put_new_from`] and [`Kv::aput_new`] store a value
+//!   atomically only under a key that holds none. Their defaults return
+//!   [`Error::Unsupported`] without reading or writing; stores that can create
+//!   atomically override them.
 //! - Stores live in their own crates, such as `covalence-kv-memory` and
 //!   `covalence-kv-s3`.
 //!
@@ -120,6 +124,25 @@ pub trait Kv: Send + Sync {
         self.put(key, value.into())
     }
 
+    /// Atomically store `value` under `key` only if the key holds no value,
+    /// and return whether it stored.
+    ///
+    /// Never replaces a value, including when writers race. The default
+    /// returns [`Error::Unsupported`] without reading or writing.
+    fn put_new(&self, _key: &[u8], _value: Bytes) -> Result<bool, Error> {
+        Err(Op::PutNew.unsupported())
+    }
+
+    /// As [`Kv::put_from`], but atomically store only if the key holds no
+    /// value, and return whether it stored.
+    ///
+    /// Never replaces a value, including when writers race. When the key
+    /// holds one, `reader` may have been read or not. The default returns
+    /// [`Error::Unsupported`] without reading or writing.
+    fn put_new_from(&self, _key: &[u8], _reader: &mut dyn Read, _len: u64) -> Result<bool, Error> {
+        Err(Op::PutNew.unsupported())
+    }
+
     /// Write the value under `key` to `writer` and return its length, or
     /// `None`, writing nothing, if missing. Fails with [`Error::Io`] if
     /// `writer` fails; after any failure `writer` may hold part of the value.
@@ -154,6 +177,12 @@ pub trait Kv: Send + Sync {
 
     /// Store `value` under `key`, replacing any previous value.
     fn aput<'a>(&'a self, key: &'a [u8], value: Bytes) -> KvFuture<'a, ()>;
+
+    /// As [`Kv::put_new`], returning [`Error::Unsupported`] without reading
+    /// or writing by default.
+    fn aput_new<'a>(&'a self, _key: &'a [u8], _value: Bytes) -> KvFuture<'a, bool> {
+        ready(Err(Op::PutNew.unsupported()))
+    }
 
     /// Whether there is a value under `key`. [`Kv::get`] by default; stores
     /// override it to avoid reading the value.
@@ -214,6 +243,12 @@ impl Kv for Arc<dyn Kv> {
     fn put_from(&self, key: &[u8], reader: &mut dyn Read, len: u64) -> Result<(), Error> {
         (**self).put_from(key, reader, len)
     }
+    fn put_new(&self, key: &[u8], value: Bytes) -> Result<bool, Error> {
+        (**self).put_new(key, value)
+    }
+    fn put_new_from(&self, key: &[u8], reader: &mut dyn Read, len: u64) -> Result<bool, Error> {
+        (**self).put_new_from(key, reader, len)
+    }
     fn get_to(&self, key: &[u8], writer: &mut dyn Write) -> Result<Option<u64>, Error> {
         (**self).get_to(key, writer)
     }
@@ -233,6 +268,9 @@ impl Kv for Arc<dyn Kv> {
     }
     fn aput<'a>(&'a self, key: &'a [u8], value: Bytes) -> KvFuture<'a, ()> {
         (**self).aput(key, value)
+    }
+    fn aput_new<'a>(&'a self, key: &'a [u8], value: Bytes) -> KvFuture<'a, bool> {
+        (**self).aput_new(key, value)
     }
     fn exists(&self, key: &[u8]) -> Result<bool, Error> {
         (**self).exists(key)
@@ -259,6 +297,8 @@ pub enum Op {
     Get,
     /// A write.
     Put,
+    /// An atomic create-only write.
+    PutNew,
 }
 
 impl Op {

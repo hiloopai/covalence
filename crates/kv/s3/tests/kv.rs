@@ -670,6 +670,85 @@ fn multipart_aborts_on_failure() {
     assert_eq!(uploads(root.path()), Vec::<String>::new());
 }
 
+/// A new value goes only under a free key, in one PUT or a multipart upload;
+/// an upload that finds the key taken is aborted, leaving the value as it was.
+#[test]
+fn new_values_never_replace() {
+    let root = tempfile::tempdir().unwrap();
+    let server = serve(root.path());
+    let kv = kv(&server.endpoint, "s3://test/p", SECRET).part_size(5 << 20);
+    assert!(kv.put_new(b"small", "one".into()).unwrap());
+    assert!(!kv.put_new(b"small", "two".into()).unwrap());
+    assert!(!block_on(kv.aput_new(b"small", "two".into())).unwrap());
+    let big = data(11 * MIB);
+    let len = big.len() as u64;
+    assert!(kv.put_new_from(b"big", &mut &big[..], len).unwrap());
+    let mut other = big.clone();
+    other.reverse();
+    assert!(!kv.put_new_from(b"big", &mut &other[..], len).unwrap());
+    assert!(!kv.put_new_from(b"small", &mut &other[..], len).unwrap());
+    assert_eq!(kv.get(b"small").unwrap().unwrap(), "one");
+    assert_eq!(kv.get(b"big").unwrap().unwrap(), big);
+    assert_eq!(uploads(root.path()), Vec::<String>::new());
+}
+
+/// A new value signs and sends `If-None-Match: *` with its PUT, or with the
+/// request completing its upload; 412 there means the key is taken, and the
+/// upload is aborted. To a plain put, 412 is a failure.
+#[test]
+fn new_value_requests() {
+    let taken = || {
+        response(
+            "412 Precondition Failed",
+            "<Error><Code>PreconditionFailed</Code></Error>",
+        )
+    };
+    let (endpoint, server) = fake(vec![
+        taken(),
+        created(),
+        with_header("200 OK", "ETag: \"e1\"", ""),
+        with_header("200 OK", "ETag: \"e2\"", ""),
+        with_header("200 OK", "ETag: \"e3\"", ""),
+        taken(),
+        response("204 No Content", ""),
+        taken(),
+    ]);
+    // The fake server answers requests in turn, so send them one at a time.
+    let kv = kv(&endpoint, "s3://test", SECRET)
+        .part_size(4)
+        .concurrency(1);
+    assert!(!kv.put_new(b"a", "01".into()).unwrap());
+    assert!(!kv.put_new(b"a", "0123456789".into()).unwrap());
+    let error = s3_error(kv.put(b"a", "01".into()).unwrap_err());
+    assert!(
+        matches!(error, Error::Status { status: 412, .. }),
+        "{error}"
+    );
+    let requests = server.join().unwrap();
+    let methods: Vec<_> = requests
+        .iter()
+        .map(|request| request.split_once(' ').unwrap().0)
+        .collect();
+    let expected = ["PUT", "POST", "PUT", "PUT", "PUT", "POST", "DELETE", "PUT"];
+    assert_eq!(methods, expected);
+    for (index, request) in requests.iter().enumerate() {
+        let conditional = matches!(index, 0 | 5);
+        let signed = request
+            .split_once(" HTTP/1.1")
+            .unwrap()
+            .0
+            .contains("if-none-match");
+        assert_eq!(
+            request.contains("\r\nif-none-match: *\r\n"),
+            conditional,
+            "{request}"
+        );
+        assert_eq!(signed, conditional, "{request}");
+    }
+    assert!(requests[5].contains("uploadId=u1"), "{}", requests[5]);
+    assert!(requests[6].contains("uploadId=u1"), "{}", requests[6]);
+}
+
 /// A response with `status`, `header`, closing the connection, and `body`.
 fn with_header(status: &str, header: &str, body: &str) -> String {
     response(status, body).replace(
