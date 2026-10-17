@@ -2,27 +2,36 @@ name: Docs
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
-    types: [opened, reopened, synchronize, closed]
   workflow_dispatch:
 
 permissions: {}
 
+# All publishing runs share a queue: each replaces the whole Pages site.
 concurrency:
-  group: docs-${{ github.ref }}
+  group: docs-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
-    if: github.event.action != 'closed'
+    if: >-
+      github.event_name != 'push' || github.ref == 'refs/heads/main' ||
+      (github.repository_id == '1382624821' && github.ref == 'refs/heads/develop')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # One site per repository. The internal site always includes both
+        # branches; PRs and other manual runs build only their checked-out ref.
+        ref: ${{ fromJSON(github.event_name != 'pull_request' && github.repository_id == '1382624821' && contains(fromJSON('["refs/heads/main", "refs/heads/develop"]'), github.ref) && '["main", "develop"]' || '[""]') }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ matrix.ref || github.sha }}
           persist-credentials: false
       - uses: cachix/install-nix-action@b85815f71a6de0ddee80b8a80a98d43f4bcc66c7 # v31
         with:
@@ -31,95 +40,80 @@ jobs:
       - name: Build the Rust docs
         run: nix develop --no-update-lock-file --command ./bin/glu doc
       # rustdoc writes no workspace index without unstable flags, so list the
-      # crates on a small root page.
+      # crates on a small root page. No generated files are committed to Git.
       - name: Assemble the site
+        env:
+          DOCS_REF: ${{ matrix.ref }}
         run: |
-          mkdir site
-          cp -R target/doc site/rust
-          rm -f site/rust/.lock
-          touch site/.nojekyll
+          destination="site${DOCS_REF:+/$DOCS_REF}"
+          mkdir -p "$destination"
+          cp -R target/doc "$destination/rust"
+          rm -f "$destination/rust/.lock"
+          source_sha="$(git rev-parse HEAD)"
           {
             echo '<!doctype html>'
             echo '<meta charset="utf-8">'
             echo '<title>Covalence docs</title>'
             echo '<h1>Covalence docs</h1>'
-            echo "<p>Built from ${GITHUB_SHA}.</p>"
+            echo "<p>Built from $source_sha.</p>"
             echo '<h2>Rust crates</h2>'
             echo '<ul>'
-            for index in site/rust/*/index.html; do
+            for index in "$destination"/rust/*/index.html; do
               crate="$(basename "$(dirname "$index")")"
               echo "<li><a href=\"rust/$crate/\">$crate</a></li>"
             done
             echo '</ul>'
-          } > site/index.html
+          } > "$destination/index.html"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: docs
+          name: docs-${{ matrix.ref || 'current' }}
           path: site
-          include-hidden-files: true
+          retention-days: 7
           if-no-files-found: error
-
-  # Previews live on the gh-pages branch under pr/pr-<number>/. Pushing works
-  # whether or not Pages is enabled; the link only resolves once it is.
-  preview:
-    needs: build
-    if: >-
-      !cancelled()
-      && github.event_name == 'pull_request'
-      && github.event.pull_request.head.repo.full_name == github.repository
-      && (needs.build.result == 'success' || github.event.action == 'closed')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: write
-      pages: read
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - if: github.event.action != 'closed'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: docs
-          path: site
-      # Private Pages sites have a generated address, so ask for it. Before
-      # Pages is enabled this finds nothing and the action guesses a public one.
-      - name: Find the Pages address
-        id: pages
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          if ! url="$(gh api "repos/$GH_REPO/pages" --jq .html_url)"; then
-            url=""
-          fi
-          url="${url#https://}"
-          echo "base=${url%/}" >> "$GITHUB_OUTPUT"
-      - uses: rossjrw/pr-preview-action@ffa7509e91a3ec8dfc2e5536c4d5c1acdf7a6de9 # v1.8.1
-        with:
-          source-dir: site
-          umbrella-dir: pr
-          pages-base-url: ${{ steps.pages.outputs.base }}
-          qr-code: false
 
   publish:
     needs: build
-    if: github.event_name == 'push'
+    # Repository IDs prevent forks from publishing, and keep internal docs
+    # out of the public site. PRs and manual runs on feature branches cannot
+    # deploy, even when their docs build succeeds.
+    if: >-
+      github.event_name != 'pull_request' &&
+      ((github.repository_id == '1419632160' && github.ref == 'refs/heads/main') ||
+       (github.repository_id == '1382624821' &&
+        contains(fromJSON('["refs/heads/main", "refs/heads/develop"]'), github.ref)))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: docs
+          pattern: docs-*
+          merge-multiple: true
           path: site
-      - uses: JamesIves/github-pages-deploy-action@fa24774553152dd7873cd16ebd8d959b010c5445 # v4.9.0
+      - name: Assemble the branch index
+        if: github.repository_id == '1382624821'
+        run: |
+          test -f site/main/index.html
+          test -f site/develop/index.html
+          cat > site/index.html <<'HTML'
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>Covalence docs</title>
+          <h1>Covalence docs</h1>
+          <ul>
+            <li><a href="develop/">develop</a></li>
+            <li><a href="main/">main</a></li>
+          </ul>
+          HTML
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
-          folder: site
-          branch: gh-pages
-          clean-exclude: /pr/
+          path: site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
