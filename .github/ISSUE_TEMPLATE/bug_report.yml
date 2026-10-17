@@ -1,0 +1,24 @@
+name: Bug report
+description: Something does not work as documented.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The smallest code or commands that show it.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Crate or Python package version, and platform.
+    validations:
+      required: true

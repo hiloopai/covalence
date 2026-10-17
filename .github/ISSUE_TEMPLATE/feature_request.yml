@@ -1,0 +1,16 @@
+name: Feature request
+description: Something Covalence could do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need
+      description: The problem to solve, rather than a particular solution.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Ideas
+      description: How it could work, and alternatives you considered.
