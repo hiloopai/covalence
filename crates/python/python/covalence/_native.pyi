@@ -1,6 +1,8 @@
 from collections.abc import Iterable, Sequence
 from os import PathLike
-from typing import Any, Literal, Self, TypeAlias, final
+from typing import Any, BinaryIO, Literal, Self, TypeAlias, final
+
+from _typeshed import SupportsWrite as _SupportsWrite
 
 from typing_extensions import disjoint_base
 
@@ -150,6 +152,23 @@ class Cid:
         """The raw BLAKE3 CID of the file at `path`, as `Cas.put_file` stores it.
 
         Reads the file without holding it in memory.
+        """
+    @staticmethod
+    def of_fileobj(file: BinaryIO, *, max_bytes: int, expected_length: int | None = None) -> Cid:
+        """The raw BLAKE3 CID of a seekable binary file object, without storing it.
+
+        - Reads once from offset zero, requesting at most 1 MiB at once,
+          without holding the complete file in memory.
+        - `max_bytes` bounds the accepted source length. If given,
+          `expected_length` must not exceed it and must match the source exactly.
+          A length violation raises ValueError. Reads at most one extra byte
+          to check the end.
+        - Calls `seek(0)` and `read(n)`. `seek` must return zero; `read` must
+          return bytes or bytearray, at most `n` bytes. Short reads are allowed;
+          empty bytes end the source. Source exceptions propagate unchanged.
+        - Never closes the source. On success its position is at EOF.
+          The caller must keep it unchanged and exclusively owned until this
+          returns. This does not create a filesystem snapshot.
         """
     def to_raw(self) -> Cid:
         """The CID with the same hash and digest and the raw codec."""
@@ -429,6 +448,29 @@ class Cas:
         - `Cas.kv` over `Kv.s3` streams the file; other stores read it into
           memory.
         """
+    def put_fileobj(self, file: BinaryIO, *, max_bytes: int, expected_length: int | None = None) -> Cid:
+        """Store a seekable binary file object and return its raw BLAKE3 CID.
+
+        - Reads from offset zero twice, to hash and store the same source.
+          The caller must keep the source unchanged and exclusively owned
+          until this returns. This does not create a filesystem snapshot.
+        - `max_bytes` bounds the accepted source length. If given,
+          `expected_length` must not exceed it and must match the source exactly.
+          A length violation raises ValueError before a new block is published.
+          Reads at most one extra byte per pass to check the end.
+        - Calls `seek(0)` and `read(n)`, requesting at most 1 MiB at once.
+          `seek` must return zero; `read` must return bytes or bytearray,
+          at most `n` bytes. Short reads are allowed; empty bytes end the source.
+        - Checks both complete passes, even if the store reuses a block.
+          Changed bytes raise IntegrityError. Reusing a block does not verify
+          the bytes already stored there; use a checked read when that is needed.
+        - Never closes the source. On success its position is at EOF.
+          Source exceptions propagate unchanged; if storage cleanup also fails,
+          raises StoreError with the source exception as its `__cause__`.
+        - The byte limit does not bound backend memory. `Cas.kv` over `Kv.s3`
+          streams with its configured concurrency; other stores may hold the
+          complete block in memory.
+        """
     def put_from(self, cid: Cid, chunks: Iterable[_BytesLike], length: int) -> Cid:
         """Store a block identified by `cid` from `chunks` and return its raw BLAKE3 CID.
 
@@ -461,6 +503,26 @@ class Cas:
           failure leaves `path` as it was.
         - `Cas.kv` over `Kv.s3` streams the bytes; other stores hold them in
           memory.
+        """
+    def get_to(self, cid: Cid, writer: _SupportsWrite[bytes], *, max_bytes: int, expected_length: int | None = None) -> int | None:
+        """Write a block to a binary file object, checking its CID and byte limits.
+
+        Returns the written length, or None if missing.
+
+        - `max_bytes` bounds bytes accepted by `writer.write`. If given,
+          `expected_length` must not exceed it and must match the block exactly.
+          A length violation raises ValueError.
+        - Calls `write(bytes)` with at most 1 MiB at once. It must return an
+          integer from one to the offered length. Short writes are allowed.
+          Never seeks, flushes or closes the writer.
+        - A successful return checks all bytes against `cid`. On failure the
+          writer may contain a partial or unchecked block; use private staging
+          and publish it only after success. Writer exceptions propagate unchanged.
+          If backend cleanup also fails, raises StoreError with the writer
+          exception as its `__cause__`.
+        - The byte limit bounds output, not backend memory. `Cas.kv` over
+          `Kv.s3` streams with its configured concurrency; other stores may
+          fetch the complete block before writing any bytes.
         """
     def size(self, cid: Cid) -> int | None:
         """The size in bytes of the value under `cid`, as the store vouches for it.

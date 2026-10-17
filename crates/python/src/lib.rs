@@ -1,4 +1,5 @@
 mod errors;
+mod streams;
 
 use std::{
     collections::hash_map::DefaultHasher,
@@ -302,6 +303,32 @@ impl PyCid {
     #[staticmethod]
     fn of_file(py: Python<'_>, path: PathBuf) -> PyResult<Self> {
         let (_, cid, _) = py.detach(|| hash_file(&path))?;
+        Ok(Self { inner: cid.into() })
+    }
+
+    /// The raw BLAKE3 CID of a seekable binary file object, without storing it.
+    ///
+    /// - Reads once from offset zero, requesting at most 1 MiB at once,
+    ///   without holding the complete file in memory.
+    /// - `max_bytes` bounds the accepted source length. If given,
+    ///   `expected_length` must not exceed it and must match the source exactly.
+    ///   A length violation raises ValueError. Reads at most one extra byte
+    ///   to check the end.
+    /// - Calls `seek(0)` and `read(n)`. `seek` must return zero; `read` must
+    ///   return bytes or bytearray, at most `n` bytes. Short reads are allowed;
+    ///   empty bytes end the source. Source exceptions propagate unchanged.
+    /// - Never closes the source. On success its position is at EOF.
+    ///   The caller must keep it unchanged and exclusively owned until this
+    ///   returns. This does not create a filesystem snapshot.
+    #[staticmethod]
+    #[pyo3(signature = (file, *, max_bytes, expected_length = None))]
+    fn of_fileobj(
+        py: Python<'_>,
+        file: Py<PyAny>,
+        max_bytes: u64,
+        expected_length: Option<u64>,
+    ) -> PyResult<Self> {
+        let cid = streams::hash_fileobj(py, file, max_bytes, expected_length)?;
         Ok(Self { inner: cid.into() })
     }
 
@@ -1002,6 +1029,39 @@ impl PyCas {
         Ok(PyCid { inner: key.into() })
     }
 
+    /// Store a seekable binary file object and return its raw BLAKE3 CID.
+    ///
+    /// - Reads from offset zero twice, to hash and store the same source.
+    ///   The caller must keep the source unchanged and exclusively owned
+    ///   until this returns. This does not create a filesystem snapshot.
+    /// - `max_bytes` bounds the accepted source length. If given,
+    ///   `expected_length` must not exceed it and must match the source exactly.
+    ///   A length violation raises ValueError before a new block is published.
+    ///   Reads at most one extra byte per pass to check the end.
+    /// - Calls `seek(0)` and `read(n)`, requesting at most 1 MiB at once.
+    ///   `seek` must return zero; `read` must return bytes or bytearray,
+    ///   at most `n` bytes. Short reads are allowed; empty bytes end the source.
+    /// - Checks both complete passes, even if the store reuses a block.
+    ///   Changed bytes raise IntegrityError. Reusing a block does not verify
+    ///   the bytes already stored there; use a checked read when that is needed.
+    /// - Never closes the source. On success its position is at EOF.
+    ///   Source exceptions propagate unchanged; if storage cleanup also fails,
+    ///   raises StoreError with the source exception as its `__cause__`.
+    /// - The byte limit does not bound backend memory. `Cas.kv` over `Kv.s3`
+    ///   streams with its configured concurrency; other stores may hold the
+    ///   complete block in memory.
+    #[pyo3(signature = (file, *, max_bytes, expected_length = None))]
+    fn put_fileobj(
+        &self,
+        py: Python<'_>,
+        file: Py<PyAny>,
+        max_bytes: u64,
+        expected_length: Option<u64>,
+    ) -> PyResult<PyCid> {
+        let key = streams::upload(py, self.inner.as_ref(), file, max_bytes, expected_length)?;
+        Ok(PyCid { inner: key.into() })
+    }
+
     /// Store a block identified by `cid` from `chunks` and return its raw BLAKE3 CID.
     ///
     /// For bytes that arrive in pieces, such as a request body, without
@@ -1085,6 +1145,44 @@ impl PyCas {
             })?;
         }
         Ok(len)
+    }
+
+    /// Write a block to a binary file object, checking its CID and byte limits.
+    ///
+    /// Returns the written length, or None if missing.
+    ///
+    /// - `max_bytes` bounds bytes accepted by `writer.write`. If given,
+    ///   `expected_length` must not exceed it and must match the block exactly.
+    ///   A length violation raises ValueError.
+    /// - Calls `write(bytes)` with at most 1 MiB at once. It must return an
+    ///   integer from one to the offered length. Short writes are allowed.
+    ///   Never seeks, flushes or closes the writer.
+    /// - A successful return checks all bytes against `cid`. On failure the
+    ///   writer may contain a partial or unchecked block; use private staging
+    ///   and publish it only after success. Writer exceptions propagate unchanged.
+    ///   If backend cleanup also fails, raises StoreError with the writer
+    ///   exception as its `__cause__`.
+    /// - The byte limit bounds output, not backend memory. `Cas.kv` over
+    ///   `Kv.s3` streams with its configured concurrency; other stores may
+    ///   fetch the complete block before writing any bytes.
+    #[pyo3(signature = (cid, writer, *, max_bytes, expected_length = None))]
+    fn get_to(
+        &self,
+        py: Python<'_>,
+        cid: PyRef<'_, PyCid>,
+        writer: Py<PyAny>,
+        max_bytes: u64,
+        expected_length: Option<u64>,
+    ) -> PyResult<Option<u64>> {
+        let cid = cid.key()?;
+        streams::download(
+            py,
+            self.inner.as_ref(),
+            &cid,
+            writer,
+            max_bytes,
+            expected_length,
+        )
     }
 
     /// The bytes under `cid`, checked against it, or None if missing.
