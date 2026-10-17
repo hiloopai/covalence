@@ -26,7 +26,7 @@ use pyo3::{
     intern,
     prelude::*,
     pybacked::{PyBackedBytes, PyBackedStr},
-    types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple},
+    types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyIterator, PyList, PyString, PyTuple},
 };
 
 use crate::errors::{Class, raise, raise_as};
@@ -592,6 +592,9 @@ impl PyKv {
     ///
     /// `location` is an `s3://bucket/prefix/` URL, or a bucket name with
     /// `prefix`. `region` and `profile` override the SDK configuration.
+    /// `concurrency` is how many 8 MiB parts of one value move at once (16 by
+    /// default; 0 counts as 1), which bounds the memory a streamed value
+    /// holds.
     ///
     /// - An invalid location, a URL with `prefix` too, or no region raises
     ///   ValueError.
@@ -602,13 +605,14 @@ impl PyKv {
     /// - Without `s3:ListBucket`, S3 answers 403 for a missing key, so reading
     ///   one raises StoreError instead of returning None or False.
     #[staticmethod]
-    #[pyo3(signature = (location, prefix = None, *, region = None, profile = None))]
+    #[pyo3(signature = (location, prefix = None, *, region = None, profile = None, concurrency = None))]
     fn s3(
         py: Python<'_>,
         location: &str,
         prefix: Option<&str>,
         region: Option<String>,
         profile: Option<String>,
+        concurrency: Option<usize>,
     ) -> PyResult<Self> {
         let location = match (location.strip_prefix("s3://"), prefix) {
             (None, prefix) => S3Location::new(location, prefix.unwrap_or_default()),
@@ -624,6 +628,10 @@ impl PyKv {
         let kv = py
             .detach(|| S3Kv::from_aws(location, &options))
             .map_err(raise)?;
+        let kv = match concurrency {
+            Some(parts) => kv.concurrency(parts),
+            None => kv,
+        };
         Ok(Self {
             inner: kv.into_dyn(),
         })
@@ -994,6 +1002,62 @@ impl PyCas {
         Ok(PyCid { inner: key.into() })
     }
 
+    /// Store a block identified by `cid` from `chunks` and return its raw BLAKE3 CID.
+    ///
+    /// For bytes that arrive in pieces, such as a request body, without
+    /// holding them all at once.
+    ///
+    /// - `cid` must be a BLAKE3 CID of any codec; another hash raises
+    ///   ValueError.
+    /// - `chunks` yields bytes or bytearray. Before a new block is stored,
+    ///   its bytes must match `length` and `cid`, and the iterable must end there.
+    /// - A store may return an existing block without consuming all of
+    ///   `chunks`. Unread bytes and source errors are not checked.
+    /// - While consuming input, a hash mismatch raises IntegrityError; too
+    ///   few or too many bytes raises ValueError; a source exception propagates
+    ///   unchanged. These failures publish no new block.
+    ///   If cleanup also fails, raises StoreError with the source exception
+    ///   as its `__cause__` and the cleanup failure in its message.
+    /// - `Cas.kv` over `Kv.s3` streams the bytes up in parts, holding about as
+    ///   many parts as upload at once; other stores hold them in memory.
+    fn put_from(
+        &self,
+        py: Python<'_>,
+        cid: PyRef<'_, PyCid>,
+        chunks: &Bound<'_, PyAny>,
+        length: u64,
+    ) -> PyResult<PyCid> {
+        let claim = cid
+            .key()?
+            .raw_blake3()
+            .ok_or_else(|| fail(format!("{} is not a BLAKE3 CID", cid.inner)))?;
+        let mut reader = Chunks {
+            iter: chunks.try_iter()?.unbind(),
+            chunk: None,
+            offset: 0,
+            left: length,
+            error: None,
+        };
+        // No read asks past the last byte, so check that nothing follows it here.
+        if length == 0 {
+            reader.end()?;
+        }
+        let result = py.detach(|| self.inner.put_from(claim, &mut reader, length));
+        if let Some(source) = reader.error.take() {
+            return match result {
+                Err(error @ covalence_cas_trait::Error::Backend { .. }) => {
+                    let error = raise(error);
+                    error.set_cause(py, Some(source));
+                    Err(error)
+                }
+                _ => Err(source),
+            };
+        }
+        let key = result.map_err(raise)?;
+        check_key(key, claim)?;
+        Ok(PyCid { inner: key.into() })
+    }
+
     /// Write the bytes under `cid` to the file at `path` and return their length.
     ///
     /// Returns None if missing.
@@ -1144,6 +1208,83 @@ impl PyCas {
         let key = py.detach(|| self.inner.put(data)).map_err(raise)?;
         check_key(key, claim)?;
         Ok(key)
+    }
+}
+
+/// The bytes of a Python iterable of chunks, read as exactly `left` more
+/// bytes. The read handing over the last of them first checks that the
+/// iterable ends there, so a store reading it never sees a last byte that
+/// more bytes follow. On failure it keeps the Python exception in `error`.
+struct Chunks {
+    iter: Py<PyIterator>,
+    chunk: Option<PyBackedBytes>,
+    offset: usize,
+    left: u64,
+    error: Option<PyErr>,
+}
+
+impl Chunks {
+    /// The next chunk, skipping empty ones, or None at the end.
+    fn next(&self) -> PyResult<Option<PyBackedBytes>> {
+        Python::attach(|py| {
+            let iter = self.iter.bind(py);
+            for item in iter.clone() {
+                let chunk: PyBackedBytes = item?.extract()?;
+                if !chunk.is_empty() {
+                    return Ok(Some(chunk));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    /// ValueError unless the iterable has no more bytes.
+    fn end(&self) -> PyResult<()> {
+        match self.next()? {
+            None => Ok(()),
+            Some(_) => Err(PyValueError::new_err("chunks hold more bytes than length")),
+        }
+    }
+
+    /// The next chunk, counted against `left`: ValueError if the iterable
+    /// ends early or holds too many bytes.
+    fn take(&mut self) -> PyResult<PyBackedBytes> {
+        let Some(chunk) = self.next()? else {
+            return Err(PyValueError::new_err("chunks hold fewer bytes than length"));
+        };
+        self.left = self
+            .left
+            .checked_sub(chunk.len() as u64)
+            .ok_or_else(|| PyValueError::new_err("chunks hold more bytes than length"))?;
+        if self.left == 0 {
+            self.end()?;
+        }
+        Ok(chunk)
+    }
+}
+
+impl io::Read for Chunks {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let chunk = match self.chunk.take() {
+            Some(chunk) if self.offset < chunk.len() => chunk,
+            _ if self.left == 0 => return Ok(0),
+            _ => {
+                self.offset = 0;
+                self.take().map_err(|error| {
+                    let message = error.to_string();
+                    self.error = Some(error);
+                    io::Error::other(message)
+                })?
+            }
+        };
+        let read = buf.len().min(chunk.len() - self.offset);
+        buf[..read].copy_from_slice(&chunk[self.offset..self.offset + read]);
+        self.offset += read;
+        self.chunk = Some(chunk);
+        Ok(read)
     }
 }
 

@@ -21,7 +21,7 @@ True
 ## Install
 
 ```sh
-pip install covalence==0.1.0.dev2
+pip install covalence==0.1.0.dev3
 ```
 
 - Pre-releases need an exact pin like this one, or `pip install --pre`.
@@ -145,16 +145,25 @@ pip install covalence==0.1.0.dev2
   - Ranges are clipped at the end.
   - Stores without native ranges fetch the whole value and slice it.
 
-### Files
+### Files and streams
 
 - `Cas.put_file(path)` stores a file and returns its raw BLAKE3 `Cid`, as
   `put` does.
+- `Cas.put_from(cid, chunks, length)` stores a block from an iterable of
+  bytes, such as a request body, and returns its raw BLAKE3 `Cid`. Before a
+  new block is stored, its bytes must match `length` and the BLAKE3 `cid`,
+  and `chunks` must end there. A store may return an existing block without
+  consuming all the input; unread bytes and source errors are not checked.
+  While consuming input, a hash mismatch (`IntegrityError`), too few or too
+  many bytes (`ValueError`), or a source exception publish no new block.
+  Source exceptions propagate unchanged unless cleanup also fails, in which
+  case `StoreError` reports that failure with the source as its `__cause__`.
 - `Cas.get_file(cid, path)` writes the block to a file and returns its
   length, or `None` if missing.
-- `put_file` and `get_file` stream on `Cas.kv` over `Kv.s3`, holding up to
-  16 parts of 8 MiB (128 MiB) at a time; files over 78 GiB go up in larger
-  parts. Other stores, including `Cas.kv(Kv.memory())`, hold the block in
-  memory.
+- `put_file`, `put_from` and `get_file` stream on `Cas.kv` over `Kv.s3`,
+  holding up to 16 parts of 8 MiB (128 MiB) at a time, or as many as
+  `Kv.s3(..., concurrency=n)` says; blocks over 78 GiB go up in larger parts. Other stores, including `Cas.kv(Kv.memory())`, hold
+  the block in memory.
 - `put_file` reads the file twice, to hash it and to store it, and stores the
   bytes it hashed. If they changed in between it raises `IntegrityError`,
   and if the file got shorter `OSError`, storing nothing either way. Bytes
@@ -243,8 +252,8 @@ workflow artifacts. A release tag must match the workspace version, such as
   `.github/workflows/crates.yml` publishes the crates to crates.io.
 - `python-v<version>` only attaches them to the GitHub release.
 
-To publish `0.1.0-dev.2`:
+To publish `0.1.0-dev.3`:
 
 ```sh
-git tag v0.1.0-dev.2 && git push origin v0.1.0-dev.2
+git tag v0.1.0-dev.3 && git push origin v0.1.0-dev.3
 ```
