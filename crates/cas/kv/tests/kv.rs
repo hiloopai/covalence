@@ -25,7 +25,7 @@ use tokio::sync::oneshot;
 const HELLO: &str = "blake3/5khrmpntq2bjexseshc6ldklwnig56gbj23yvbxjbdcwestheahq/bytes";
 
 /// Store "hello" and check reads, then `corrupt` it and check that checked
-/// reads notice, and that `put` writes the block again.
+/// reads notice, and that `put` leaves the block it finds: it never replaces.
 fn check(store: &KvCas, corrupt: impl FnOnce()) {
     let cid: Cid = store.put("hello".into()).unwrap();
     assert_eq!(cid, Blake3::of(b"hello").into());
@@ -59,7 +59,12 @@ fn check(store: &KvCas, corrupt: impl FnOnce()) {
     ));
     assert!(matches!(store.get_fact(&cid), Err(Error::Check { .. })));
     let _: Cid = store.put("hello".into()).unwrap();
-    assert_eq!(store.get(&cid).unwrap().unwrap(), "hello");
+    assert_eq!(store.get_unchecked(&cid).unwrap().unwrap(), "wrong");
+    let _ = block_on(store.aput("hello".into())).unwrap();
+    assert_eq!(store.get_unchecked(&cid).unwrap().unwrap(), "wrong");
+    let put_from = store.put_from(Blake3::of(b"hello"), &mut &b"hello"[..], 5);
+    assert_eq!(put_from.unwrap(), cid);
+    assert_eq!(store.get_unchecked(&cid).unwrap().unwrap(), "wrong");
 }
 
 #[test]
@@ -72,7 +77,7 @@ fn memory() {
 }
 
 /// A key-value store that cannot read values, only whether they exist.
-struct Blind(MemoryKv);
+struct Blind(MemoryKv, usize);
 
 impl Kv for Blind {
     fn get(&self, _: &[u8]) -> Result<Option<Bytes>, covalence_kv_trait::Error> {
@@ -90,13 +95,61 @@ impl Kv for Blind {
     fn exists(&self, key: &[u8]) -> Result<bool, covalence_kv_trait::Error> {
         self.0.exists(key)
     }
+    fn put_new(&self, key: &[u8], value: Bytes) -> Result<bool, covalence_kv_trait::Error> {
+        self.0.put_new(key, value)
+    }
+    fn aput_new<'a>(&'a self, key: &'a [u8], value: Bytes) -> KvFuture<'a, bool> {
+        self.0.aput_new(key, value)
+    }
+    fn put_new_from(
+        &self,
+        key: &[u8],
+        reader: &mut dyn std::io::Read,
+        len: u64,
+    ) -> Result<bool, covalence_kv_trait::Error> {
+        if self.0.exists(key)? {
+            reader
+                .read_exact(&mut vec![0; self.1])
+                .map_err(|source| covalence_kv_trait::Error::Io { source })?;
+            return Ok(false);
+        }
+        self.0.put_new_from(key, reader, len)
+    }
+}
+
+/// An existing block may succeed with invalid or failing input left unread.
+#[test]
+fn existing_blocks_leave_unused_stream_bytes_unchecked() {
+    for consumed in [0, 2] {
+        // A backend may skip immediately or after reading part of the source.
+        let store = KvCas::new(Blind(MemoryKv::default(), consumed).into_dyn());
+        let cid: Cid = store.put("hello".into()).unwrap();
+        let claim = Blake3::of(b"hello");
+        for data in [&b"wrong"[..], &b"bad"[..]] {
+            let mut source = std::io::Cursor::new(data);
+            assert_eq!(store.put_from(claim, &mut source, 5).unwrap(), cid);
+            assert_eq!(source.position(), consumed as u64);
+        }
+        // An error beyond the consumed prefix must not be observed either.
+        let mut source = std::io::Read::chain(std::io::Cursor::new(b"he"), FailingReader);
+        assert_eq!(store.put_from(claim, &mut source, 5).unwrap(), cid);
+        assert_eq!(source.get_ref().0.position(), consumed as u64);
+    }
+}
+
+struct FailingReader;
+
+impl std::io::Read for FailingReader {
+    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("source failed"))
+    }
 }
 
 /// `has` and `missing` ask whether keys exist rather than reading values,
 /// through `Arc<dyn Cas>` too.
 #[test]
 fn existence_without_reads() {
-    let store = KvCas::new(Blind(MemoryKv::default()).into_dyn()).into_dyn();
+    let store = KvCas::new(Blind(MemoryKv::default(), 0).into_dyn()).into_dyn();
     let cid = store.put("hello".into()).unwrap();
     assert_eq!(store.put("hello".into()).unwrap(), cid);
     let missing: Cid = Blake3::of(b"missing").into();
@@ -352,12 +405,12 @@ impl Kv for Leaky {
     fn put(&self, _: &[u8], _: Bytes) -> Result<(), covalence_kv_trait::Error> {
         Ok(())
     }
-    fn put_from(
+    fn put_new_from(
         &self,
         _: &[u8],
         reader: &mut dyn std::io::Read,
         _: u64,
-    ) -> Result<(), covalence_kv_trait::Error> {
+    ) -> Result<bool, covalence_kv_trait::Error> {
         let _ = reader.read_to_end(&mut Vec::new());
         Err(covalence_kv_trait::Error::Backend {
             source: "abort failed".into(),

@@ -17,13 +17,17 @@
 //! ```
 #![deny(missing_docs)]
 
-use std::{collections::BTreeMap, sync::RwLock};
+use std::{
+    collections::BTreeMap,
+    io::{self, Read},
+    sync::RwLock,
+};
 
 use covalence_kv_trait::{Error, Kv, KvFuture, ready};
 use covalence_lib_dasl::Value;
 use covalence_lib_data::Bytes;
 
-/// An in-memory store. It accepts every key.
+/// An in-memory store. It accepts every key, and [`Kv::put_new`] is atomic.
 ///
 /// [`Kv::info`] is `{"name": "memory"}`, and [`Kv::stats`] counts `keys` and
 /// the `bytes` of their values.
@@ -46,6 +50,35 @@ impl Kv for MemoryKv {
 
     fn aput<'a>(&'a self, key: &'a [u8], value: Bytes) -> KvFuture<'a, ()> {
         ready(self.put(key, value))
+    }
+
+    fn put_new(&self, key: &[u8], value: Bytes) -> Result<bool, Error> {
+        let mut map = self.0.write().unwrap();
+        if map.contains_key(key) {
+            return Ok(false);
+        }
+        map.insert(key.into(), value);
+        Ok(true)
+    }
+
+    /// Reads the value into memory first, so the store is locked only to
+    /// insert it.
+    fn put_new_from(&self, key: &[u8], reader: &mut dyn Read, len: u64) -> Result<bool, Error> {
+        let mut value = Vec::new();
+        let read = reader
+            .take(len)
+            .read_to_end(&mut value)
+            .map_err(|source| Error::Io { source })?;
+        if (read as u64) < len {
+            return Err(Error::Io {
+                source: io::ErrorKind::UnexpectedEof.into(),
+            });
+        }
+        self.put_new(key, value.into())
+    }
+
+    fn aput_new<'a>(&'a self, key: &'a [u8], value: Bytes) -> KvFuture<'a, bool> {
+        ready(self.put_new(key, value))
     }
 
     fn exists(&self, key: &[u8]) -> Result<bool, Error> {

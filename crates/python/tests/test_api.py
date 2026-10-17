@@ -494,7 +494,13 @@ class FakeS3(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if self.command == "PUT":
-            self.server.objects[url.path] = self.rfile.read(int(self.headers["Content-Length"]))
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            if self.headers["If-None-Match"] == "*" and url.path in self.server.objects:
+                self.send_response(412)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.server.objects[url.path] = body
             data = b""
         elif url.path in self.server.objects:
             data = self.server.objects[url.path]
@@ -580,6 +586,17 @@ class S3Tests(ApiCase):
         self.assertEqual(self.credential(), ("profile-key", None))
         _, _, query = self.server.requests[-1]
         self.assertIn("/eu-central-1/s3/", query["X-Amz-Credential"][0])
+
+    def test_cas_never_replaces_over_s3(self):
+        os.environ.update(AWS_ACCESS_KEY_ID="key", AWS_SECRET_ACCESS_KEY="secret")
+        cas = Cas.kv(Kv.s3("s3://bucket/p", region="us-east-1"))
+        cid = Cid.of(b"one")
+        path = f"/bucket/p/blake3/{base64.b32encode(cid.digest).decode().lower().rstrip('=')}/bytes"
+        self.server.objects[path] = b"wrong"
+        self.assertEqual(cas.put(b"one"), cid)
+        self.assertEqual(self.server.objects, {path: b"wrong"})
+        with self.assertRaises(IntegrityError):
+            cas.get(cid)
 
     def test_cas_over_s3(self):
         os.environ.update(AWS_ACCESS_KEY_ID="key", AWS_SECRET_ACCESS_KEY="secret")
@@ -814,8 +831,8 @@ class CasTests(ApiCase):
             with self.subTest(get=get.__name__), self.assertRaises(IntegrityError):
                 get(cid)
         self.assertTrue(cas.has(cid))  # has does not read or check
-        cas.put(b"one")  # put writes the block again
-        self.assertEqual(cas.get(cid), b"one")
+        cas.put(b"one")  # put never replaces a block
+        self.assertEqual(kv.get(key), b"two")
 
     def test_has_and_missing(self):
         one, two, sha256 = Cid.of(b"one"), Cid.of(b"two"), Cid.of(b"one", "sha256")

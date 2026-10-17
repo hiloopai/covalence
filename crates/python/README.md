@@ -124,6 +124,9 @@ pip install covalence==0.1.0.dev2
     `prefix/blake3/<digest>/bytes`.
 - `put` returns the raw BLAKE3 `Cid`, after checking that the store kept the
   data under it.
+- `Cas.kv` never replaces a block its `Kv` already holds: on `Kv.s3` each
+  write is conditional (`If-None-Match: *`), so concurrent writers of one
+  block race safely and the first one's bytes stay.
 - `put_value(value)` stores the DRISL encoding of a `Value` (or what
   `Value(...)` takes) and returns its DRISL CID, which is `value.cid()`.
 - `get` returns the bytes and `get_fact` a `BlobFact`, both checked against

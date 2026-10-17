@@ -46,13 +46,16 @@ use data_encoding::BASE32_NOPAD;
 ///   `get_fact` and `aget_fact` check the bytes against the CID and fail with
 ///   [`Error::Check`] if they do not match. `get_unchecked`, sizes and ranges
 ///   are not checked.
-/// - `has` asks the key-value store whether the key exists (a HEAD request on
-///   S3), without reading the bytes.
-/// - `put` writes without asking first, so it needs only write access. (S3
-///   answers a HEAD for a missing key with 403 to a client that may not list
-///   the bucket.)
+/// - `has` asks the key-value store whether the key exists, without reading
+///   the bytes.
+/// - `put`, `aput` and `put_from` never replace a block: they store through
+///   the key-value store's [`Kv::put_new`], [`Kv::aput_new`] and
+///   [`Kv::put_new_from`], so concurrent writers of one block race safely.
+///   Writes fail if the backend does not implement atomic create-only writes.
 /// - `put_from` and `get_to` stream through the key-value store's own
-///   `put_from` and `get_to`, hashing the bytes as they pass.
+///   `put_new_from` and `get_to`, hashing the bytes as they pass.
+///   If the backend skips an existing block, `put_from` returns without
+///   consuming or checking any remaining input.
 /// - If the bytes `put_from` reads do not hash to the CID, the read that would
 ///   hand over the last byte fails instead. The key-value store's `put_from`
 ///   then fails as [`Kv::put_from`] says, storing nothing, and `put_from`
@@ -60,6 +63,18 @@ use data_encoding::BASE32_NOPAD;
 ///   store reports a further failure, such as failing to clean up.
 /// - [`Cas::info`] is `{"name": "kv", "prefix": <prefix>, "kv": <the
 ///   key-value store's info>}`; [`Cas::stats`] is the key-value store's.
+///
+/// # S3
+///
+/// Writes use conditional requests to preserve existing blocks. They do not
+/// make a preliminary HEAD request, so they need only write access.
+///
+/// `has` uses a HEAD request. S3 answers a HEAD for a missing key with 403 to
+/// a client that may not list the bucket.
+///
+/// S3 may consume the source before discovering that a block already exists.
+/// Once the backend skips insertion, `put_from` leaves any remaining input
+/// unread.
 pub struct KvCas {
     kv: Arc<dyn Kv>,
     prefix: String,
@@ -277,7 +292,7 @@ impl Put<Blake3> for KvCas {
     fn put(&self, bytes: Bytes) -> Result<Blake3, Error> {
         let cid = Blake3::of(&bytes);
         self.kv
-            .put(self.key(&cid).as_bytes(), bytes)
+            .put_new(self.key(&cid).as_bytes(), bytes)
             .map_err(backend)?;
         Ok(cid)
     }
@@ -294,7 +309,10 @@ impl AsyncPut for KvCas {
         Box::pin(async move {
             let cid = Blake3::of(&bytes);
             let key = self.key(&cid);
-            self.kv.aput(key.as_bytes(), bytes).await.map_err(backend)?;
+            self.kv
+                .aput_new(key.as_bytes(), bytes)
+                .await
+                .map_err(backend)?;
             Ok(cid.into())
         })
     }
@@ -334,8 +352,8 @@ impl Cas for KvCas {
             mismatch: false,
         };
         let key = self.key(&cid);
-        match self.kv.put_from(key.as_bytes(), &mut checked, len) {
-            Ok(()) => Ok(cid.into()),
+        match self.kv.put_new_from(key.as_bytes(), &mut checked, len) {
+            Ok(_) => Ok(cid.into()),
             // The store failed as asked; a store error beyond that, such as a
             // failed cleanup, is the one to report.
             Err(covalence_kv_trait::Error::Io { .. }) if checked.mismatch => {

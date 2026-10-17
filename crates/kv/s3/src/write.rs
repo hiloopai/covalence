@@ -1,5 +1,7 @@
 //! PUTs: one request for a value up to the part size, a multipart upload for
-//! a larger one.
+//! a larger one. A put of a new value is a conditional write (`If-None-Match:
+//! *` on the PUT, or on completing the upload), which S3 answers with 412 when
+//! the key already holds a value.
 
 use std::io::Read;
 
@@ -17,10 +19,32 @@ use crate::{
 /// The header carrying the base64 SHA-256 of a PUT body, signed with the URL.
 const CHECKSUM: &str = "x-amz-checksum-sha256";
 
+/// The header making a write conditional on the key holding no value.
+const IF_NONE_MATCH: &str = "if-none-match";
+
+/// Whether a write may replace a value under its key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Write {
+    /// Replace any value.
+    Replace,
+    /// Store only if the key holds no value; S3 decides, atomically.
+    New,
+}
+
 /// An uploaded part: its ETag and base64 SHA-256.
 struct Part {
     etag: String,
     checksum: String,
+}
+
+/// Whether a write answered with `status` stored: 200 did, and 412 to a new
+/// value means the key already holds one.
+fn stored(status: u16, body: &[u8], write: Write) -> Result<bool, Error> {
+    match status {
+        200 => Ok(true),
+        412 if write == Write::New => Ok(false),
+        status => status_error(status, body),
+    }
 }
 
 /// `text` escaped for an XML element.
@@ -29,24 +53,26 @@ fn escape(text: &str) -> String {
 }
 
 impl S3Kv {
-    /// Store `value` under `key`.
-    pub(crate) fn write(&self, key: &[u8], value: Bytes) -> Result<(), Error> {
+    /// Store `value` under `key`, as `write` says; whether it stored.
+    pub(crate) fn write(&self, key: &[u8], value: Bytes, write: Write) -> Result<bool, Error> {
         let mut offset = 0;
-        self.upload(key, value.len() as u64, |len| {
+        self.upload(key, value.len() as u64, write, |len| {
             let part = value.slice(offset..offset + len);
             offset += len;
             Ok(part)
         })
     }
 
-    /// Store the next `len` bytes of `reader` under `key`.
+    /// Store the next `len` bytes of `reader` under `key`, as `write` says;
+    /// whether it stored.
     pub(crate) fn write_from(
         &self,
         key: &[u8],
         reader: &mut dyn Read,
         len: u64,
-    ) -> Result<(), Error> {
-        self.upload(key, len, |len| {
+        write: Write,
+    ) -> Result<bool, Error> {
+        self.upload(key, len, write, |len| {
             let mut part = vec![0; len];
             reader.read_exact(&mut part).context(IoSnafu)?;
             Ok(part.into())
@@ -56,17 +82,19 @@ impl S3Kv {
     /// Store `len` bytes under `key`, taking each part's bytes from `next`
     /// in order, which is asked for all of them at once if they fit in one
     /// part. Parts go up concurrently; the upload is aborted only once none
-    /// is in flight, so that no part outlives it.
+    /// is in flight, so that no part outlives it, and also when a new value
+    /// finds the key taken, which leaves the parts uploaded.
     fn upload(
         &self,
         key: &[u8],
         len: u64,
+        write: Write,
         mut next: impl FnMut(usize) -> Result<Bytes, Error>,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let object = self.object(key)?;
         let part = self.part_for(len);
         if len <= part {
-            return self.put_object(&object, next(len as usize)?);
+            return self.put_object(&object, next(len as usize)?, write);
         }
         let upload_id = self.create(&object)?;
         // At most MAX_PARTS, so the count and part numbers fit.
@@ -89,15 +117,19 @@ impl S3Kv {
                     Ok(())
                 },
             )
-            .and_then(|()| self.complete(&object, &upload_id, &parts));
-        result.map_err(|cause| match self.abort(&object, &upload_id) {
-            Ok(()) => cause,
-            Err(source) => Error::Abort {
-                upload_id,
-                cause: Box::new(cause),
-                source: Box::new(source),
-            },
-        })
+            .and_then(|()| self.complete(&object, &upload_id, &parts, write));
+        match result {
+            Ok(true) => Ok(true),
+            Ok(false) => self.abort(&object, &upload_id).map(|()| false),
+            Err(cause) => Err(match self.abort(&object, &upload_id) {
+                Ok(()) => cause,
+                Err(source) => Error::Abort {
+                    upload_id,
+                    cause: Box::new(cause),
+                    source: Box::new(source),
+                },
+            }),
+        }
     }
 
     /// The part size for a value of `len` bytes: the configured one, or as
@@ -106,23 +138,27 @@ impl S3Kv {
         self.part.max(len.div_ceil(MAX_PARTS))
     }
 
-    /// PUT `value` as `object` in one request.
-    fn put_object(&self, object: &str, value: Bytes) -> Result<(), Error> {
+    /// PUT `value` as `object` in one request, as `write` says; whether it
+    /// stored.
+    fn put_object(&self, object: &str, value: Bytes, write: Write) -> Result<bool, Error> {
         let checksum = BASE64.encode(&Sha256::digest(&value));
         let credentials = self.credentials()?;
         let (status, body) = self.send(|| {
             let mut action = self.bucket.put_object(Some(&credentials), object);
             action.headers_mut().insert(CHECKSUM, &checksum);
+            if write == Write::New {
+                action.headers_mut().insert(IF_NONE_MATCH, "*");
+            }
             let url = action.sign(EXPIRY);
             let request = self.agent.put(url.as_str()).config();
             let request = request.timeout_global(Some(timeout(value.len() as u64)));
-            let request = request.build().header(CHECKSUM, &checksum);
+            let mut request = request.build().header(CHECKSUM, &checksum);
+            if write == Write::New {
+                request = request.header(IF_NONE_MATCH, "*");
+            }
             body(request.send(&value[..])?, MAX_ERROR, Vec::new())
         })?;
-        match status {
-            200 => Ok(()),
-            status => status_error(status, &body),
-        }
+        stored(status, &body, write)
     }
 
     /// Start a multipart upload of `object` with SHA-256 part checksums, and
@@ -184,9 +220,16 @@ impl S3Kv {
         Ok(Part { etag, checksum })
     }
 
-    /// Complete upload `upload_id` from `parts`. S3 can answer 200 with an
-    /// error in the body, so that is a failure too.
-    fn complete(&self, object: &str, upload_id: &str, parts: &[Part]) -> Result<(), Error> {
+    /// Complete upload `upload_id` from `parts`, as `write` says; whether it
+    /// stored. S3 can answer 200 with an error in the body, so that is a
+    /// failure too.
+    fn complete(
+        &self,
+        object: &str,
+        upload_id: &str,
+        parts: &[Part],
+        write: Write,
+    ) -> Result<bool, Error> {
         let mut xml = String::from("<CompleteMultipartUpload>");
         for (number, part) in (1..).zip(parts) {
             xml += &format!(
@@ -200,23 +243,29 @@ impl S3Kv {
         let credentials = self.credentials()?;
         let (status, body) = self.send(|| {
             // rusty-s3 writes a body without checksums, so only sign with it.
-            let action = self.bucket.complete_multipart_upload(
+            let mut action = self.bucket.complete_multipart_upload(
                 Some(&credentials),
                 object,
                 upload_id,
                 std::iter::empty::<&str>(),
             );
+            if write == Write::New {
+                action.headers_mut().insert(IF_NONE_MATCH, "*");
+            }
             let url = action.sign(EXPIRY);
             // S3 takes longer to join more parts.
             let wait = timeout(parts.len() as u64 * crate::MIN_RATE);
             let request = self.agent.post(url.as_str()).config();
-            let request = request.timeout_global(Some(wait)).build();
+            let mut request = request.timeout_global(Some(wait)).build();
+            if write == Write::New {
+                request = request.header(IF_NONE_MATCH, "*");
+            }
             body(request.send(&xml)?, MAX_ERROR, Vec::new())
         })?;
-        match status {
-            200 if !body.windows(7).any(|window| window == b"<Error>") => Ok(()),
-            status => status_error(status, &body),
+        if status == 200 && body.windows(7).any(|window| window == b"<Error>") {
+            return status_error(status, &body);
         }
+        stored(status, &body, write)
     }
 
     /// Abort upload `upload_id`, freeing its parts. A missing upload is

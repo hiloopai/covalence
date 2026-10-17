@@ -30,6 +30,8 @@
 mod read;
 mod write;
 
+use write::Write;
+
 use std::{
     collections::BTreeMap,
     fmt,
@@ -405,6 +407,10 @@ impl Cached {
 ///   `x-amz-checksum-sha256`, which S3 checks against the bytes it receives.
 /// - A failed multipart upload is aborted once its parts in flight finish.
 ///   If aborting fails too, the error is [`Error::Abort`].
+/// - [`Kv::put_new`] and [`Kv::put_new_from`] send `If-None-Match: *` with
+///   the PUT, or with the request completing a multipart upload, so S3 stores
+///   the value only if the key holds none (status 412 otherwise), atomically.
+///   A multipart upload that finds the key taken is aborted.
 ///
 /// # Reads
 ///
@@ -783,7 +789,8 @@ impl Kv for S3Kv {
     }
 
     fn put(&self, key: &[u8], value: Bytes) -> Result<(), covalence_kv_trait::Error> {
-        Ok(self.write(key, value)?)
+        self.write(key, value, Write::Replace)?;
+        Ok(())
     }
 
     /// Stream the value up in parts, reading them in order and holding about
@@ -794,7 +801,27 @@ impl Kv for S3Kv {
         reader: &mut dyn io::Read,
         len: u64,
     ) -> Result<(), covalence_kv_trait::Error> {
-        Ok(self.write_from(key, reader, len)?)
+        self.write_from(key, reader, len, Write::Replace)?;
+        Ok(())
+    }
+
+    /// A conditional write: `If-None-Match: *`, atomic in S3. Needs only
+    /// `s3:PutObject`.
+    fn put_new(&self, key: &[u8], value: Bytes) -> Result<bool, covalence_kv_trait::Error> {
+        Ok(self.write(key, value, Write::New)?)
+    }
+
+    /// As [`Kv::put_from`], with a conditional write: `If-None-Match: *` on
+    /// the PUT or on completing the multipart upload, atomic in S3. A large
+    /// value is uploaded in full before S3 decides; when the key is taken,
+    /// the upload is aborted (`s3:AbortMultipartUpload`).
+    fn put_new_from(
+        &self,
+        key: &[u8],
+        reader: &mut dyn io::Read,
+        len: u64,
+    ) -> Result<bool, covalence_kv_trait::Error> {
+        Ok(self.write_from(key, reader, len, Write::New)?)
     }
 
     /// Stream the value down in ranges, writing them in order and holding
@@ -832,6 +859,13 @@ impl Kv for S3Kv {
 
     fn aput<'a>(&'a self, key: &'a [u8], value: Bytes) -> KvFuture<'a, ()> {
         ready(self.put(key, value))
+    }
+
+    /// Write before returning a ready future, as [`Kv::put_new`] does.
+    ///
+    /// This blocks just like [`Kv::put_new`]; keep it off async runtime threads.
+    fn aput_new<'a>(&'a self, key: &'a [u8], value: Bytes) -> KvFuture<'a, bool> {
+        ready(self.put_new(key, value))
     }
 
     /// Ask with HEAD, as [`Kv::size`] does.

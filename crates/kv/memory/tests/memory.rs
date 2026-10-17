@@ -27,6 +27,36 @@ fn put_and_get() -> Result<(), Error> {
     Ok(())
 }
 
+/// A new value goes only under a free key, also through `Arc<dyn Kv>`, and
+/// racing writers of one key store once.
+#[test]
+fn new_values_never_replace() -> Result<(), Error> {
+    let store = store();
+    assert!(store.put_new(b"a", "one".into())?);
+    assert!(!store.put_new(b"a", "two".into())?);
+    assert!(!block_on(store.aput_new(b"a", "two".into()))?);
+    assert!(!store.put_new_from(b"a", &mut &b"two"[..], 3)?);
+    assert_eq!(store.get(b"a")?.unwrap(), "one");
+    assert!(store.put_new_from(b"b", &mut &b"two!"[..], 3)?);
+    assert_eq!(store.get(b"b")?.unwrap(), "two");
+    let error = store.put_new_from(b"c", &mut &b"ab"[..], 3).unwrap_err();
+    assert!(matches!(error, Error::Io { .. }), "{error}");
+    assert!(!store.exists(b"c")?);
+    let stored = std::thread::scope(|scope| {
+        let store = &store;
+        let racers: Vec<_> = (0..8u8)
+            .map(|i| scope.spawn(move || store.put_new(b"race", vec![i].into()).unwrap()))
+            .collect();
+        racers
+            .into_iter()
+            .map(|racer| racer.join().unwrap())
+            .filter(|&stored| stored)
+            .count()
+    });
+    assert_eq!(stored, 1);
+    Ok(())
+}
+
 #[test]
 fn async_matches_sync() -> Result<(), Error> {
     let store = store();
