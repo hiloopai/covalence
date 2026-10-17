@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_DEPTH"],"enum":["Error","Event","Value"],"struct":["Builder","Events","Links"]};

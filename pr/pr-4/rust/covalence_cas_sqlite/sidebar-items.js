@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Sha256Policy"],"struct":["SqliteCas","UnknownHashes","UnknownStorage"]};
