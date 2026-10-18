@@ -12,9 +12,42 @@ use rusty_s3::{S3Action, actions::CreateMultipartUpload};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    EXPIRY, Error, IoSnafu, MAX_ERROR, MAX_PARTS, MissingFieldSnafu, S3Kv, body, status_error,
-    timeout,
+    EXPIRY, Error, IoSnafu, MAX_ERROR, MAX_OBJECT, MAX_PART, MAX_PARTS, MAX_SINGLE_PUT, MIN_PART,
+    MissingFieldSnafu, S3Kv, UploadAllocationSnafu, body, status_error, timeout,
 };
+
+/// The checked geometry and upload payload reservation for a value.
+///
+/// Produced by [`S3Kv::upload_plan`], which is also used to admit writes.
+/// It does not allocate payloads, reserve budget or send requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UploadPlan {
+    /// The largest part payload, or zero for an empty value.
+    pub part_bytes: u64,
+    /// The number of parts, including one for a single PUT.
+    pub parts: u16,
+    /// The maximum payload held by this upload's concurrent workers and reader.
+    ///
+    /// Excludes source, allocator, HTTP/TLS and metadata overhead; see
+    /// [`S3Kv::upload_buffer_bytes`].
+    pub buffer_bytes: u64,
+    /// Whether the value uses multipart upload, rather than one PUT.
+    pub multipart: bool,
+}
+
+/// Reject unsupported quantities before any allocation or upload request.
+fn within(field: &'static str, value: u64, minimum: u64, maximum: u64) -> Result<(), Error> {
+    if (minimum..=maximum).contains(&value) {
+        Ok(())
+    } else {
+        Err(Error::UploadLimit {
+            field,
+            value,
+            minimum,
+            maximum,
+        })
+    }
+}
 
 /// The header carrying the base64 SHA-256 of a PUT body, signed with the URL.
 const CHECKSUM: &str = "x-amz-checksum-sha256";
@@ -53,6 +86,46 @@ fn escape(text: &str) -> String {
 }
 
 impl S3Kv {
+    /// Plan a write of `len` bytes without reading, allocating or sending.
+    ///
+    /// Checks S3's 10,000-part limit, 5 GiB maximum part, 5 MiB minimum
+    /// non-final part, 5 GB single-PUT limit and this platform's allocation
+    /// limit. Parts grow beyond the configured size when needed. An invalid
+    /// length or part size returns [`Error::UploadLimit`].
+    ///
+    /// The reservation is the smaller of the value's length and the part
+    /// size times the number of workers. It covers the reader's next part
+    /// as well as in-flight parts: a worker slot is available before the
+    /// next part is read. This does not reserve capacity or check current
+    /// availability; the write does that atomically before doing any I/O.
+    pub fn upload_plan(&self, len: u64) -> Result<UploadPlan, Error> {
+        within("object length", len, 0, MAX_OBJECT)?;
+        // A small configured part remains useful for ranged reads and tiny
+        // single PUTs, but an oversized one is never a supported upload setting.
+        if self.part > MAX_PART {
+            within("part size", self.part, MIN_PART, MAX_PART)?;
+        }
+        let part = self.part_for(len);
+        let multipart = len > part || len > MAX_SINGLE_PUT;
+        if multipart {
+            within("part size", part, MIN_PART, MAX_PART)?;
+        }
+        let parts = if multipart { len.div_ceil(part) } else { 1 };
+        within("part count", parts, 1, MAX_PARTS)?;
+        let part_bytes = len.min(part);
+        // Vec allocations must fit isize, a stronger condition than usize.
+        within("part allocation", part_bytes, 0, isize::MAX as u64)?;
+        let workers = self.concurrency.min(parts as usize) as u64;
+        // Validated S3 geometry bounds this product by MAX_OBJECT.
+        let buffer_bytes = len.min(workers * part_bytes);
+        Ok(UploadPlan {
+            part_bytes,
+            parts: parts as u16,
+            buffer_bytes,
+            multipart,
+        })
+    }
+
     /// Store `value` under `key`, as `write` says; whether it stored.
     pub(crate) fn write(&self, key: &[u8], value: Bytes, write: Write) -> Result<bool, Error> {
         let mut offset = 0;
@@ -73,7 +146,10 @@ impl S3Kv {
         write: Write,
     ) -> Result<bool, Error> {
         self.upload(key, len, write, |len| {
-            let mut part = vec![0; len];
+            let mut part = Vec::new();
+            part.try_reserve_exact(len)
+                .context(UploadAllocationSnafu { bytes: len as u64 })?;
+            part.resize(len, 0);
             reader.read_exact(&mut part).context(IoSnafu)?;
             Ok(part.into())
         })
@@ -91,14 +167,22 @@ impl S3Kv {
         write: Write,
         mut next: impl FnMut(usize) -> Result<Bytes, Error>,
     ) -> Result<bool, Error> {
+        let plan = self.upload_plan(len)?;
+        // This guard outlives in_order's scoped worker joins and the abort
+        // request, on success, error and unwinding alike.
+        let _reservation = self
+            .upload_budget
+            .as_ref()
+            .map(|budget| budget.reserve(plan.buffer_bytes))
+            .transpose()?;
         let object = self.object(key)?;
-        let part = self.part_for(len);
-        if len <= part {
-            return self.put_object(&object, next(len as usize)?, write);
+        if !plan.multipart {
+            return self.put_object(&object, next(plan.part_bytes as usize)?, write);
         }
         let upload_id = self.create(&object)?;
-        // At most MAX_PARTS, so the count and part numbers fit.
-        let count = len.div_ceil(part);
+        // The planner checked every allocation and the part count above.
+        let part = plan.part_bytes;
+        let count = u64::from(plan.parts);
         let mut parts = Vec::with_capacity(count as usize);
         let jobs = (0..count).map(|index| {
             let size = part.min(len - index * part);

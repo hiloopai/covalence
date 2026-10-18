@@ -6,6 +6,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -211,21 +212,24 @@ fn fake(responses: Vec<String>) -> (String, JoinHandle<Vec<String>>) {
 fn read_request(stream: &mut impl Read) -> String {
     let mut request = Vec::new();
     let mut buffer = [0; 4096];
+    let mut expected = None;
     loop {
         let read = stream.read(&mut buffer).unwrap();
         assert_ne!(read, 0, "the request ended early");
         request.extend_from_slice(&buffer[..read]);
-        let text = String::from_utf8_lossy(&request);
-        let Some((head, body)) = text.split_once("\r\n\r\n") else {
-            continue;
-        };
-        let length = head
-            .lines()
-            .filter_map(|line| line.split_once(": "))
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-            .map_or(0, |(_, value)| value.parse().unwrap());
-        if body.len() >= length {
-            return text.into();
+        if expected.is_none()
+            && let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+        {
+            let head = str::from_utf8(&request[..end]).unwrap();
+            let length = head
+                .lines()
+                .filter_map(|line| line.split_once(": "))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map_or(0, |(_, value)| value.parse::<usize>().unwrap());
+            expected = Some(end + 4 + length);
+        }
+        if expected.is_some_and(|length| request.len() >= length) {
+            return String::from_utf8_lossy(&request).into_owned();
         }
     }
 }
@@ -335,7 +339,7 @@ fn s3_retries_put() {
         response("500 Internal Server Error", ""),
         response("200 OK", ""),
     ]);
-    let kv = kv(&endpoint, "s3://test", SECRET);
+    let kv = kv(&endpoint, "s3://test", SECRET).upload_buffer_bytes(1);
     kv.put(b"a", Bytes::from_static(b"x")).unwrap();
     let heads = server.join().unwrap();
     assert_eq!(heads.len(), 3);
@@ -576,6 +580,11 @@ fn data(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
 
+/// Three legal multipart bodies, with a two-byte final part.
+fn multipart_ascii() -> String {
+    "0".repeat(5 * MIB) + &"1".repeat(5 * MIB) + "23"
+}
+
 /// The multipart uploads on the server at `root` that are in progress or
 /// left behind.
 fn uploads(root: &Path) -> Vec<String> {
@@ -603,6 +612,345 @@ impl Read for Failing {
     }
 }
 
+/// Records an unexpected read without allocating the advertised upload.
+#[derive(Default)]
+struct Unread {
+    reads: usize,
+}
+
+impl Read for Unread {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        self.reads += 1;
+        Err(io::Error::other("the upload must fail before reading"))
+    }
+}
+
+/// Holds a reservation in a reader until the test permits its upload.
+struct HeldReader {
+    entered: Option<mpsc::SyncSender<()>>,
+    release: mpsc::Receiver<()>,
+}
+
+impl Read for HeldReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if let Some(entered) = self.entered.take() {
+            entered.send(()).unwrap();
+            self.release
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(io::Error::other)?;
+        }
+        buffer.fill(b'x');
+        Ok(buffer.len())
+    }
+}
+
+/// Preflight rejects impossible requests before reading or creating uploads.
+#[test]
+fn upload_limits_fail_before_io() {
+    const MAX_PART: u64 = 5 << 30;
+    const MAX_OBJECT: u64 = MAX_PART * 10_000;
+    let root = tempfile::tempdir().unwrap();
+    let server = serve(root.path());
+    for (part, len, field, value, minimum, maximum) in [
+        (
+            5 << 20,
+            MAX_OBJECT + 1,
+            "object length",
+            MAX_OBJECT + 1,
+            0,
+            MAX_OBJECT,
+        ),
+        (5 << 20, u64::MAX, "object length", u64::MAX, 0, MAX_OBJECT),
+        (4, 5, "part size", 4, 5 << 20, MAX_PART),
+        (
+            MAX_PART + 1,
+            1,
+            "part size",
+            MAX_PART + 1,
+            5 << 20,
+            MAX_PART,
+        ),
+    ] {
+        // Even a regressed length check cannot allocate the huge source:
+        // the separately enforced upload budget is only one byte.
+        let store = kv(&server.endpoint, "s3://test", SECRET)
+            .part_size(part)
+            .upload_buffer_bytes(1);
+        for new in [false, true] {
+            let mut reader = Unread::default();
+            let error = if new {
+                store.put_new_from(b"v", &mut reader, len).unwrap_err()
+            } else {
+                store.put_from(b"v", &mut reader, len).unwrap_err()
+            };
+            let error = s3_error(error);
+            assert!(
+                matches!(error, Error::UploadLimit {
+                    field: actual_field,
+                    value: actual_value,
+                    minimum: actual_minimum,
+                    maximum: actual_maximum,
+                } if (actual_field, actual_value, actual_minimum, actual_maximum)
+                    == (field, value, minimum, maximum)),
+                "part={part}, len={len}, new={new}: {error}"
+            );
+            assert_eq!(reader.reads, 0);
+        }
+    }
+    assert!(server.answered.lock().unwrap().is_empty());
+    assert!(uploads(root.path()).is_empty());
+}
+
+/// A provider-legal part must also fit this platform's Vec allocation limit.
+#[test]
+#[cfg(target_pointer_width = "32")]
+fn upload_part_allocation_limit_precedes_io() {
+    let root = tempfile::tempdir().unwrap();
+    let server = serve(root.path());
+    let len = isize::MAX as u64 + 1;
+    let store = kv(&server.endpoint, "s3://test", SECRET)
+        .part_size(len)
+        .upload_buffer_bytes(1);
+    let mut reader = Unread::default();
+    let error = s3_error(store.put_from(b"v", &mut reader, len).unwrap_err());
+    assert!(matches!(error, Error::UploadLimit {
+        field: "part allocation", value, minimum: 0, maximum,
+    } if value == len && maximum == isize::MAX as u64));
+    assert_eq!(reader.reads, 0);
+    assert!(server.answered.lock().unwrap().is_empty());
+}
+
+/// The planner reports native payload memory for actual workers and the tail.
+#[test]
+fn upload_plan_accounts_for_size_and_concurrency() {
+    let store = kv("http://127.0.0.1:1", "s3://test", SECRET)
+        .part_size(5 << 20)
+        .concurrency(2);
+    for (len, part_bytes, parts, buffer_bytes, multipart) in [
+        (0, 0, 1, 0, false),
+        (1, 1, 1, 1, false),
+        (5 << 20, 5 << 20, 1, 5 << 20, false),
+        ((5 << 20) + 1, 5 << 20, 2, (5 << 20) + 1, true),
+        ((10 << 20) + 1, 5 << 20, 3, 10 << 20, true),
+    ] {
+        let plan = store.upload_plan(len).unwrap();
+        assert_eq!(plan.part_bytes, part_bytes, "len={len}");
+        assert_eq!(plan.parts, parts, "len={len}");
+        assert_eq!(plan.buffer_bytes, buffer_bytes, "len={len}");
+        assert_eq!(plan.multipart, multipart, "len={len}");
+    }
+    #[cfg(target_pointer_width = "64")]
+    {
+        let store = store.part_size(5 << 30).upload_buffer_bytes(u64::MAX);
+        assert!(!store.upload_plan(5_000_000_000).unwrap().multipart);
+        assert!(store.upload_plan(5_000_000_001).unwrap().multipart);
+        let largest = store.upload_plan((5_u64 << 30) * 10_000).unwrap();
+        assert_eq!(largest.part_bytes, 5 << 30);
+        assert_eq!(largest.parts, 10_000);
+        assert_eq!(largest.buffer_bytes, 10 << 30);
+        assert!(largest.multipart);
+    }
+}
+
+/// Budget rejection reads no source and sends neither PUT nor multipart create.
+#[test]
+fn upload_buffer_rejection_precedes_io() {
+    let root = tempfile::tempdir().unwrap();
+    let server = serve(root.path());
+    for (len, concurrency, required) in [
+        (4, 1, 4),
+        ((5 << 20) + 1, 1, 5 << 20),
+        ((5 << 20) + 1, 2, (5 << 20) + 1),
+        ((10 << 20) + 1, 2, 10 << 20),
+        ((5_u64 << 30) * 10_000, 1, 5 << 30),
+    ] {
+        if required > isize::MAX as u64 {
+            // The platform allocation limit is checked before this budget.
+            continue;
+        }
+        let available = if required == 5 << 30 { 1 } else { required - 1 };
+        let store = kv(&server.endpoint, "s3://test", SECRET)
+            .part_size(5 << 20)
+            .concurrency(concurrency)
+            .upload_buffer_bytes(available);
+        for new in [false, true] {
+            let mut reader = Unread::default();
+            let error = if new {
+                store.put_new_from(b"v", &mut reader, len).unwrap_err()
+            } else {
+                store.put_from(b"v", &mut reader, len).unwrap_err()
+            };
+            let error = s3_error(error);
+            assert!(
+                matches!(error, Error::UploadBuffer {
+                    required: actual_required, available: actual_available,
+                } if (actual_required, actual_available) == (required, available)),
+                "len={len}, concurrency={concurrency}, new={new}: {error}"
+            );
+            assert_eq!(reader.reads, 0);
+        }
+    }
+    // The owned-bytes API uses the same reservation path.
+    let store = kv(&server.endpoint, "s3://test", SECRET).upload_buffer_bytes(0);
+    for error in [
+        store.put(b"v", "x".into()).unwrap_err(),
+        store.put_new(b"v", "x".into()).unwrap_err(),
+        block_on(store.aput(b"v", "x".into())).unwrap_err(),
+        block_on(store.aput_new(b"v", "x".into())).unwrap_err(),
+    ] {
+        assert!(matches!(
+            s3_error(error),
+            Error::UploadBuffer {
+                required: 1,
+                available: 0
+            }
+        ));
+    }
+    assert!(server.answered.lock().unwrap().is_empty());
+    assert!(uploads(root.path()).is_empty());
+    // An empty object needs no payload buffer and is still an actual PUT.
+    store.put_from(b"empty", &mut Unread::default(), 0).unwrap();
+    assert_eq!(store.get(b"empty").unwrap().unwrap(), Bytes::new());
+}
+
+/// A huge declared source starts multipart before reading or allocating it.
+/// Small parts and a small budget keep a regression from allocating gigabytes;
+/// the planner test separately covers the single-PUT size boundary.
+#[test]
+fn huge_upload_creates_before_reading_source() {
+    let denied = response("403 Forbidden", "<Error><Code>AccessDenied</Code></Error>");
+    let (endpoint, server) = fake(vec![denied]);
+    let store = kv(&endpoint, "s3://test", SECRET)
+        .part_size(5 << 20)
+        .concurrency(1)
+        .upload_buffer_bytes(5 << 20);
+    let mut reader = Unread::default();
+    let error = s3_error(
+        store
+            .put_from(b"v", &mut reader, 5_000_000_001)
+            .unwrap_err(),
+    );
+    assert!(
+        matches!(error, Error::Status { status: 403, .. }),
+        "{error}"
+    );
+    assert_eq!(reader.reads, 0);
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("POST /test/v?"));
+    assert!(requests[0].contains("&uploads="));
+}
+
+/// Concurrent calls share a store's budget and release it after completion.
+#[test]
+fn concurrent_uploads_share_buffer_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let server = serve(root.path());
+    let store = Arc::new(kv(&server.endpoint, "s3://test", SECRET).upload_buffer_bytes(4));
+    thread::scope(|scope| {
+        let (entered, observed) = mpsc::sync_channel(1);
+        let (release, proceed) = mpsc::sync_channel(1);
+        let first_store = Arc::clone(&store);
+        let first = scope.spawn(move || {
+            let mut reader = HeldReader {
+                entered: Some(entered),
+                release: proceed,
+            };
+            first_store.put_from(b"first", &mut reader, 4)
+        });
+        observed.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut reader = Unread::default();
+        let error = s3_error(store.put_new_from(b"second", &mut reader, 1).unwrap_err());
+        assert!(
+            matches!(
+                error,
+                Error::UploadBuffer {
+                    required: 1,
+                    available: 0
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(reader.reads, 0);
+        assert!(server.answered.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+        first.join().unwrap().unwrap();
+    });
+    assert!(store.put_new(b"second", "done".into()).unwrap());
+    assert_eq!(store.get(b"first").unwrap().unwrap(), "xxxx");
+    assert_eq!(store.get(b"second").unwrap().unwrap(), "done");
+}
+
+/// An upload retains its payload reservation until abort succeeds or fails.
+#[test]
+fn upload_budget_covers_abort_and_unwind() {
+    for denied in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (entered, observed) = mpsc::sync_channel(1);
+        let (release, proceed) = mpsc::sync_channel(1);
+        let proceed = Mutex::new(proceed);
+        let server = serve_with(root.path(), move |line| {
+            if line.starts_with("DELETE") {
+                entered.send(()).unwrap();
+                proceed
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                if denied {
+                    return Act::Deny;
+                }
+            }
+            Act::Serve
+        });
+        let store = Arc::new(
+            kv(&server.endpoint, "s3://test", SECRET)
+                .part_size(5 << 20)
+                .concurrency(1)
+                .upload_buffer_bytes(5 << 20),
+        );
+        thread::scope(|scope| {
+            let first_store = Arc::clone(&store);
+            let first = scope.spawn(move || {
+                first_store.put_from(b"failed", &mut Failing { ok: 0 }, (5 << 20) + 1)
+            });
+            observed.recv_timeout(Duration::from_secs(10)).unwrap();
+            let error = s3_error(store.put(b"busy", "x".into()).unwrap_err());
+            assert!(matches!(
+                error,
+                Error::UploadBuffer {
+                    required: 1,
+                    available: 0
+                }
+            ));
+            release.send(()).unwrap();
+            let error = first.join().unwrap().unwrap_err();
+            if denied {
+                assert!(matches!(s3_error(error), Error::Abort { .. }));
+            } else {
+                assert!(matches!(error, covalence_kv_trait::Error::Io { .. }));
+            }
+        });
+        store.put(b"after-abort", "x".into()).unwrap();
+
+        // Occupy the entire budget so even one leaked byte fails the retry.
+        let store = kv(&server.endpoint, "s3://test", SECRET).upload_buffer_bytes(1);
+        struct Panics;
+        impl Read for Panics {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("source panicked");
+            }
+        }
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                store.put_from(b"panic", &mut Panics, 1)
+            }))
+            .is_err()
+        );
+        store.put(b"after-panic", "x".into()).unwrap();
+    }
+}
+
 /// A writer that always fails.
 struct Full;
 
@@ -622,7 +970,9 @@ impl Write for Full {
 fn multipart() {
     let root = tempfile::tempdir().unwrap();
     let server = serve(root.path());
-    let kv = kv(&server.endpoint, "s3://test/p", SECRET).part_size(5 << 20);
+    let kv = kv(&server.endpoint, "s3://test/p", SECRET)
+        .part_size(5 << 20)
+        .upload_buffer_bytes(15 << 20);
     let value = Bytes::from(data(11 * MIB + 3));
     kv.put(b"v", value.clone()).unwrap();
     assert_eq!(kv.get(b"v").unwrap().unwrap(), value);
@@ -653,7 +1003,9 @@ fn multipart() {
 fn multipart_aborts_on_failure() {
     let root = tempfile::tempdir().unwrap();
     let server = serve(root.path());
-    let kv = kv(&server.endpoint, "s3://test", SECRET).part_size(5 << 20);
+    let kv = kv(&server.endpoint, "s3://test", SECRET)
+        .part_size(5 << 20)
+        .upload_buffer_bytes(15 << 20);
     let len = 11 * MIB as u64;
     let error = kv.put_from(b"v", &mut Failing { ok: 6 * MIB }, len);
     assert!(
@@ -676,7 +1028,9 @@ fn multipart_aborts_on_failure() {
 fn new_values_never_replace() {
     let root = tempfile::tempdir().unwrap();
     let server = serve(root.path());
-    let kv = kv(&server.endpoint, "s3://test/p", SECRET).part_size(5 << 20);
+    let kv = kv(&server.endpoint, "s3://test/p", SECRET)
+        .part_size(5 << 20)
+        .upload_buffer_bytes(15 << 20);
     assert!(kv.put_new(b"small", "one".into()).unwrap());
     assert!(!kv.put_new(b"small", "two".into()).unwrap());
     assert!(!block_on(kv.aput_new(b"small", "two".into())).unwrap());
@@ -715,10 +1069,11 @@ fn new_value_requests() {
     ]);
     // The fake server answers requests in turn, so send them one at a time.
     let kv = kv(&endpoint, "s3://test", SECRET)
-        .part_size(4)
-        .concurrency(1);
+        .part_size(5 << 20)
+        .concurrency(1)
+        .upload_buffer_bytes(5 << 20);
     assert!(!kv.put_new(b"a", "01".into()).unwrap());
-    assert!(!kv.put_new(b"a", "0123456789".into()).unwrap());
+    assert!(!kv.put_new(b"a", multipart_ascii().into()).unwrap());
     let error = s3_error(kv.put(b"a", "01".into()).unwrap_err());
     assert!(
         matches!(error, Error::Status { status: 412, .. }),
@@ -786,9 +1141,10 @@ fn multipart_requests() {
     ]);
     // The fake server answers requests in turn, so send them one at a time.
     let kv = kv(&endpoint, "s3://test", SECRET)
-        .part_size(4)
-        .concurrency(1);
-    let error = s3_error(kv.put(b"a", "0123456789".into()).unwrap_err());
+        .part_size(5 << 20)
+        .concurrency(1)
+        .upload_buffer_bytes(5 << 20);
+    let error = s3_error(kv.put(b"a", multipart_ascii().into()).unwrap_err());
     assert!(
         matches!(&error, Error::Status { status: 200, code: Some(code) } if code == "InternalError"),
         "{error}"
@@ -799,16 +1155,18 @@ fn multipart_requests() {
     assert!(requests[0].contains("&uploads="), "{}", requests[0]);
     assert!(requests[0].contains("x-amz-checksum-algorithm: SHA256"));
     let mut complete = String::from("<CompleteMultipartUpload>");
-    for (number, part) in [(1, "0123"), (2, "4567"), (3, "89")] {
+    let value = multipart_ascii();
+    for (offset, part) in value.as_bytes().chunks(5 * MIB).enumerate() {
+        let number = offset + 1;
         let request = &requests[number];
         assert!(request.starts_with("PUT /test/a?"), "{request}");
         assert!(
             request.contains(&format!("partNumber={number}&uploadId=u1")),
             "{request}"
         );
-        let checksum = sha256(part.as_bytes());
+        let checksum = sha256(part);
         assert!(request.contains(&format!("x-amz-checksum-sha256: {checksum}")));
-        assert!(request.ends_with(&format!("\r\n\r\n{part}")), "{request}");
+        assert_eq!(request.split_once("\r\n\r\n").unwrap().1.as_bytes(), part);
         complete += &format!(
             "<Part><ETag>\"e{number}\"</ETag><ChecksumSHA256>{checksum}</ChecksumSHA256>\
              <PartNumber>{number}</PartNumber></Part>"
@@ -842,14 +1200,15 @@ fn multipart_abort_failures() {
     ]);
     // The fake server answers requests in turn, so send them one at a time.
     let kv = kv(&endpoint, "s3://test", SECRET)
-        .part_size(4)
-        .concurrency(1);
-    let error = s3_error(kv.put(b"a", "0123456789".into()).unwrap_err());
+        .part_size(5 << 20)
+        .concurrency(1)
+        .upload_buffer_bytes(5 << 20);
+    let error = s3_error(kv.put(b"a", multipart_ascii().into()).unwrap_err());
     assert!(
         matches!(&error, Error::Status { status: 403, code: Some(code) } if code == "AccessDenied"),
         "{error}"
     );
-    let error = s3_error(kv.put(b"a", "0123456789".into()).unwrap_err());
+    let error = s3_error(kv.put(b"a", multipart_ascii().into()).unwrap_err());
     let Error::Abort {
         upload_id,
         cause,
@@ -991,7 +1350,8 @@ fn failed_part_aborts_after_parts_in_flight() {
     });
     let kv = kv(&server.endpoint, "s3://test", SECRET)
         .part_size(5 << 20)
-        .concurrency(4);
+        .concurrency(4)
+        .upload_buffer_bytes(20 << 20);
     let value = data(36 * MIB);
     let error = s3_error(
         kv.put_from(b"v", &mut &value[..], value.len() as u64)
@@ -1009,4 +1369,6 @@ fn failed_part_aborts_after_parts_in_flight() {
         .rposition(|line| line.contains("partNumber="));
     let abort = answered.iter().position(|line| line.starts_with("DELETE"));
     assert!(abort > last_part, "{answered:#?}");
+    drop(answered);
+    kv.put(b"after-failure", "x".into()).unwrap();
 }
