@@ -106,8 +106,23 @@ pip install covalence==0.1.0.dev4
 - S3 keys must be UTF-8 with non-empty `/`-separated segments other than `.`
   and `..`; other keys raise `StoreError`.
 - On S3, values over 8 MiB go up as multipart uploads, and values come down
-  in ranged GETs of 8 MiB, 16 parts or ranges at a time. Covalence sets no
-  size limit; S3's is 5 TiB.
+  in ranged GETs of 8 MiB, 16 parts or ranges at a time. Upload parts grow
+  when needed to stay within 10,000 parts. Covalence checks
+  [S3's limits](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html)
+  before upload: at most 10,000 parts of 5 GiB each, subject to the platform's
+  allocation limit.
+- `Kv.s3(..., upload_buffer_bytes=n)` caps aggregate upload payload
+  reservations across calls sharing that store. An upload reserves the smaller
+  of its length and its part size times its worker count before allocating
+  parts, reading its upload source or making requests. Insufficient capacity
+  raises `StoreError` immediately; zero admits only empty uploads. The default
+  is no budget. Reservations last through retries and cleanup.
+- This budget excludes caller-owned sources, read buffers, allocator overhead,
+  HTTP/TLS buffers and request metadata; it is not an RSS limit. Owned byte
+  values still reserve their planned payload even though their parts share the
+  original allocation. File helpers may hash their source before upload
+  admission. A larger legal object can need a larger budget because its parts
+  grow; rejection does not consume its upload source or create an upload.
 
 ## Content-addressed stores
 
@@ -182,8 +197,10 @@ pip install covalence==0.1.0.dev4
 - These limits govern source length and output bytes, not the memory a backend
   uses before reading or writing. Python callback transfers are at most 1 MiB.
 - `put_file`, `put_fileobj`, `put_from`, `get_file` and `get_to` stream on `Cas.kv` over `Kv.s3`,
-  holding up to 16 parts of 8 MiB (128 MiB) at a time, or as many as
+  holding up to 16 part payloads at a time, or as many as
   `Kv.s3(..., concurrency=n)` says; blocks over 78 GiB go up in larger parts.
+  Upload parts start at 8 MiB; read ranges stay at 8 MiB. Set
+  `upload_buffer_bytes=` to enforce a shared upload payload budget.
   Other stores, including `Cas.kv(Kv.memory())`, hold the block in memory.
 - A create-only write can reuse a block without checking its stored bytes.
   Returning a CID does not freshly verify an existing block: use a checked

@@ -596,6 +596,44 @@ class S3Tests(ApiCase):
         _, _, query = self.server.requests[-1]
         return query["X-Amz-Credential"][0].split("/")[0], query.get("X-Amz-Security-Token", [None])[0]
 
+    def test_upload_budget_preflight_and_release(self):
+        os.environ.update(AWS_ACCESS_KEY_ID="key", AWS_SECRET_ACCESS_KEY="secret")
+        for limit in (-1, 1 << 64):
+            with self.subTest(limit=limit), self.assertRaises(OverflowError):
+                Kv.s3("bucket", region="us-east-1", upload_buffer_bytes=limit)
+        zero = Kv.s3("bucket", region="us-east-1", upload_buffer_bytes=0)
+        with self.assertRaisesRegex(StoreError, "1 buffer bytes; 0 available"):
+            zero.put(b"rejected", b"x")
+        self.assertEqual(self.server.requests, [])
+        zero.put(b"empty", b"")
+        self.assertEqual(self.server.objects, {"/bucket/empty": b""})
+
+        kv = Kv.s3("bucket", region="us-east-1", concurrency=1, upload_buffer_bytes=7 << 20)
+        cas = Cas.kv(kv)
+        self.server.requests.clear()
+
+        def unread():
+            self.fail("budget admission must precede upload source reads")
+            yield b""
+
+        with self.assertRaisesRegex(StoreError, "8388608 buffer bytes; 7340032 available"):
+            cas.put_from(Cid.of(b"unused"), unread(), 9 << 20)
+        self.assertEqual(self.server.requests, [])
+
+        # The same native store remains usable after digest and HTTP failures.
+        one = Kv.s3("bucket", region="us-east-1", upload_buffer_bytes=1)
+        checked = Cas.kv(one)
+        with self.assertRaises(IntegrityError):
+            checked.put_from(Cid.of(b"x"), iter([b"y"]), 1)
+        self.server.denied.add("PUT")
+        with self.assertRaises(StoreError):
+            one.put(b"failed", b"x")
+        self.server.denied.clear()
+        one.put(b"success", b"x")
+        one.put(b"success-again", b"x")
+        # Upload admission does not constrain ranged reads.
+        self.assertEqual(zero.get(b"success"), b"x")
+
     def test_environment_credentials(self):
         os.environ.update(AWS_ACCESS_KEY_ID="env-key", AWS_SECRET_ACCESS_KEY="env-secret", AWS_SESSION_TOKEN="env-token")
         url, bucket = Kv.s3("s3://bucket/p/q/", region="us-east-1"), Kv.s3("bucket", "p/q", region="us-east-1")

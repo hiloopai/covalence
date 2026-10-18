@@ -619,9 +619,19 @@ impl PyKv {
     ///
     /// `location` is an `s3://bucket/prefix/` URL, or a bucket name with
     /// `prefix`. `region` and `profile` override the SDK configuration.
-    /// `concurrency` is how many 8 MiB parts of one value move at once (16 by
-    /// default; 0 counts as 1), which bounds the memory a streamed value
-    /// holds.
+    /// `concurrency` is how many parts or read ranges of one value move at
+    /// once (16 by default; 0 counts as 1). Upload parts start at 8 MiB and
+    /// grow when needed to keep to 10,000 parts; read ranges stay at 8 MiB.
+    ///
+    /// `upload_buffer_bytes` optionally caps aggregate upload payload
+    /// reservations across calls sharing this store. An upload reserves the
+    /// smaller of its length and its part size times its worker count before
+    /// reading its source, allocating parts or sending requests. Insufficient
+    /// capacity raises StoreError immediately; zero admits only empty uploads.
+    /// Reservations last through retries and cleanup. Caller-owned sources,
+    /// read buffers, allocator overhead, HTTP/TLS buffers and metadata are
+    /// additional memory; this is not an RSS limit. Already owned values also
+    /// reserve their planned payload, though their parts share that allocation.
     ///
     /// - An invalid location, a URL with `prefix` too, or no region raises
     ///   ValueError.
@@ -632,7 +642,7 @@ impl PyKv {
     /// - Without `s3:ListBucket`, S3 answers 403 for a missing key, so reading
     ///   one raises StoreError instead of returning None or False.
     #[staticmethod]
-    #[pyo3(signature = (location, prefix = None, *, region = None, profile = None, concurrency = None))]
+    #[pyo3(signature = (location, prefix = None, *, region = None, profile = None, concurrency = None, upload_buffer_bytes = None))]
     fn s3(
         py: Python<'_>,
         location: &str,
@@ -640,6 +650,7 @@ impl PyKv {
         region: Option<String>,
         profile: Option<String>,
         concurrency: Option<usize>,
+        upload_buffer_bytes: Option<u64>,
     ) -> PyResult<Self> {
         let location = match (location.strip_prefix("s3://"), prefix) {
             (None, prefix) => S3Location::new(location, prefix.unwrap_or_default()),
@@ -657,6 +668,10 @@ impl PyKv {
             .map_err(raise)?;
         let kv = match concurrency {
             Some(parts) => kv.concurrency(parts),
+            None => kv,
+        };
+        let kv = match upload_buffer_bytes {
+            Some(bytes) => kv.upload_buffer_bytes(bytes),
             None => kv,
         };
         Ok(Self {

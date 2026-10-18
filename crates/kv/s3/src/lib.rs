@@ -30,17 +30,18 @@
 mod read;
 mod write;
 
+pub use write::UploadPlan;
 use write::Write;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, TryReserveError},
     fmt,
     io::{self, Read},
     panic::{self, AssertUnwindSafe},
     str::FromStr,
     sync::{
         Mutex, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -68,6 +69,34 @@ use rusty_s3::{Bucket, BucketError, UrlStyle};
 #[snafu(crate_root(covalence_lib_error::snafu))]
 #[non_exhaustive]
 pub enum Error {
+    /// An upload exceeds an S3 limit or the platform's allocation limit.
+    #[snafu(display("invalid upload {field} {value}: expected {minimum}..={maximum}"))]
+    UploadLimit {
+        /// The quantity checked.
+        field: &'static str,
+        /// The requested quantity.
+        value: u64,
+        /// Its smallest supported value.
+        minimum: u64,
+        /// Its largest supported value.
+        maximum: u64,
+    },
+    /// The store's upload payload budget cannot admit another upload.
+    #[snafu(display("upload needs {required} buffer bytes; {available} available"))]
+    UploadBuffer {
+        /// The payload reservation required for this upload.
+        required: u64,
+        /// The unreserved bytes when admission failed.
+        available: u64,
+    },
+    /// Allocating an upload part failed after admission.
+    #[snafu(display("could not allocate {bytes} upload bytes: {source}"))]
+    UploadAllocation {
+        /// The part's size in bytes.
+        bytes: u64,
+        /// Why the allocator refused it.
+        source: TryReserveError,
+    },
     /// The endpoint is not a URL.
     #[snafu(display("invalid endpoint {endpoint}: {source}"))]
     Endpoint {
@@ -254,10 +283,18 @@ const EXPIRY: Duration = Duration::from_secs(60);
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// The slowest transfer, in bytes per second, a request attempt waits for.
 const MIN_RATE: u64 = 1 << 20;
-/// The largest S3 object, in bytes.
-const MAX_OBJECT: u64 = 5 << 40;
+/// The body size above which request timeouts stop increasing.
+const MAX_TIMEOUT_BYTES: u64 = 5 << 40;
 /// The most parts a multipart upload may have.
 const MAX_PARTS: u64 = 10_000;
+/// S3's largest multipart part, in bytes.
+const MAX_PART: u64 = 5 << 30;
+/// S3's smallest non-final multipart part, in bytes.
+const MIN_PART: u64 = 5 << 20;
+/// S3's largest object: 10,000 parts of 5 GiB.
+const MAX_OBJECT: u64 = MAX_PARTS * MAX_PART;
+/// The largest body sent with one PUT, in bytes (5 GB).
+const MAX_SINGLE_PUT: u64 = 5_000_000_000;
 /// The default part size, 8 MiB: values larger are uploaded in parts of at
 /// least this size, and values are read in ranges of it.
 pub const PART: u64 = 8 << 20;
@@ -283,7 +320,7 @@ pub struct AwsOptions {
 
 /// The limit on a request attempt moving `bytes` of body.
 fn timeout(bytes: u64) -> Duration {
-    TIMEOUT + Duration::from_secs(bytes.min(MAX_OBJECT) / MIN_RATE)
+    TIMEOUT + Duration::from_secs(bytes.min(MAX_TIMEOUT_BYTES) / MIN_RATE)
 }
 
 /// Run `future` to completion on `runtime`, on a thread of its own so that
@@ -400,9 +437,12 @@ impl Cached {
 /// # Writes
 ///
 /// - A value of up to the part size ([`PART`] unless set with
-///   [`S3Kv::part_size`]) is written with one PUT.
+///   [`S3Kv::part_size`]) and 5 GB is written with one PUT.
 /// - A larger value is written with a multipart upload, in parts of the part
 ///   size, or larger parts if needed to keep to S3's limit of 10,000 parts.
+/// - [`S3Kv::upload_plan`] checks S3 and allocation limits before any
+///   upload request or source read. [`S3Kv::upload_buffer_bytes`] can bound
+///   the aggregate upload payload held by calls sharing this store.
 /// - Each PUT or part sends the SHA-256 of its body as
 ///   `x-amz-checksum-sha256`, which S3 checks against the bytes it receives.
 /// - A failed multipart upload is aborted once its parts in flight finish.
@@ -458,6 +498,43 @@ pub struct S3Kv {
     agent: ureq::Agent,
     part: u64,
     concurrency: usize,
+    upload_budget: Option<UploadBudget>,
+}
+
+/// Aggregate payload reservations for calls sharing one store.
+struct UploadBudget {
+    limit: u64,
+    used: AtomicU64,
+}
+
+impl UploadBudget {
+    fn reserve(&self, required: u64) -> Result<UploadReservation<'_>, Error> {
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(required)
+                    .filter(|next| *next <= self.limit)
+            })
+            .map_err(|used| Error::UploadBuffer {
+                required,
+                available: self.limit - used,
+            })?;
+        Ok(UploadReservation {
+            budget: self,
+            bytes: required,
+        })
+    }
+}
+
+/// Held until all upload requests, including cleanup, have finished.
+struct UploadReservation<'a> {
+    budget: &'a UploadBudget,
+    bytes: u64,
+}
+
+impl Drop for UploadReservation<'_> {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
 }
 
 impl fmt::Debug for S3Kv {
@@ -498,6 +575,7 @@ impl S3Kv {
             agent: agent(CONCURRENCY),
             part: PART,
             concurrency: CONCURRENCY,
+            upload_budget: None,
         })
     }
 
@@ -514,6 +592,28 @@ impl S3Kv {
     pub fn concurrency(mut self, parts: usize) -> Self {
         self.concurrency = parts.max(1);
         self.agent = agent(self.concurrency);
+        self
+    }
+
+    /// Limit the aggregate upload payload reservation to `bytes`.
+    ///
+    /// Calls sharing this store (including through `Arc`) share the budget.
+    /// An upload reserves [`UploadPlan::buffer_bytes`] before reading its
+    /// source, allocating parts or sending requests, and keeps the reservation
+    /// until all its requests and cleanup finish. Insufficient capacity fails
+    /// immediately with [`Error::UploadBuffer`]; it does not wait. Zero admits
+    /// only empty uploads. No budget is set by default.
+    ///
+    /// This bounds upload part payloads, including parts held for retries.
+    /// Caller-owned sources, read buffers, allocator overhead, HTTP/TLS buffers
+    /// and request metadata are additional memory; this is not an RSS limit.
+    /// Already owned values still reserve their planned upload payload, even
+    /// though their parts share the caller's allocation.
+    pub fn upload_buffer_bytes(mut self, bytes: u64) -> Self {
+        self.upload_budget = Some(UploadBudget {
+            limit: bytes,
+            used: AtomicU64::new(0),
+        });
         self
     }
 

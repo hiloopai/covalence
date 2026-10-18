@@ -272,14 +272,24 @@ class Kv:
     def memory() -> Kv:
         """A new, empty store in memory."""
     @staticmethod
-    def s3(location: str, prefix: str | None = None, *, region: str | None = None, profile: str | None = None, concurrency: int | None = None) -> Kv:
+    def s3(location: str, prefix: str | None = None, *, region: str | None = None, profile: str | None = None, concurrency: int | None = None, upload_buffer_bytes: int | None = None) -> Kv:
         """A store in S3, configured as the AWS SDKs are.
 
         `location` is an `s3://bucket/prefix/` URL, or a bucket name with
         `prefix`. `region` and `profile` override the SDK configuration.
-        `concurrency` is how many 8 MiB parts of one value move at once (16 by
-        default; 0 counts as 1), which bounds the memory a streamed value
-        holds.
+        `concurrency` is how many parts or read ranges of one value move at
+        once (16 by default; 0 counts as 1). Upload parts start at 8 MiB and
+        grow when needed to keep to 10,000 parts; read ranges stay at 8 MiB.
+
+        `upload_buffer_bytes` optionally caps aggregate upload payload
+        reservations across calls sharing this store. An upload reserves the
+        smaller of its length and its part size times its worker count before
+        reading its source, allocating parts or sending requests. Insufficient
+        capacity raises StoreError immediately; zero admits only empty uploads.
+        Reservations last through retries and cleanup. Caller-owned sources,
+        read buffers, allocator overhead, HTTP/TLS buffers and metadata are
+        additional memory; this is not an RSS limit. Already owned values also
+        reserve their planned payload, though their parts share that allocation.
 
         - An invalid location, a URL with `prefix` too, or no region raises
           ValueError.
