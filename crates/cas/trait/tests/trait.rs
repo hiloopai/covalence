@@ -5,7 +5,8 @@ use std::{
 };
 
 use covalence_cas_trait::{
-    AsyncGet, AsyncGetExt, AsyncPut, Cas, CasFuture, Error, Get, GetExt, Put, ready,
+    AsyncGet, AsyncGetExt, AsyncPut, Cas, CasFuture, Error, EvictionCandidate, EvictionPolicy,
+    Flush, Get, GetExt, Put, ready,
 };
 use covalence_lib_cid::{Blake3, Cid, Fact, Format};
 use covalence_lib_dasl::Value;
@@ -382,4 +383,91 @@ fn has_and_missing_default_to_unchecked_reads() {
     let keys = [four, one, wrong, three];
     assert_eq!(store.missing(&keys).unwrap(), [four, three]);
     assert_eq!(store.missing(&[]).unwrap(), []);
+}
+
+/// A cache that distinguishes its sync and async policy dispatch.
+#[derive(Default)]
+struct Selecting {
+    sync: AtomicUsize,
+    asynchronous: AtomicUsize,
+}
+
+impl Get for Selecting {
+    fn get_unchecked(&self, _: &Cid) -> Result<Option<Bytes>, Error> {
+        Ok(None)
+    }
+}
+impl Put for Selecting {
+    fn put(&self, bytes: Bytes) -> Result<Cid, Error> {
+        Ok(key(&bytes))
+    }
+}
+impl AsyncGet for Selecting {
+    fn aget_unchecked<'a>(&'a self, cid: &'a Cid) -> CasFuture<'a, Option<Bytes>> {
+        ready(self.get_unchecked(cid))
+    }
+}
+impl AsyncPut for Selecting {
+    fn aput(&self, bytes: Bytes) -> CasFuture<'_, Cid> {
+        ready(self.put(bytes))
+    }
+}
+impl Selecting {
+    fn select(flags: Flush, policy: Option<&dyn EvictionPolicy>) {
+        if flags.contains(Flush::EVICT) {
+            let candidate = EvictionCandidate::new(
+                key(b"borrowed"),
+                3,
+                Some(std::time::SystemTime::UNIX_EPOCH),
+            );
+            assert!(policy.unwrap().should_evict(&candidate));
+        }
+    }
+}
+impl Cas for Selecting {
+    fn flush(&self, flags: Flush, policy: Option<&dyn EvictionPolicy>) -> Result<(), Error> {
+        self.sync.fetch_add(1, Ordering::Relaxed);
+        Self::select(flags, policy);
+        Ok(())
+    }
+    fn aflush<'a>(
+        &'a self,
+        flags: Flush,
+        policy: Option<&'a dyn EvictionPolicy>,
+    ) -> CasFuture<'a, ()> {
+        Box::pin(async move {
+            self.asynchronous.fetch_add(1, Ordering::Relaxed);
+            Self::select(flags, policy);
+            Ok(())
+        })
+    }
+}
+
+#[test]
+fn flush_policies_borrow_closures_and_forward_async_dispatch_through_shared_stores() {
+    let concrete = Arc::new(Selecting::default());
+    let store: Arc<dyn Cas> = concrete.clone();
+    let borrowed = String::from("borrowed");
+    let calls = AtomicUsize::new(0);
+    let policy = |candidate: &EvictionCandidate| {
+        calls.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(candidate.stored_size, 3);
+        assert_eq!(
+            candidate.modified_at,
+            Some(std::time::SystemTime::UNIX_EPOCH)
+        );
+        candidate.cid == key(borrowed.as_bytes())
+    };
+    store.flush(Flush::EVICT, Some(&policy)).unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let future = store.aflush(Flush::EVICT, Some(&policy));
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    block_on(future).unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(concrete.sync.load(Ordering::Relaxed), 1);
+    assert_eq!(concrete.asynchronous.load(Ordering::Relaxed), 1);
+    let unused = |_: &EvictionCandidate| panic!("a policy needs EVICT");
+    let defaults = Map::default().into_dyn();
+    defaults.flush(Flush::empty(), Some(&unused)).unwrap();
+    block_on(defaults.aflush(Flush::empty(), Some(&unused))).unwrap();
 }

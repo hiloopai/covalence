@@ -23,6 +23,7 @@ covalence-cas-memory.workspace = true
 covalence-cas-sqlite.workspace = true
 covalence-cas-trait.workspace = true
 covalence-kv-memory.workspace = true
+covalence-kv-directory.workspace = true
 covalence-kv-s3.workspace = true
 covalence-kv-trait.workspace = true
 covalence-lib-cid.workspace = true

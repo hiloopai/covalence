@@ -82,8 +82,17 @@ pip install covalence==0.1.0.dev5
 
 - `Kv` is a byte key-value store:
   - `Kv.memory()` makes one in memory;
+  - `Kv.directory(path)` stores files below a directory, with atomic writes;
   - `Kv.s3("s3://bucket/prefix/")` (or `Kv.s3("bucket", "prefix")`) makes
     one in S3.
+  - `Kv.gcs("bucket", "prefix")` uses the optional `covalence[gcs]` extra;
+    it supports Google Application Default Credentials or `credentials_file=`.
+  - `Kv.from_backend(object)` adapts a Python byte-store implementation.
+- `put_file(key, path)` and `get_file(key, path)` transfer files. Downloads
+  replace the destination only after success; a missing key leaves it unchanged.
+- S3's optional `storage_class=`, `standard_below=` and `client=` use the
+  `covalence[s3-python]` extra and boto3. Below the size threshold, uploads use
+  STANDARD instead of the requested storage class.
 - S3 is configured as the AWS SDKs are:
   - the region is `region=`, else from `AWS_REGION`, the profile or EC2
     instance metadata, which can take a moment off EC2;
@@ -142,11 +151,16 @@ pip install covalence==0.1.0.dev5
   - `Cas.sqlite(path)`, in memory without a path;
   - `Cas.kv(kv, prefix)`, keeping blocks in a `Kv` under
     `prefix/blake3/<digest>/bytes`.
+- `Cas.kv(kv, compression="zstd", level=3)` keeps zstd frames under
+  `blake3/<digest>/bytes.zst`. The digest and CID name the uncompressed bytes.
+  Directory, S3 and GCS backends use bounded-memory file transfers. Byte-returning
+  operations such as `get` still hold the requested bytes in memory.
 - `put` returns the raw BLAKE3 `Cid`, after checking that the store kept the
-  data under it.
-- `Cas.kv` never replaces a block its `Kv` already holds: on `Kv.s3` each
-  write is conditional (`If-None-Match: *`), so concurrent writers of one
-  block race safely and the first one's bytes stay.
+  data under it. Uncompressed `Cas.kv` writes atomically preserve existing
+  blocks; their backend must support create-only writes. Compressed `Cas.kv`
+  writes retain the backend's replacement behavior for compatibility.
+  Reusing an existing block does not check its stored bytes; use a checked
+  read when that guarantee is needed.
 - `put_value(value)` stores the DRISL encoding of a `Value` (or what
   `Value(...)` takes) and returns its DRISL CID, which is `value.cid()`.
 - `get` returns the bytes and `get_fact` a `BlobFact`, both checked against
@@ -180,6 +194,9 @@ pip install covalence==0.1.0.dev5
   case `StoreError` reports that failure with the source as its `__cause__`.
 - `Cas.get_file(cid, path)` writes the block to a file and returns its
   length, or `None` if missing.
+- `Cas.put_file(path, expected=cid)` rejects changed bytes before publishing
+  a new block. Uncompressed KV stores may reuse an existing block without
+  reading the source; `put_fileobj` checks both source passes even then.
 - `Cas.put_fileobj(file, max_bytes=..., expected_length=...)` stores a
   caller-owned, seekable binary file object. It reads from offset zero twice,
   checks the complete source on both passes even when deduplicating, and
@@ -207,8 +224,9 @@ pip install covalence==0.1.0.dev5
   read, such as `get_to`, when that guarantee is needed.
 - `put_file` reads the file twice, to hash it and to store it, and stores the
   bytes it hashed. If they changed in between it raises `IntegrityError`,
-  and if the file got shorter `OSError`, storing nothing either way. Bytes
-  appended in between are not stored.
+  and if the consumed file got shorter `OSError`, storing nothing either way.
+  Reusing an existing block may skip that read. Bytes appended in between are
+  not stored.
 - `get_file` checks the bytes against the CID in a private temporary file
   beside `path`. That file replaces `path` only once the check passes, so a
   missing block or a failed check (`IntegrityError`) leaves `path` as it
@@ -236,6 +254,40 @@ buffering=0)` for downloads, or `"rb"` for uploads. Close that wrapper when
 finished; the original descriptor remains open. Duplicates share a file
 position, so the caller must also keep the original descriptor exclusively
 owned during the operation.
+
+### Durability and cache release
+
+`Cas.flush(flags)` requests explicit guarantees. Its default is `Flush.PERSIST`.
+The Python API is synchronous. Rust `Cas::aflush` and `Kv::aflush` provide async
+entry points; their default calls the sync implementation when polled and may block.
+
+| Flag | Meaning |
+| --- | --- |
+| `Flush.PERSIST` | Make accepted writes durable in the store's own storage. |
+| `Flush.REMOTE` | Copy accepted content to the remote CAS. |
+| `Flush.EVICT` | Release cached copies only when durable backing is confirmed. |
+
+Combine `Flush.REMOTE | Flush.EVICT` to copy first and then release eligible
+copies under the store's policy. Zero does nothing. Unsupported flags raise
+`UnsupportedError` before work begins; I/O failures may leave part complete.
+Eviction never deletes backing content.
+
+`Cas.flush(..., policy=policy)` accepts an `EvictionPolicy`. With `EVICT`, it
+replaces configured selection for that call; `None` uses the store's policy.
+The store confirms durable backing before offering an immutable
+`EvictionCandidate` with `cid`, `stored_size` and optional `modified_at` (Unix
+seconds). `should_evict(candidate)` must return bool: False retains the copy,
+True permits release. An exception retains that candidate and propagates;
+earlier work may be complete. Without `EVICT`, the policy is never called.
+`EvictionPolicy.from_callable(lambda candidate: candidate.stored_size > 1024)`
+adapts a function. Rust accepts a borrowed `&dyn EvictionPolicy`, and closures
+implement the trait without requiring a `'static` lifetime.
+
+The directory-backed KV CAS supports `PERSIST` by syncing files and directories.
+Other requested guarantees are unsupported by the built-in CASes. These hooks
+allow a cache layer to define write-back and eviction without changing callers.
+`Cas.remote()` returns that layer's remote CAS view, or raises `UnsupportedError`;
+it does not expose an underlying database or KV implementation.
 
 ## Blobs and facts
 

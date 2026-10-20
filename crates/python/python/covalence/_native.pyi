@@ -1,12 +1,11 @@
 from collections.abc import Iterable, Sequence
 from os import PathLike
 from typing import Any, BinaryIO, Literal, Self, TypeAlias, final
-
 from _typeshed import SupportsWrite as _SupportsWrite
 
 from typing_extensions import disjoint_base
 
-from . import Fact
+from . import EvictionPolicy, Fact, Flush
 
 __all__ = [
     "__version__",
@@ -19,6 +18,7 @@ __all__ = [
     "Blob",
     "BlobFact",
     "Error",
+    "EvictionCandidate",
     "IntegrityError",
     "StoreError",
     "UnsupportedError",
@@ -259,7 +259,8 @@ class Value:
 class Kv:
     """A store of byte values under byte keys.
 
-    Build one with `memory` or `s3`. A failure of the storage underneath
+    Build one with `memory`, `directory`, `s3`, `gcs` or `from_backend`.
+    A failure of the storage underneath
     raises StoreError.
 
     >>> from covalence import Kv
@@ -272,7 +273,40 @@ class Kv:
     def memory() -> Kv:
         """A new, empty store in memory."""
     @staticmethod
-    def s3(location: str, prefix: str | None = None, *, region: str | None = None, profile: str | None = None, concurrency: int | None = None, upload_buffer_bytes: int | None = None) -> Kv:
+    def directory(root: str | PathLike[str]) -> Kv:
+        """A store of files below `root`, with atomic writes and streamed file transfers.
+
+        Keys must be UTF-8 paths with non-empty segments other than `.` and
+        `..`. Paths and symlinks cannot escape the root."""
+    @staticmethod
+    def from_backend(backend: object) -> Kv:
+        """A store backed by a Python object with `get(key)` and `put(key, value)`.
+
+        Keys and values are bytes; `get` returns bytes or None. Optional
+        `exists(key)` and `size(key)` avoid reading whole values. Optional
+        `put_file(key, path)` and `get_file(key, path)` stream through temporary
+        files; `get_file` returns the length or None. Backend failures raise
+        StoreError. Methods run synchronously, including from Rust async calls."""
+    @staticmethod
+    def gcs(bucket: str, prefix: str = "", *, storage_class: str = "STANDARD", project: str | None = None, credentials_file: str | PathLike[str] | None = None) -> Kv:
+        """A Google Cloud Storage store, using `covalence[gcs]` and Google credentials.
+
+        `bucket` is a bare bucket name and `prefix` a folder within it.
+        `storage_class` applies to uploads. `project` selects the billing
+        project; `credentials_file` selects a service account JSON file instead
+        of Application Default Credentials. File transfers stream through disk."""
+    def put_file(self, key: _BytesLike, path: str | PathLike[str]) -> None:
+        """Store the file at `path` under `key`, replacing any value there.
+
+        Directory, S3 and GCS stores stream the transfer; memory stores hold
+        the value in memory. A failed or shortened reader publishes nothing."""
+    def get_file(self, key: _BytesLike, path: str | PathLike[str]) -> int | None:
+        """Write the value under `key` to `path` and return its length, or None.
+
+        A temporary file replaces `path` only after a successful transfer.
+        A missing value or a failure leaves the destination unchanged."""
+    @staticmethod
+    def s3(location: str, prefix: str | None = None, *, region: str | None = None, profile: str | None = None, storage_class: str | None = None, standard_below: int = 0, client: object | None = None, concurrency: int | None = None, upload_buffer_bytes: int | None = None) -> Kv:
         """A store in S3, configured as the AWS SDKs are.
 
         `location` is an `s3://bucket/prefix/` URL, or a bucket name with
@@ -295,11 +329,18 @@ class Kv:
           ValueError.
         - Keys must be UTF-8 with non-empty `/`-separated segments other than
           `.` and `..`; other keys raise StoreError.
-        - Credentials are fetched at the first request; missing or failed
-          credentials raise StoreError then.
+        - The native backend fetches credentials at the first request; missing
+          or failed credentials raise StoreError then. The optional boto3
+          backend resolves SDK configuration when constructed and may raise
+          SDK configuration or credential errors then.
         - Without `s3:ListBucket`, S3 answers 403 for a missing key, so reading
           one raises StoreError instead of returning None or False.
-        """
+        - `storage_class`, `standard_below` or `client` selects the optional
+          boto3 backend (`covalence[s3-python]`). Objects smaller than
+          `standard_below` use STANDARD; others use `storage_class` or STANDARD.
+        - `concurrency` sets the native backend's simultaneous parts or ranges
+          (16 by default; 0 counts as 1). A Python SDK backend with this option
+          or `upload_buffer_bytes` raises ValueError."""
     def get(self, key: _BytesLike) -> bytes | None:
         """The value under `key`, or None if there is none."""
     def put(self, key: _BytesLike, value: _BytesLike) -> None:
@@ -401,6 +442,25 @@ class BlobFact(Blob, Fact):
     def __hash__(self) -> int: ...
 
 @final
+class EvictionCandidate:
+    """A durably backed cached copy offered to an eviction policy.
+
+    Properties are read-only. `stored_size` counts the stored representation,
+    which may be compressed. `modified_at` is Unix seconds, or None if unknown.
+    A policy can approve releasing this copy, never the backing content.
+    """
+    def __new__(cls, cid: Cid, stored_size: int, modified_at: float | None = None) -> Self: ...
+    @property
+    def cid(self) -> Cid:
+        """The content identifier of the cached block."""
+    @property
+    def stored_size(self) -> int:
+        """The number of bytes occupied by the cached representation."""
+    @property
+    def modified_at(self) -> float | None:
+        """The cached representation's modification time in Unix seconds, if known."""
+
+@final
 class Cas:
     """A content-addressed store, which finds bytes by their CIDs.
 
@@ -427,37 +487,35 @@ class Cas:
     def sqlite(path: str | PathLike[str] | None = None) -> Cas:
         """A store in the SQLite database at `path`, or in memory without one."""
     @staticmethod
-    def kv(kv: Kv, prefix: str | None = None) -> Cas:
+    def kv(kv: Kv, prefix: str | None = None, *, compression: Literal["zstd"] | None = None, level: int = 3) -> Cas:
         """A store of blocks in `kv`, each under `prefix/blake3/<digest>/bytes`.
 
         - Without a prefix, the key is `blake3/<digest>/bytes`.
         - The digest is the BLAKE3 digest in lowercase unpadded base32.
         - A trailing `/` on `prefix` is optional; an invalid prefix raises
           ValueError.
-        - Never replaces a block `kv` already holds: on `Kv.s3` each write is
-          conditional, so concurrent writers of one block race safely.
-        """
-    def put(self, data: _BytesLike) -> Cid:
-        """Store `data` and return its raw BLAKE3 CID.
+        - Uncompressed writes atomically preserve existing blocks, requiring
+          a backend with create-only writes. Compressed writes retain the
+          backend's replacement behavior.
+        - `compression="zstd"` stores zstd frames under `bytes.zst`, keeping
+          CIDs of the uncompressed content. `level` sets the compression level."""
+    def flush(self, flags: Flush | int = 1, *, policy: EvictionPolicy | None = None) -> None:
+        """Request the guarantees in `flags`, defaulting to Flush.PERSIST.
 
-        Checks that the store keeps the data under that CID.
-        """
-    def put_value(self, value: _NativeInput) -> Cid:
-        """Store the DRISL encoding of `value` and return its DRISL CID.
+        Flush.REMOTE writes back to the remote CAS; Flush.EVICT releases only
+        cached copies with confirmed durable backing. Combine the flags to
+        write back before releasing. Unsupported requests raise UnsupportedError;
+        zero does nothing. A failure may leave part of the work complete.
 
-        The CID is hashed with BLAKE3, so it is `Value(value).cid()`.
-        """
-    def put_file(self, path: str | PathLike[str]) -> Cid:
-        """Store the file at `path` and return its raw BLAKE3 CID.
+        With EVICT, `policy` replaces configured selection for this call;
+        None uses the store's policy. It receives only durably backed copies,
+        and `should_evict(candidate)` must return bool. False keeps the copy;
+        True permits release. Exceptions propagate and keep that candidate.
+        Without EVICT the policy is ignored and is never called."""
+    def remote(self) -> Cas:
+        """The remote CAS holding this store's backing content, if supported.
 
-        Checks that the store keeps the file under that CID.
-
-        - Reads the file twice, to hash it and to store it, and stores only
-          the bytes it hashed. If they changed in between it raises
-          IntegrityError, and if the file got shorter OSError, storing nothing.
-        - `Cas.kv` over `Kv.s3` streams the file; other stores read it into
-          memory.
-        """
+        Raises UnsupportedError when this store has no remote CAS view."""
     def put_fileobj(self, file: BinaryIO, *, max_bytes: int, expected_length: int | None = None) -> Cid:
         """Store a seekable binary file object and return its raw BLAKE3 CID.
 
@@ -480,6 +538,51 @@ class Cas:
         - The byte limit does not bound backend memory. `Cas.kv` over `Kv.s3`
           streams with its configured concurrency; other stores may hold the
           complete block in memory.
+        """
+    def put(self, data: _BytesLike) -> Cid:
+        """Store `data` and return its raw BLAKE3 CID.
+
+        Checks that the store keeps the data under that CID."""
+    def put_value(self, value: _NativeInput) -> Cid:
+        """Store the DRISL encoding of `value` and return its DRISL CID.
+
+        The CID is hashed with BLAKE3, so it is `Value(value).cid()`."""
+    def put_file(self, path: str | PathLike[str], *, expected: Cid | None = None) -> Cid:
+        """Store the file at `path` and return its raw BLAKE3 CID.
+
+        Checks that the store keeps the file under that CID.
+
+        - Without `expected`, reads the file twice, to hash it and to store it.
+          With `expected`, reads once and checks against that BLAKE3 CID. Stores only
+          the bytes it hashed. If they changed in between it raises
+          IntegrityError, and if the consumed file got shorter OSError, storing
+          nothing. An existing block may be reused without reading the file.
+        - KV-backed stores spool and transfer through disk; a memory KV still
+          holds its values in memory. Memory and SQLite CASes read the file
+          into memory.
+        - `expected` requires that CID before publishing a new block, raising
+          IntegrityError if the consumed file has different content. Uncompressed
+          KV stores may reuse an existing block without reading the source;
+          use `put_fileobj` to check the complete source even when deduplicating."""
+    def get_to(self, cid: Cid, writer: _SupportsWrite[bytes], *, max_bytes: int, expected_length: int | None = None) -> int | None:
+        """Write a block to a binary file object, checking its CID and byte limits.
+
+        Returns the written length, or None if missing.
+
+        - `max_bytes` bounds bytes accepted by `writer.write`. If given,
+          `expected_length` must not exceed it and must match the block exactly.
+          A length violation raises ValueError.
+        - Calls `write(bytes)` with at most 1 MiB at once. It must return an
+          integer from one to the offered length. Short writes are allowed.
+          Never seeks, flushes or closes the writer.
+        - A successful return checks all bytes against `cid`. On failure the
+          writer may contain a partial or unchecked block; use private staging
+          and publish it only after success. Writer exceptions propagate unchanged.
+          If backend cleanup also fails, raises StoreError with the writer
+          exception as its `__cause__`.
+        - The byte limit bounds output, not backend memory. `Cas.kv` over
+          `Kv.s3` streams with its configured concurrency; other stores may
+          fetch the complete block before writing any bytes.
         """
     def put_from(self, cid: Cid, chunks: Iterable[_BytesLike], length: int) -> Cid:
         """Store a block identified by `cid` from `chunks` and return its raw BLAKE3 CID.
@@ -511,34 +614,12 @@ class Cas:
         - Checks the bytes against `cid` in a temporary file beside `path`,
           which replaces `path` only once the check passes. A missing CID or a
           failure leaves `path` as it was.
-        - `Cas.kv` over `Kv.s3` streams the bytes; other stores hold them in
-          memory.
-        """
-    def get_to(self, cid: Cid, writer: _SupportsWrite[bytes], *, max_bytes: int, expected_length: int | None = None) -> int | None:
-        """Write a block to a binary file object, checking its CID and byte limits.
-
-        Returns the written length, or None if missing.
-
-        - `max_bytes` bounds bytes accepted by `writer.write`. If given,
-          `expected_length` must not exceed it and must match the block exactly.
-          A length violation raises ValueError.
-        - Calls `write(bytes)` with at most 1 MiB at once. It must return an
-          integer from one to the offered length. Short writes are allowed.
-          Never seeks, flushes or closes the writer.
-        - A successful return checks all bytes against `cid`. On failure the
-          writer may contain a partial or unchecked block; use private staging
-          and publish it only after success. Writer exceptions propagate unchanged.
-          If backend cleanup also fails, raises StoreError with the writer
-          exception as its `__cause__`.
-        - The byte limit bounds output, not backend memory. `Cas.kv` over
-          `Kv.s3` streams with its configured concurrency; other stores may
-          fetch the complete block before writing any bytes.
-        """
+        - Directory, S3 and GCS KV backends transfer through disk in bounded
+          memory. Memory and SQLite CASes hold the bytes in memory."""
     def size(self, cid: Cid) -> int | None:
         """The size in bytes of the value under `cid`, as the store vouches for it.
 
-        None if missing. No store checks sizes yet.
-        """
+        None if missing. No store checks sizes yet."""
     def get_range(self, cid: Cid, start: int, length: int) -> bytes | None:
         """Up to `length` bytes from `start`, as the store vouches for them.
 
@@ -554,8 +635,7 @@ class Cas:
         >>> cas.get_range(cid, 4, 10)
         b'o'
         >>> cas.get_range(cid, 5, 1)
-        b''
-        """
+        b''"""
     def size_unchecked(self, cid: Cid) -> int | None:
         """The unchecked size in bytes of the value under `cid`, or None if missing."""
     def get_range_unchecked(self, cid: Cid, start: int, length: int) -> bytes | None:
@@ -567,8 +647,7 @@ class Cas:
 
         - `Cas.sqlite` checks its index, without reading the bytes.
         - `Cas.kv` asks its `Kv` whether the key exists (a HEAD on S3).
-        - `Cas.memory` looks the bytes up in memory.
-        """
+        - `Cas.memory` looks the bytes up in memory."""
     def missing(self, cids: Sequence[Cid]) -> list[Cid]:
         """Those of `cids` the store lacks, in order, as `has` finds them."""
     def info(self) -> _Native:

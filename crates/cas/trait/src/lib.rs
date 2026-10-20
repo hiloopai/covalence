@@ -20,6 +20,8 @@
 //!   with `a`: `get` and `aget`, `put` and `aput`.
 //! - [`Cas`] combines them over [`Cid`]. Hold a store as `Arc<dyn Cas>` (or
 //!   take `&dyn Cas`) rather than being generic; [`Cas::into_dyn`] makes one.
+//! - [`Cas::aflush`] requests the guarantees of [`Cas::flush`] asynchronously;
+//!   its default calls the sync method when polled and may block.
 //! - [`Cas::info`] and [`Cas::stats`] describe a store, for debugging, as a
 //!   DASL value.
 //! - Stores live in their own crates, such as `covalence-cas-memory`.
@@ -106,6 +108,7 @@ use std::{
     io::{self, Read, Write},
     pin::Pin,
     sync::Arc,
+    time::SystemTime,
 };
 
 use covalence_lib_cid::{Blake3, Cid, CidFormat, Claim, Fact};
@@ -129,6 +132,72 @@ pub fn map<const N: usize>(entries: [(&str, Value); N]) -> Value {
     Value::Map(BTreeMap::from(
         entries.map(|(key, value)| (key.into(), value)),
     ))
+}
+
+bitflags::bitflags! {
+    /// The guarantees requested by [`Cas::flush`].
+    ///
+    /// Flags are independent: `REMOTE | EVICT` copies data before releasing
+    /// cached copies; `EVICT` alone releases only already-backed copies. An
+    /// empty set does nothing. Stores reject unsupported flags before doing
+    /// work. A later I/O failure may leave some work complete, but must never
+    /// release a copy whose backing has not been confirmed.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Flush: u32 {
+        /// Make accepted writes durable in this store's persistent storage.
+        const PERSIST = 1;
+        /// Copy accepted content to the CAS returned by [`Cas::remote`].
+        const REMOTE = 2;
+        /// Release cached copies that have confirmed durable backing.
+        const EVICT = 4;
+    }
+}
+
+/// A durably backed cached copy offered to an eviction policy.
+///
+/// Sizes describe stored bytes, which may be compressed. The store must
+/// confirm durable backing before offering a candidate; policy approval
+/// never permits deleting the backing content.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct EvictionCandidate {
+    /// The content identifier of the cached block.
+    pub cid: Cid,
+    /// The number of bytes occupied by the cached representation.
+    pub stored_size: u64,
+    /// When the cached representation was last modified, if known.
+    pub modified_at: Option<SystemTime>,
+}
+
+impl EvictionCandidate {
+    /// Describe a cached block, its stored size and optional modification time.
+    pub fn new(cid: Cid, stored_size: u64, modified_at: Option<SystemTime>) -> Self {
+        Self {
+            cid,
+            stored_size,
+            modified_at,
+        }
+    }
+}
+
+/// A decision about which durably backed cached copies may be released.
+///
+/// A policy replaces the store's configured selection for one flush. Stores
+/// offer only copies whose durable backing they have confirmed. A `true`
+/// decision permits release but does not require it. Closures implement this
+/// trait and may borrow data for the duration of the flush.
+pub trait EvictionPolicy: Send + Sync {
+    /// Whether this durably backed cached copy may be released.
+    fn should_evict(&self, candidate: &EvictionCandidate) -> bool;
+}
+
+impl<F> EvictionPolicy for F
+where
+    F: Fn(&EvictionCandidate) -> bool + Send + Sync,
+{
+    fn should_evict(&self, candidate: &EvictionCandidate) -> bool {
+        self(candidate)
+    }
 }
 
 /// A key stores can be asked for.
@@ -319,6 +388,44 @@ impl<K: Key, T: AsyncGet<K> + ?Sized> AsyncGetExt<K> for T {}
 /// local cache), but `get_fact` and `aget_fact` are correct either way. Do not
 /// call the sync methods on an async runtime thread: they may block.
 pub trait Cas: Get + Put + AsyncGet + AsyncPut {
+    /// Request durability, remote write-back or cache release, as `flags` says.
+    ///
+    /// The default accepts an empty set and otherwise returns
+    /// [`Error::Unsupported`]. A successful eviction may retain copies under
+    /// the store's cache policy. This does not delete the backing content.
+    ///
+    /// With `EVICT`, `policy` replaces configured selection for this call;
+    /// `None` uses the store's policy. Only durably backed copies may be
+    /// offered, and approval never bypasses that requirement. Without
+    /// `EVICT`, the policy is ignored and must not be called.
+    fn flush(&self, flags: Flush, _policy: Option<&dyn EvictionPolicy>) -> Result<(), Error> {
+        if flags.is_empty() {
+            Ok(())
+        } else {
+            Err(Op::Flush.unsupported())
+        }
+    }
+
+    /// As [`Cas::flush`], using this store's async storage path.
+    ///
+    /// The default calls [`Cas::flush`] when polled and may block. Stores
+    /// with a nonblocking implementation override it.
+    fn aflush<'a>(
+        &'a self,
+        flags: Flush,
+        policy: Option<&'a dyn EvictionPolicy>,
+    ) -> CasFuture<'a, ()> {
+        Box::pin(async move { self.flush(flags, policy) })
+    }
+
+    /// The remote CAS holding this store's backing content, if supported.
+    ///
+    /// This is a content-addressed view, not an implementation backend such
+    /// as a database or key-value store. The default is [`Error::Unsupported`].
+    fn remote(&self) -> Result<Arc<dyn Cas>, Error> {
+        Err(Op::Remote.unsupported())
+    }
+
     /// Whether the store holds bytes for `key`, unchecked, as
     /// [`Get::get_unchecked`] would find them. Reads them by default; stores
     /// override it to avoid that.
@@ -500,6 +607,19 @@ impl AsyncPut for Arc<dyn Cas> {
 }
 
 impl Cas for Arc<dyn Cas> {
+    fn aflush<'a>(
+        &'a self,
+        flags: Flush,
+        policy: Option<&'a dyn EvictionPolicy>,
+    ) -> CasFuture<'a, ()> {
+        (**self).aflush(flags, policy)
+    }
+    fn flush(&self, flags: Flush, policy: Option<&dyn EvictionPolicy>) -> Result<(), Error> {
+        (**self).flush(flags, policy)
+    }
+    fn remote(&self) -> Result<Arc<dyn Cas>, Error> {
+        (**self).remote()
+    }
     fn has(&self, key: &Cid) -> Result<bool, Error> {
         (**self).has(key)
     }
@@ -531,6 +651,10 @@ pub enum Op {
     Get,
     /// A write.
     Put,
+    /// A durability, write-back or cache release request.
+    Flush,
+    /// Access to a store's remote CAS.
+    Remote,
 }
 
 impl Op {

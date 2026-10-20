@@ -66,6 +66,7 @@ Stores:
 - `crates/cas/kv`: a content-addressed store over a key-value store.
 - `crates/kv/trait`: the key-value store trait.
 - `crates/kv/memory`: an in-memory key-value store.
+- `crates/kv/directory`: a key-value store in a filesystem directory.
 - `crates/kv/s3`: a key-value store on S3.
 
 Python:

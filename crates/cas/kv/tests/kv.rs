@@ -76,6 +76,47 @@ fn memory() {
     });
 }
 
+/// A backend using the default unsupported create-only operations.
+struct ReplaceOnly;
+
+impl Kv for ReplaceOnly {
+    fn get(&self, _: &[u8]) -> Result<Option<Bytes>, covalence_kv_trait::Error> {
+        panic!("an unsupported create-only write must not read the backend");
+    }
+
+    fn put(&self, _: &[u8], _: Bytes) -> Result<(), covalence_kv_trait::Error> {
+        panic!("an unsupported create-only write must not replace a value");
+    }
+
+    fn aget<'a>(&'a self, key: &'a [u8]) -> KvFuture<'a, Option<Bytes>> {
+        ready(self.get(key))
+    }
+
+    fn aput<'a>(&'a self, key: &'a [u8], value: Bytes) -> KvFuture<'a, ()> {
+        ready(self.put(key, value))
+    }
+}
+
+/// Unsupported create-only writes retain the CAS operation error at the boundary.
+#[test]
+fn unsupported_create_only_writes_are_unsupported_cas_puts() {
+    let store = KvCas::new(ReplaceOnly.into_dyn()).into_dyn();
+    let mut source = std::io::Cursor::new(b"hello");
+    for result in [
+        store.put("hello".into()),
+        block_on(store.aput("hello".into())),
+        store.put_from(Blake3::of(b"hello"), &mut source, 5),
+    ] {
+        assert!(matches!(
+            result,
+            Err(Error::Unsupported {
+                op: covalence_cas_trait::Op::Put,
+            })
+        ));
+    }
+    assert_eq!(source.position(), 0);
+}
+
 /// A key-value store that cannot read values, only whether they exist.
 struct Blind(MemoryKv, usize);
 

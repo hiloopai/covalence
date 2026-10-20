@@ -1,4 +1,6 @@
+mod backend;
 mod errors;
+mod eviction;
 mod streams;
 
 use std::{
@@ -14,7 +16,8 @@ use covalence_blob_trait::{Blob, BlobExt, Slice};
 use covalence_cas_kv::KvCas;
 use covalence_cas_memory::MemoryCas;
 use covalence_cas_sqlite::SqliteCas;
-use covalence_cas_trait::{Cas, GetExt};
+use covalence_cas_trait::{Cas, EvictionPolicy, Flush, GetExt};
+use covalence_kv_directory::DirectoryKv;
 use covalence_kv_memory::MemoryKv;
 use covalence_kv_s3::{AwsOptions, S3Kv, S3Location};
 use covalence_kv_trait::Kv;
@@ -590,7 +593,8 @@ impl PyValue {
 
 /// A store of byte values under byte keys.
 ///
-/// Build one with `memory` or `s3`. A failure of the storage underneath
+/// Build one with `memory`, `directory`, `s3`, `gcs` or `from_backend`.
+/// A failure of the storage underneath
 /// raises StoreError.
 ///
 /// >>> from covalence import Kv
@@ -615,6 +619,39 @@ impl PyKv {
         }
     }
 
+    /// A store of files below `root`, with atomic writes and streamed file transfers.
+    ///
+    /// Keys must be UTF-8 paths with non-empty segments other than `.` and
+    /// `..`. Paths and symlinks cannot escape the root.
+    #[staticmethod]
+    fn directory(py: Python<'_>, root: PathBuf) -> PyResult<Self> {
+        let store = py.detach(|| DirectoryKv::new(root)).map_err(raise)?;
+        Ok(Self {
+            inner: store.into_dyn(),
+        })
+    }
+
+    /// A store backed by a Python object with `get(key)` and `put(key, value)`.
+    ///
+    /// Keys and values are bytes; `get` returns bytes or None. Optional
+    /// `exists(key)` and `size(key)` avoid reading whole values. Optional
+    /// `put_file(key, path)` and `get_file(key, path)` stream through temporary
+    /// files; `get_file` returns the length or None. Backend failures raise
+    /// StoreError. Methods run synchronously, including from Rust async calls.
+    #[staticmethod]
+    fn from_backend(py: Python<'_>, backend: Py<PyAny>) -> PyResult<Self> {
+        for name in ["get", "put"] {
+            if !backend.bind(py).getattr(name)?.is_callable() {
+                return Err(PyTypeError::new_err(format!(
+                    "backend.{name} must be callable"
+                )));
+            }
+        }
+        Ok(Self {
+            inner: backend::PythonKv(backend).into_dyn(),
+        })
+    }
+
     /// A store in S3, configured as the AWS SDKs are.
     ///
     /// `location` is an `s3://bucket/prefix/` URL, or a bucket name with
@@ -637,21 +674,52 @@ impl PyKv {
     ///   ValueError.
     /// - Keys must be UTF-8 with non-empty `/`-separated segments other than
     ///   `.` and `..`; other keys raise StoreError.
-    /// - Credentials are fetched at the first request; missing or failed
-    ///   credentials raise StoreError then.
+    /// - The native backend fetches credentials at the first request; missing
+    ///   or failed credentials raise StoreError then. The optional boto3
+    ///   backend resolves SDK configuration when constructed and may raise
+    ///   SDK configuration or credential errors then.
     /// - Without `s3:ListBucket`, S3 answers 403 for a missing key, so reading
     ///   one raises StoreError instead of returning None or False.
+    /// - `storage_class`, `standard_below` or `client` selects the optional
+    ///   boto3 backend (`covalence[s3-python]`). Objects smaller than
+    ///   `standard_below` use STANDARD; others use `storage_class` or STANDARD.
+    /// - `concurrency` sets the native backend's simultaneous parts or ranges
+    ///   (16 by default; 0 counts as 1). A Python SDK backend with this option
+    ///   or `upload_buffer_bytes` raises ValueError.
     #[staticmethod]
-    #[pyo3(signature = (location, prefix = None, *, region = None, profile = None, concurrency = None, upload_buffer_bytes = None))]
+    #[pyo3(signature = (location, prefix = None, *, region = None, profile = None, storage_class = None, standard_below = 0, client = None, concurrency = None, upload_buffer_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
     fn s3(
         py: Python<'_>,
         location: &str,
         prefix: Option<&str>,
         region: Option<String>,
         profile: Option<String>,
+        storage_class: Option<&str>,
+        standard_below: u64,
+        client: Option<Py<PyAny>>,
         concurrency: Option<usize>,
         upload_buffer_bytes: Option<u64>,
     ) -> PyResult<Self> {
+        if storage_class.is_some() || standard_below != 0 || client.is_some() {
+            if concurrency.is_some() || upload_buffer_bytes.is_some() {
+                return Err(fail(
+                    "concurrency and upload_buffer_bytes are supported only by the native S3 backend",
+                ));
+            }
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("region", region)?;
+            kwargs.set_item("profile", profile)?;
+            kwargs.set_item("storage_class", storage_class.unwrap_or("STANDARD"))?;
+            kwargs.set_item("standard_below", standard_below)?;
+            kwargs.set_item("client", client)?;
+            let object = py
+                .import("covalence._cloud")?
+                .getattr("S3Backend")?
+                .call((location, prefix), Some(&kwargs))?
+                .unbind();
+            return Self::from_backend(py, object);
+        }
         let location = match (location.strip_prefix("s3://"), prefix) {
             (None, prefix) => S3Location::new(location, prefix.unwrap_or_default()),
             (Some(_), None) => location.parse(),
@@ -679,6 +747,34 @@ impl PyKv {
         })
     }
 
+    /// A Google Cloud Storage store, using `covalence[gcs]` and Google credentials.
+    ///
+    /// `bucket` is a bare bucket name and `prefix` a folder within it.
+    /// `storage_class` applies to uploads. `project` selects the billing
+    /// project; `credentials_file` selects a service account JSON file instead
+    /// of Application Default Credentials. File transfers stream through disk.
+    #[staticmethod]
+    #[pyo3(signature = (bucket, prefix = "", *, storage_class = "STANDARD", project = None, credentials_file = None))]
+    fn gcs(
+        py: Python<'_>,
+        bucket: &str,
+        prefix: &str,
+        storage_class: &str,
+        project: Option<&str>,
+        credentials_file: Option<PathBuf>,
+    ) -> PyResult<Self> {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("storage_class", storage_class)?;
+        kwargs.set_item("project", project)?;
+        kwargs.set_item("credentials_file", credentials_file)?;
+        let object = py
+            .import("covalence._cloud")?
+            .getattr("GcsBackend")?
+            .call((bucket, prefix), Some(&kwargs))?
+            .unbind();
+        Self::from_backend(py, object)
+    }
+
     /// The value under `key`, or None if there is none.
     fn get<'py>(
         &self,
@@ -693,6 +789,36 @@ impl PyKv {
     fn put(&self, py: Python<'_>, key: PyBackedBytes, value: PyBackedBytes) -> PyResult<()> {
         let value = Bytes::from_owner(value);
         py.detach(|| self.inner.put(&key, value)).map_err(raise)
+    }
+
+    /// Store the file at `path` under `key`, replacing any value there.
+    ///
+    /// Directory, S3 and GCS stores stream the transfer; memory stores hold
+    /// the value in memory. A failed or shortened reader publishes nothing.
+    fn put_file(&self, py: Python<'_>, key: PyBackedBytes, path: PathBuf) -> PyResult<()> {
+        py.detach(|| {
+            let mut file = File::open(path)?;
+            let len = file.metadata()?.len();
+            self.inner.put_from(&key, &mut file, len).map_err(raise)
+        })
+    }
+
+    /// Write the value under `key` to `path` and return its length, or None.
+    ///
+    /// A temporary file replaces `path` only after a successful transfer.
+    /// A missing value or a failure leaves the destination unchanged.
+    fn get_file(&self, py: Python<'_>, key: PyBackedBytes, path: PathBuf) -> PyResult<Option<u64>> {
+        let (mut temp, permissions) = py.detach(|| temp_beside(&path))?;
+        let len = py
+            .detach(|| self.inner.get_to(&key, temp.as_file_mut()))
+            .map_err(raise)?;
+        if len.is_some() {
+            py.detach(|| {
+                temp.as_file().set_permissions(permissions)?;
+                temp.persist(&path).map_err(|error| error.error)
+            })?;
+        }
+        Ok(len)
     }
 
     /// Whether there is a value under `key`, without reading it.
@@ -964,6 +1090,50 @@ struct PyCas {
 #[pymethods]
 #[pyo3(crate = "covalence_lib_python::pyo3")]
 impl PyCas {
+    /// Request the guarantees in `flags`, defaulting to Flush.PERSIST.
+    ///
+    /// Flush.REMOTE writes back to the remote CAS; Flush.EVICT releases only
+    /// cached copies with confirmed durable backing. Combine the flags to
+    /// write back before releasing. Unsupported requests raise UnsupportedError;
+    /// zero does nothing. A failure may leave part of the work complete.
+    ///
+    /// With EVICT, `policy` replaces configured selection for this call;
+    /// None uses the store's policy. It receives only durably backed copies,
+    /// and `should_evict(candidate)` must return bool. False keeps the copy;
+    /// True permits release. Exceptions propagate and keep that candidate.
+    /// Without EVICT the policy is ignored and is never called.
+    #[pyo3(signature = (flags = 1, *, policy = None))]
+    fn flush(&self, py: Python<'_>, flags: u32, policy: Option<Py<PyAny>>) -> PyResult<()> {
+        let flags = Flush::from_bits(flags).ok_or_else(|| fail("unknown flush flags"))?;
+        let policy = policy.map(eviction::Policy::new);
+        let result = py.detach(|| {
+            self.inner.flush(
+                flags,
+                policy.as_ref().map(|policy| policy as &dyn EvictionPolicy),
+            )
+        });
+        if let Some(source) = policy.and_then(|policy| policy.take_error()) {
+            return match result {
+                Err(error @ covalence_cas_trait::Error::Backend { .. }) => {
+                    let error = raise(error);
+                    error.set_cause(py, Some(source));
+                    Err(error)
+                }
+                _ => Err(source),
+            };
+        }
+        result.map_err(raise)
+    }
+
+    /// The remote CAS holding this store's backing content, if supported.
+    ///
+    /// Raises UnsupportedError when this store has no remote CAS view.
+    fn remote(&self, py: Python<'_>) -> PyResult<Self> {
+        Ok(Self {
+            inner: py.detach(|| self.inner.remote()).map_err(raise)?,
+        })
+    }
+
     /// A new, empty store in memory.
     #[staticmethod]
     fn memory() -> Self {
@@ -993,15 +1163,29 @@ impl PyCas {
     /// - The digest is the BLAKE3 digest in lowercase unpadded base32.
     /// - A trailing `/` on `prefix` is optional; an invalid prefix raises
     ///   ValueError.
-    /// - Never replaces a block `kv` already holds: on `Kv.s3` each write is
-    ///   conditional, so concurrent writers of one block race safely.
+    /// - Uncompressed writes atomically preserve existing blocks, requiring
+    ///   a backend with create-only writes. Compressed writes retain the
+    ///   backend's replacement behavior.
+    /// - `compression="zstd"` stores zstd frames under `bytes.zst`, keeping
+    ///   CIDs of the uncompressed content. `level` sets the compression level.
     #[staticmethod]
-    #[pyo3(signature = (kv, prefix = None))]
-    fn kv(kv: PyRef<'_, PyKv>, prefix: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (kv, prefix = None, *, compression = None, level = 3))]
+    fn kv(
+        kv: PyRef<'_, PyKv>,
+        prefix: Option<&str>,
+        compression: Option<&str>,
+        level: i32,
+    ) -> PyResult<Self> {
         let kv = kv.inner.clone();
-        let store = match prefix {
-            Some(prefix) => KvCas::with_prefix(kv, prefix).map_err(fail)?,
-            None => KvCas::new(kv),
+        let store = match compression {
+            Some("zstd") => {
+                KvCas::compressed(kv, prefix.unwrap_or_default(), level).map_err(fail)?
+            }
+            Some(_) => return Err(fail("compression must be 'zstd' or None")),
+            None => match prefix {
+                Some(prefix) => KvCas::with_prefix(kv, prefix).map_err(fail)?,
+                None => KvCas::new(kv),
+            },
         };
         Ok(Self {
             inner: store.into_dyn(),
@@ -1030,13 +1214,39 @@ impl PyCas {
     ///
     /// Checks that the store keeps the file under that CID.
     ///
-    /// - Reads the file twice, to hash it and to store it, and stores only
+    /// - Without `expected`, reads the file twice, to hash it and to store it.
+    ///   With `expected`, reads once and checks against that BLAKE3 CID. Stores only
     ///   the bytes it hashed. If they changed in between it raises
-    ///   IntegrityError, and if the file got shorter OSError, storing nothing.
-    /// - `Cas.kv` over `Kv.s3` streams the file; other stores read it into
-    ///   memory.
-    fn put_file(&self, py: Python<'_>, path: PathBuf) -> PyResult<PyCid> {
-        let (mut file, claim, len) = py.detach(|| hash_file(&path))?;
+    ///   IntegrityError, and if the consumed file got shorter OSError, storing
+    ///   nothing. An existing block may be reused without reading the file.
+    /// - KV-backed stores spool and transfer through disk; a memory KV still
+    ///   holds its values in memory. Memory and SQLite CASes read the file
+    ///   into memory.
+    /// - `expected` requires that CID before publishing a new block, raising
+    ///   IntegrityError if the consumed file has different content. Uncompressed
+    ///   KV stores may reuse an existing block without reading the source;
+    ///   use `put_fileobj` to check the complete source even when deduplicating.
+    #[pyo3(signature = (path, *, expected = None))]
+    fn put_file(
+        &self,
+        py: Python<'_>,
+        path: PathBuf,
+        expected: Option<PyRef<'_, PyCid>>,
+    ) -> PyResult<PyCid> {
+        let (mut file, claim, len) = if let Some(expected) = expected {
+            let claim = expected
+                .key()?
+                .raw_blake3()
+                .ok_or_else(|| raise_as(Class::Integrity, "expected must be a BLAKE3 CID"))?;
+            let (file, len) = py.detach(|| -> io::Result<_> {
+                let file = File::open(&path)?;
+                let len = file.metadata()?.len();
+                Ok((file, len))
+            })?;
+            (file, claim, len)
+        } else {
+            py.detach(|| hash_file(&path))?
+        };
         let key = py
             .detach(|| self.inner.put_from(claim, &mut file, len))
             .map_err(raise)?;
@@ -1140,8 +1350,8 @@ impl PyCas {
     /// - Checks the bytes against `cid` in a temporary file beside `path`,
     ///   which replaces `path` only once the check passes. A missing CID or a
     ///   failure leaves `path` as it was.
-    /// - `Cas.kv` over `Kv.s3` streams the bytes; other stores hold them in
-    ///   memory.
+    /// - Directory, S3 and GCS KV backends transfer through disk in bounded
+    ///   memory. Memory and SQLite CASes hold the bytes in memory.
     fn get_file(
         &self,
         py: Python<'_>,
@@ -1468,6 +1678,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyValue>()?;
     m.add_class::<PyKv>()?;
     m.add_class::<PyCas>()?;
+    m.add_class::<eviction::PyEvictionCandidate>()?;
     m.add_class::<PyBlob>()?;
     m.add_class::<PyBlobFact>()?;
     errors::add(m)

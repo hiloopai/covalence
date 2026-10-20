@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lib/error", "crates/lib/cli", "tools/glu", "crates/lib/serde", "crates/lib/data", "crates/lib/python", "crates/python", "crates/lib/cid", "crates/lib/sqlite", "crates/lib/dasl", "crates/cas/trait", "crates/cas/memory", "crates/lib/rand", "crates/cas/sqlite", "crates/kv/trait", "crates/kv/memory", "crates/kv/s3", "crates/cas/kv", "crates/blob/trait"]
+members = ["crates/lib/error", "crates/lib/cli", "tools/glu", "crates/lib/serde", "crates/lib/data", "crates/lib/python", "crates/python", "crates/lib/cid", "crates/lib/sqlite", "crates/lib/dasl", "crates/cas/trait", "crates/cas/memory", "crates/lib/rand", "crates/cas/sqlite", "crates/kv/trait", "crates/kv/memory", "crates/kv/directory", "crates/kv/s3", "crates/cas/kv", "crates/blob/trait"]
 resolver = "3"
 
 [workspace.package]
@@ -22,6 +22,7 @@ covalence-cas-kv = { path = "crates/cas/kv", version = "=0.1.0-dev.5" }
 covalence-cas-memory = { path = "crates/cas/memory", version = "=0.1.0-dev.5" }
 covalence-cas-sqlite = { path = "crates/cas/sqlite", version = "=0.1.0-dev.5" }
 covalence-cas-trait = { path = "crates/cas/trait", version = "=0.1.0-dev.5" }
+covalence-kv-directory = { path = "crates/kv/directory", version = "=0.1.0-dev.5" }
 covalence-kv-memory = { path = "crates/kv/memory", version = "=0.1.0-dev.5" }
 covalence-kv-s3 = { path = "crates/kv/s3", version = "=0.1.0-dev.5" }
 covalence-kv-trait = { path = "crates/kv/trait", version = "=0.1.0-dev.5" }

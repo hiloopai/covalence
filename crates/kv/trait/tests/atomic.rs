@@ -50,3 +50,41 @@ fn atomic_defaults_are_unsupported_without_side_effects() {
         Poll::Ready(Err(Error::Unsupported { op: Op::PutNew }))
     ));
 }
+
+#[test]
+fn async_flush_default_is_lazy_and_forwards_through_shared_stores() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Persist(Arc<AtomicUsize>);
+    impl Kv for Persist {
+        fn get(&self, _: &[u8]) -> Result<Option<Bytes>, Error> {
+            Ok(None)
+        }
+        fn put(&self, _: &[u8], _: Bytes) -> Result<(), Error> {
+            Ok(())
+        }
+        fn aget<'a>(&'a self, _: &'a [u8]) -> KvFuture<'a, Option<Bytes>> {
+            covalence_kv_trait::ready(Ok(None))
+        }
+        fn aput<'a>(&'a self, _: &'a [u8], _: Bytes) -> KvFuture<'a, ()> {
+            covalence_kv_trait::ready(Ok(()))
+        }
+        fn flush(&self) -> Result<(), Error> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let store = Persist(calls.clone()).into_dyn();
+    let mut future = store.aflush();
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        future.as_mut().poll(&mut context),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
