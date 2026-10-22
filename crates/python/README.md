@@ -98,6 +98,18 @@ pip install covalence==0.1.0.dev6
 - `get` returns `bytes` or `None`.
 - `put` replaces any value under the key.
 - `exists` says whether there is a value without reading it (a HEAD on S3).
+- `put_file(key, path)` uploads a file, using streamed transfers when the
+  backend supports them; otherwise the value is held in memory.
+- `get_file(key, path)` downloads to a temporary file, then replaces the
+  destination on success. It returns the byte count, or `None` if missing.
+  A missing value or a failure leaves an existing destination unchanged.
+- `Kv.from_backend(object)` wraps a Python object with `get(key)` and
+  `put(key, value)`. Keys and values are bytes; `get` returns bytes or `None`.
+  Optional `exists` and `size` methods avoid whole-value reads, and optional
+  `put_file` and `get_file` methods transfer through private temporary files.
+  `get_file` returns the byte count or `None`; an incorrect count raises
+  `StoreError`. Python backend calls are synchronous. Atomic create-only
+  writes are unsupported, so `Cas.kv` cannot insert blocks through this adapter.
 - `Kv.s3` raises `ValueError` for an invalid location, a URL with a prefix
   argument too, or no region.
 - Without `s3:ListBucket`, S3 answers 403 for a missing key, so reading one

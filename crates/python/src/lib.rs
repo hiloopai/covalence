@@ -1,3 +1,4 @@
+mod backend;
 mod errors;
 mod streams;
 
@@ -590,8 +591,8 @@ impl PyValue {
 
 /// A store of byte values under byte keys.
 ///
-/// Build one with `memory` or `s3`. A failure of the storage underneath
-/// raises StoreError.
+/// Build one with `memory`, `s3` or `from_backend`. A failure of the
+/// storage underneath raises StoreError.
 ///
 /// >>> from covalence import Kv
 /// >>> kv = Kv.memory()
@@ -613,6 +614,28 @@ impl PyKv {
         Self {
             inner: MemoryKv::default().into_dyn(),
         }
+    }
+
+    /// A store backed by a Python object with `get(key)` and `put(key, value)`.
+    ///
+    /// Keys and values are bytes; `get` returns bytes or None. Optional
+    /// `exists(key)` and `size(key)` avoid reading whole values. Optional
+    /// `put_file(key, path)` and `get_file(key, path)` transfer through private
+    /// temporary files; `get_file` returns the length or None. Backend failures
+    /// raise StoreError. Methods run synchronously, including from Rust async
+    /// calls. Create-only writes are unsupported.
+    #[staticmethod]
+    fn from_backend(py: Python<'_>, backend: Py<PyAny>) -> PyResult<Self> {
+        for name in ["get", "put"] {
+            if !backend.bind(py).getattr(name)?.is_callable() {
+                return Err(PyTypeError::new_err(format!(
+                    "backend.{name} must be callable"
+                )));
+            }
+        }
+        Ok(Self {
+            inner: backend::PythonKv(backend).into_dyn(),
+        })
     }
 
     /// A store in S3, configured as the AWS SDKs are.
@@ -693,6 +716,36 @@ impl PyKv {
     fn put(&self, py: Python<'_>, key: PyBackedBytes, value: PyBackedBytes) -> PyResult<()> {
         let value = Bytes::from_owner(value);
         py.detach(|| self.inner.put(&key, value)).map_err(raise)
+    }
+
+    /// Store the file at `path` under `key`, replacing any value there.
+    ///
+    /// Uses the backend's streamed transfer when available; otherwise holds
+    /// the value in memory. Python backends transfer through a temporary file.
+    fn put_file(&self, py: Python<'_>, key: PyBackedBytes, path: PathBuf) -> PyResult<()> {
+        py.detach(|| {
+            let mut file = File::open(path)?;
+            let len = file.metadata()?.len();
+            self.inner.put_from(&key, &mut file, len).map_err(raise)
+        })
+    }
+
+    /// Write the value under `key` to `path` and return its length, or None.
+    ///
+    /// A temporary file replaces `path` only after a successful transfer.
+    /// A missing value or a failure leaves the destination unchanged.
+    fn get_file(&self, py: Python<'_>, key: PyBackedBytes, path: PathBuf) -> PyResult<Option<u64>> {
+        let (mut temp, permissions) = py.detach(|| temp_beside(&path))?;
+        let len = py
+            .detach(|| self.inner.get_to(&key, temp.as_file_mut()))
+            .map_err(raise)?;
+        if len.is_some() {
+            py.detach(|| {
+                temp.as_file().set_permissions(permissions)?;
+                temp.persist(&path).map_err(|error| error.error)
+            })?;
+        }
+        Ok(len)
     }
 
     /// Whether there is a value under `key`, without reading it.
