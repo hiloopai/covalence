@@ -17,6 +17,8 @@
 //!   atomically only under a key that holds none. Their defaults return
 //!   [`Error::Unsupported`] without reading or writing; stores that can create
 //!   atomically override them.
+//! - [`Kv::aflush`] requests the guarantees of [`Kv::flush`] asynchronously;
+//!   its default calls the sync method when polled and may block.
 //! - Stores live in their own crates, such as `covalence-kv-memory` and
 //!   `covalence-kv-s3`.
 //!
@@ -85,6 +87,21 @@ pub fn ready<'a, T: Send + 'a>(result: Result<T, Error>) -> KvFuture<'a, T> {
 /// may see different data (sync might read only a local cache). Do not call
 /// the sync methods on an async runtime thread: they may block.
 pub trait Kv: Send + Sync {
+    /// Make accepted writes durable in this store's persistent storage.
+    ///
+    /// The default returns [`Error::Unsupported`].
+    fn flush(&self) -> Result<(), Error> {
+        Err(Op::Flush.unsupported())
+    }
+
+    /// As [`Kv::flush`], using this store's async storage path.
+    ///
+    /// The default calls [`Kv::flush`] when polled and may block. Stores
+    /// with a nonblocking implementation override it.
+    fn aflush(&self) -> KvFuture<'_, ()> {
+        Box::pin(async move { self.flush() })
+    }
+
     /// The value under `key`, or `None` if missing.
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>, Error>;
 
@@ -228,6 +245,12 @@ fn slice(value: &Bytes, start: u64, len: u64) -> Bytes {
 
 /// A shared store is a store: each method forwards to it.
 impl Kv for Arc<dyn Kv> {
+    fn aflush(&self) -> KvFuture<'_, ()> {
+        (**self).aflush()
+    }
+    fn flush(&self) -> Result<(), Error> {
+        (**self).flush()
+    }
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>, Error> {
         (**self).get(key)
     }
@@ -299,6 +322,8 @@ pub enum Op {
     Put,
     /// An atomic create-only write.
     PutNew,
+    /// A request to make writes durable.
+    Flush,
 }
 
 impl Op {

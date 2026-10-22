@@ -4,6 +4,7 @@ import base64
 import copy
 import hashlib
 import importlib.resources
+import io
 import math
 import os
 import pathlib
@@ -1084,6 +1085,23 @@ class CasTests(ApiCase):
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(StoreError) as raised:
             Cas.sqlite(directory)
         self.assertIsInstance(raised.exception, OSError)
+
+    def test_missing_create_only_backend_operations_raise_unsupported_error(self):
+        class ReplaceOnly:
+            def get(self, key):
+                raise AssertionError("unsupported creation must not read the backend")
+
+            def put(self, key, value):
+                raise AssertionError("unsupported creation must not replace a value")
+
+        cas = Cas.kv(Kv.from_backend(ReplaceOnly()))
+        for operation in (
+            lambda: cas.put(b"hello"),
+            lambda: cas.put_fileobj(io.BytesIO(b"hello"), max_bytes=5),
+        ):
+            with self.subTest(operation=operation), self.assertRaises(UnsupportedError) as raised:
+                operation()
+            self.assertNotIsInstance(raised.exception, StoreError)
 
     def test_info_and_stats(self):
         memory, sqlite = Cas.memory(), Cas.sqlite()

@@ -2,6 +2,7 @@
 
 import ast
 import doctest
+import enum
 import importlib.resources
 import inspect
 from pathlib import Path
@@ -25,6 +26,8 @@ def public_members(cls):
         if not name.startswith("_"):
             yield name, getattr(cls, name)
         elif isinstance(value, (types.FunctionType, types.MethodDescriptorType)):
+            if issubclass(cls, enum.Enum) and not getattr(value, "__qualname__", "").startswith(f"{cls.__name__}."):
+                continue  # Enum installs inherited flag operators in the subclass.
             yield name, value
 
 

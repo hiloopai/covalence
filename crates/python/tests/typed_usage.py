@@ -1,8 +1,9 @@
 """Typed use of the public API, which `mypy --strict` checks in test_stubs.py."""
 
 from typing import assert_type
+import io
 
-from covalence import Blob, BlobFact, Cas, Cid, Codec, Error, Fact, Hash, IntegrityError, Kv, Value
+from covalence import Blob, BlobFact, Cas, Cid, EvictionCandidate, EvictionPolicy, Codec, Error, Fact, Flush, Hash, IntegrityError, Kv, Value
 
 
 def use_cids() -> None:
@@ -45,6 +46,22 @@ def use_blobs() -> None:
     assert_type(blob, Blob)
     assert_type(blob.read_all(), bytes)
     assert_type(blob.fact(Cid.of(b"ell")), BlobFact | None)
+
+
+def use_streams(path: str) -> None:
+    cas = Cas.kv(Kv.directory(path), compression="zstd")
+    cid = cas.put_fileobj(io.BytesIO(b"hello"), max_bytes=5, expected_length=5)
+    assert_type(cid, Cid)
+    assert_type(Cid.of_fileobj(io.BytesIO(b"hello"), max_bytes=5), Cid)
+    assert_type(cas.get_to(cid, io.BytesIO(), max_bytes=5), int | None)
+    policy = EvictionPolicy.from_callable(lambda candidate: candidate.stored_size > 10)
+    assert_type(policy, EvictionPolicy)
+    candidate = EvictionCandidate(cid, 5)
+    assert_type(candidate.cid, Cid)
+    assert_type(candidate.stored_size, int)
+    assert_type(candidate.modified_at, float | None)
+    cas.flush(Flush.PERSIST, policy=policy)
+    assert_type(cas.remote(), Cas)
 
 
 def handle_errors(cas: Cas, cid: Cid) -> bytes | None:

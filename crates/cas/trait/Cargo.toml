@@ -12,6 +12,7 @@ categories = ["database"]
 publish = true
 
 [dependencies]
+bitflags = "2"
 covalence-lib-cid.workspace = true
 covalence-lib-dasl.workspace = true
 covalence-lib-data.workspace = true

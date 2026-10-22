@@ -1,0 +1,30 @@
+[package]
+name = "covalence-kv-directory"
+description = "A key-value store in a filesystem directory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/covalence-kv-directory"
+keywords = ["key-value", "kv", "storage", "filesystem"]
+categories = ["database-implementations"]
+publish = true
+
+[dependencies]
+cap-std = "3.4"
+covalence-kv-trait.workspace = true
+covalence-lib-dasl.workspace = true
+covalence-lib-data.workspace = true
+covalence-lib-rand.workspace = true
+once_cell = "1.21"
+
+[dev-dependencies]
+pollster = "1.0.1"
+tempfile = "3"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
