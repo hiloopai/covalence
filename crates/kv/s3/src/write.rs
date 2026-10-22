@@ -1,7 +1,7 @@
 //! PUTs: one request for a value up to the part size, a multipart upload for
 //! a larger one. A put of a new value is a conditional write (`If-None-Match:
-//! *` on the PUT, or on completing the upload), which S3 answers with 412 when
-//! the key already holds a value.
+//! *` on the PUT, or on completing the upload). An occupied key returns 412
+//! or a `PreconditionFailed` error inside a 200 multipart completion response.
 
 use std::io::Read;
 
@@ -347,7 +347,12 @@ impl S3Kv {
             body(request.send(&xml)?, MAX_ERROR, Vec::new())
         })?;
         if status == 200 && body.windows(7).any(|window| window == b"<Error>") {
-            return status_error(status, &body);
+            return match status_error(status, &body) {
+                Err(Error::Status {
+                    code: Some(code), ..
+                }) if write == Write::New && code == "PreconditionFailed" => Ok(false),
+                result => result,
+            };
         }
         stored(status, &body, write)
     }

@@ -1048,60 +1048,101 @@ fn new_values_never_replace() {
 
 /// A new value signs and sends `If-None-Match: *` with its PUT, or with the
 /// request completing its upload; 412 there means the key is taken, and the
-/// upload is aborted. To a plain put, 412 is a failure.
+/// upload is aborted. Multipart completion may put that error inside a 200.
+/// To a plain put, 412 is a failure.
 #[test]
 fn new_value_requests() {
-    let taken = || {
-        response(
-            "412 Precondition Failed",
-            "<Error><Code>PreconditionFailed</Code></Error>",
-        )
-    };
-    let (endpoint, server) = fake(vec![
-        taken(),
-        created(),
-        with_header("200 OK", "ETag: \"e1\"", ""),
-        with_header("200 OK", "ETag: \"e2\"", ""),
-        with_header("200 OK", "ETag: \"e3\"", ""),
-        taken(),
-        response("204 No Content", ""),
-        taken(),
-    ]);
-    // The fake server answers requests in turn, so send them one at a time.
-    let kv = kv(&endpoint, "s3://test", SECRET)
-        .part_size(5 << 20)
-        .concurrency(1)
-        .upload_buffer_bytes(5 << 20);
-    assert!(!kv.put_new(b"a", "01".into()).unwrap());
-    assert!(!kv.put_new(b"a", multipart_ascii().into()).unwrap());
-    let error = s3_error(kv.put(b"a", "01".into()).unwrap_err());
-    assert!(
-        matches!(error, Error::Status { status: 412, .. }),
-        "{error}"
-    );
-    let requests = server.join().unwrap();
-    let methods: Vec<_> = requests
-        .iter()
-        .map(|request| request.split_once(' ').unwrap().0)
-        .collect();
-    let expected = ["PUT", "POST", "PUT", "PUT", "PUT", "POST", "DELETE", "PUT"];
-    assert_eq!(methods, expected);
-    for (index, request) in requests.iter().enumerate() {
-        let conditional = matches!(index, 0 | 5);
-        let signed = request
-            .split_once(" HTTP/1.1")
-            .unwrap()
-            .0
-            .contains("if-none-match");
-        assert_eq!(
-            request.contains("\r\nif-none-match: *\r\n"),
-            conditional,
-            "{request}"
+    for completion_status in ["412 Precondition Failed", "200 OK"] {
+        let taken = || {
+            response(
+                "412 Precondition Failed",
+                "<Error><Code>PreconditionFailed</Code></Error>",
+            )
+        };
+        let (endpoint, server) = fake(vec![
+            taken(),
+            created(),
+            with_header("200 OK", "ETag: \"e1\"", ""),
+            with_header("200 OK", "ETag: \"e2\"", ""),
+            with_header("200 OK", "ETag: \"e3\"", ""),
+            response(
+                completion_status,
+                "<Error><Code>PreconditionFailed</Code></Error>",
+            ),
+            response("204 No Content", ""),
+            taken(),
+        ]);
+        // The fake server answers requests in turn, so send them one at a time.
+        let kv = kv(&endpoint, "s3://test", SECRET)
+            .part_size(5 << 20)
+            .concurrency(1)
+            .upload_buffer_bytes(5 << 20);
+        assert!(!kv.put_new(b"a", "01".into()).unwrap());
+        assert!(!kv.put_new(b"a", multipart_ascii().into()).unwrap());
+        let error = s3_error(kv.put(b"a", "01".into()).unwrap_err());
+        assert!(
+            matches!(error, Error::Status { status: 412, .. }),
+            "{error}"
         );
-        assert_eq!(signed, conditional, "{request}");
+        let requests = server.join().unwrap();
+        let methods: Vec<_> = requests
+            .iter()
+            .map(|request| request.split_once(' ').unwrap().0)
+            .collect();
+        let expected = ["PUT", "POST", "PUT", "PUT", "PUT", "POST", "DELETE", "PUT"];
+        assert_eq!(methods, expected);
+        for (index, request) in requests.iter().enumerate() {
+            let conditional = matches!(index, 0 | 5);
+            let signed = request
+                .split_once(" HTTP/1.1")
+                .unwrap()
+                .0
+                .contains("if-none-match");
+            assert_eq!(
+                request.contains("\r\nif-none-match: *\r\n"),
+                conditional,
+                "{request}"
+            );
+            assert_eq!(signed, conditional, "{request}");
+        }
+        assert!(requests[5].contains("uploadId=u1"), "{}", requests[5]);
+        assert!(requests[6].contains("uploadId=u1"), "{}", requests[6]);
     }
-    assert!(requests[5].contains("uploadId=u1"), "{}", requests[5]);
-    assert!(requests[6].contains("uploadId=u1"), "{}", requests[6]);
+}
+
+/// Embedded completion errors remain failures unless a create-only write
+/// specifically lost its precondition. Failed completions still abort.
+#[test]
+fn multipart_completion_errors_stay_errors() {
+    for (create_only, code) in [(false, "PreconditionFailed"), (true, "InternalError")] {
+        let (endpoint, server) = fake(vec![
+            created(),
+            with_header("200 OK", "ETag: \"e1\"", ""),
+            with_header("200 OK", "ETag: \"e2\"", ""),
+            with_header("200 OK", "ETag: \"e3\"", ""),
+            response("200 OK", &format!("<Error><Code>{code}</Code></Error>")),
+            response("204 No Content", ""),
+        ]);
+        let kv = kv(&endpoint, "s3://test", SECRET)
+            .part_size(5 << 20)
+            .concurrency(1)
+            .upload_buffer_bytes(5 << 20);
+        let value = multipart_ascii();
+        let error = if create_only {
+            kv.put_new(b"a", value.into()).unwrap_err()
+        } else {
+            kv.put(b"a", value.into()).unwrap_err()
+        };
+        let error = s3_error(error);
+        assert!(
+            matches!(&error, Error::Status { status: 200, code: Some(actual) } if actual == code),
+            "{error}"
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert!(requests[5].starts_with("DELETE /test/a?"));
+        assert!(requests[5].contains("uploadId=u1"));
+    }
 }
 
 /// A response with `status`, `header`, closing the connection, and `body`.
