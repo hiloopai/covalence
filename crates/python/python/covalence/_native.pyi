@@ -259,8 +259,8 @@ class Value:
 class Kv:
     """A store of byte values under byte keys.
 
-    Build one with `memory` or `s3`. A failure of the storage underneath
-    raises StoreError.
+    Build one with `memory`, `s3` or `from_backend`. A failure of the
+    storage underneath raises StoreError.
 
     >>> from covalence import Kv
     >>> kv = Kv.memory()
@@ -271,6 +271,17 @@ class Kv:
     @staticmethod
     def memory() -> Kv:
         """A new, empty store in memory."""
+    @staticmethod
+    def from_backend(backend: object) -> Kv:
+        """A store backed by a Python object with `get(key)` and `put(key, value)`.
+
+        Keys and values are bytes; `get` returns bytes or None. Optional
+        `exists(key)` and `size(key)` avoid reading whole values. Optional
+        `put_file(key, path)` and `get_file(key, path)` transfer through private
+        temporary files; `get_file` returns the length or None. Backend failures
+        raise StoreError. Methods run synchronously, including from Rust async
+        calls. Create-only writes are unsupported.
+        """
     @staticmethod
     def s3(location: str, prefix: str | None = None, *, region: str | None = None, profile: str | None = None, concurrency: int | None = None, upload_buffer_bytes: int | None = None) -> Kv:
         """A store in S3, configured as the AWS SDKs are.
@@ -304,6 +315,18 @@ class Kv:
         """The value under `key`, or None if there is none."""
     def put(self, key: _BytesLike, value: _BytesLike) -> None:
         """Store `value` under `key`, replacing any value there."""
+    def put_file(self, key: _BytesLike, path: str | PathLike[str]) -> None:
+        """Store the file at `path` under `key`, replacing any value there.
+
+        Uses the backend's streamed transfer when available; otherwise holds
+        the value in memory. Python backends transfer through a temporary file.
+        """
+    def get_file(self, key: _BytesLike, path: str | PathLike[str]) -> int | None:
+        """Write the value under `key` to `path` and return its length, or None.
+
+        A temporary file replaces `path` only after a successful transfer.
+        A missing value or a failure leaves the destination unchanged.
+        """
     def exists(self, key: _BytesLike) -> bool:
         """Whether there is a value under `key`, without reading it."""
 
