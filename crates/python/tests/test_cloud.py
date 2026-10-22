@@ -172,6 +172,20 @@ class CloudTests(unittest.TestCase):
         self.assertEqual([call[0] for call in self.s3.transfers], ["upload", "download"])
         self.assertEqual(self.s3.objects["bucket", "prefix/file"][1], "GLACIER_IR")
 
+    def test_sdk_factories_preserve_opaque_prefixes_instead_of_normalizing_object_names(self):
+        for prefix in ("legacy//prefix", "legacy/./prefix", "legacy/../prefix"):
+            for location, argument in ((f"s3://bucket/{prefix}/", None), ("bucket", f"/{prefix}/")):
+                with self.subTest(provider="s3", location=location, prefix=argument):
+                    kv = Kv.s3(location, argument, storage_class="STANDARD")
+                    kv.put(b"key", b"payload")
+                    self.assertEqual(kv.get(b"key"), b"payload")
+                    self.assertEqual(self.s3.objects["bucket", f"{prefix}/key"], (b"payload", "STANDARD"))
+            with self.subTest(provider="gcs", prefix=prefix):
+                kv = Kv.gcs("bucket", f"/{prefix}/")
+                kv.put(b"key", b"payload")
+                self.assertEqual(kv.get(b"key"), b"payload")
+                self.assertEqual(self.gcs_buckets["bucket"].objects[f"{prefix}/key"], (b"payload", "STANDARD"))
+
     def test_s3_missing_and_denied_are_distinct_and_empty_is_present(self):
         backend = S3Backend("bucket", client=self.s3)
         backend.put(b"empty", b"")

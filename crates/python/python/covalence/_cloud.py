@@ -19,10 +19,8 @@ def _object_key(prefix: str, key: bytes) -> str:
 
 
 def _prefix(prefix: str) -> str:
-    """A prefix with one trailing slash, or an empty string."""
+    """An opaque object prefix with one trailing slash, or an empty string."""
     prefix = prefix.strip("/")
-    if prefix and any(part in ("", ".", "..") for part in prefix.split("/")):
-        raise ValueError("object prefixes must have non-empty segments other than '.' and '..'")
     return f"{prefix}/" if prefix else ""
 
 

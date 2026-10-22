@@ -8,6 +8,8 @@
 //! in the destination directory; a failed read leaves the previous value intact.
 //! Create-only writes atomically link the completed file into place, preserving
 //! an existing value and its metadata.
+//! New files, including replacements, use Unix mode `0600`, restricted further
+//! by the process umask.
 //!
 //! `flush` syncs regular files and directories without following symlinks.
 //! Streaming methods use bounded memory. Async methods perform the same blocking
@@ -179,12 +181,19 @@ struct Pending<'a> {
 
 impl<'a> Pending<'a> {
     fn new(dir: &'a Dir) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         loop {
             let name = format!(
                 ".covalence-{:032x}.tmp",
                 covalence_lib_rand::random::<u128>()
             );
-            match dir.open_with(&name, OpenOptions::new().write(true).create_new(true)) {
+            match dir.open_with(&name, &options) {
                 Ok(file) => {
                     return Ok(Self {
                         dir,

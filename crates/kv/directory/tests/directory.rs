@@ -215,6 +215,92 @@ fn create_only_writes_preserve_existing_bytes_and_metadata() {
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn writes_keep_temporary_and_published_files_private() {
+    use std::{os::unix::fs::PermissionsExt, path::Path, process::Command};
+
+    const CHILD: &str = "COVALENCE_DIRECTORY_PERMISSIONS_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        // A child process gives the test a permissive umask without changing
+        // the mask used by other tests running in this process.
+        let status = Command::new("/bin/sh")
+            .args(["-c", "umask 000; exec \"$@\"", "directory-permissions-test"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "writes_keep_temporary_and_published_files_private",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+
+    struct InspectingReader<'a> {
+        root: &'a Path,
+        bytes: &'a [u8],
+        observed: bool,
+    }
+
+    impl Read for InspectingReader<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let pending: Vec<_> = std::fs::read_dir(self.root)?
+                .map(Result::unwrap)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".covalence-")
+                })
+                .collect();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].metadata()?.permissions().mode() & 0o777, 0o600);
+            self.observed = true;
+            self.bytes.read(output)
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let store = DirectoryKv::new(root.path()).unwrap();
+    let write = |key: &[u8], replace| {
+        let mut source = InspectingReader {
+            root: root.path(),
+            bytes: b"secret",
+            observed: false,
+        };
+        let created = if replace {
+            store.put_from(key, &mut source, 6).unwrap();
+            true
+        } else {
+            store.put_new_from(key, &mut source, 6).unwrap()
+        };
+        assert!(source.observed);
+        created
+    };
+    for replace in [false, true] {
+        let key = if replace {
+            "replacement"
+        } else {
+            "create-only"
+        };
+        let path = root.path().join(key);
+        assert!(write(key.as_bytes(), replace));
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(write(key.as_bytes(), replace), replace);
+        let expected = if replace { 0o600 } else { 0o644 };
+        assert_eq!(
+            path.metadata().unwrap().permissions().mode() & 0o777,
+            expected
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"secret");
+    }
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+}
+
 #[test]
 fn concurrent_create_only_writes_have_one_complete_winner() {
     let temporary = tempfile::tempdir().unwrap();
