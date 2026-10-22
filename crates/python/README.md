@@ -83,7 +83,22 @@ pip install covalence==0.1.0.dev6
 - `Kv` is a byte key-value store:
   - `Kv.memory()` makes one in memory;
   - `Kv.s3("s3://bucket/prefix/")` (or `Kv.s3("bucket", "prefix")`) makes
-    one in S3.
+    one in S3;
+  - `Kv.gcs("bucket", "prefix")` uses the optional `covalence[gcs]` extra.
+- `Kv.s3(..., storage_class="GLACIER_IR", standard_below=131072)` uses
+  boto3 from the optional `covalence[s3-python]` extra. Objects below the
+  threshold use STANDARD; objects at or above it use the requested class.
+  Passing `client=` also selects boto3. These SDK options cannot be combined
+  with native `concurrency` or `upload_buffer_bytes` options.
+- SDK backends keep object prefixes opaque: leading and trailing `/` are
+  stripped, while interior `/`, `.` and `..` segments remain unchanged.
+  They support byte operations and streamed file transfers through temporary
+  files. Atomic create-only writes are unsupported, so these SDK backends
+  cannot insert blocks through `Cas.kv`.
+- `Kv.gcs` uses Application Default Credentials, or a service-account JSON
+  file named by `credentials_file=`. `project=` selects the billing project,
+  and `storage_class=` selects STANDARD, NEARLINE, COLDLINE or ARCHIVE.
+  SDK imports are deferred until the corresponding backend is constructed.
 - S3 is configured as the AWS SDKs are:
   - the region is `region=`, else from `AWS_REGION`, the profile or EC2
     instance metadata, which can take a moment off EC2;
@@ -110,14 +125,15 @@ pip install covalence==0.1.0.dev6
   `get_file` returns the byte count or `None`; an incorrect count raises
   `StoreError`. Python backend calls are synchronous. Atomic create-only
   writes are unsupported, so `Cas.kv` cannot insert blocks through this adapter.
-- `Kv.s3` raises `ValueError` for an invalid location, a URL with a prefix
-  argument too, or no region.
+- `Kv.s3` raises `ValueError` for an invalid location or a URL with a prefix
+  argument too. The native backend also requires a region. The boto3 backend
+  uses the Python SDK's configuration and credential resolution.
 - Without `s3:ListBucket`, S3 answers 403 for a missing key, so reading one
   raises `StoreError` instead of returning `None` or `False`, here and
   through `Cas.kv`.
 - S3 keys must be UTF-8 with non-empty `/`-separated segments other than `.`
   and `..`; other keys raise `StoreError`.
-- On S3, values over 8 MiB go up as multipart uploads, and values come down
+- On native S3, values over 8 MiB go up as multipart uploads, and values come down
   in ranged GETs of 8 MiB, 16 parts or ranges at a time. Upload parts grow
   when needed to stay within 10,000 parts. Covalence checks
   [S3's limits](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html)

@@ -591,8 +591,8 @@ impl PyValue {
 
 /// A store of byte values under byte keys.
 ///
-/// Build one with `memory`, `s3` or `from_backend`. A failure of the
-/// storage underneath raises StoreError.
+/// Build one with `memory`, `s3`, `gcs` or `from_backend`. A failure of
+/// the storage underneath raises StoreError.
 ///
 /// >>> from covalence import Kv
 /// >>> kv = Kv.memory()
@@ -656,16 +656,25 @@ impl PyKv {
     /// additional memory; this is not an RSS limit. Already owned values also
     /// reserve their planned payload, though their parts share that allocation.
     ///
-    /// - An invalid location, a URL with `prefix` too, or no region raises
-    ///   ValueError.
+    /// `storage_class`, nonzero `standard_below` or `client` selects the
+    /// optional boto3 backend (`covalence[s3-python]`). Objects smaller than
+    /// `standard_below` use STANDARD; others use `storage_class` or STANDARD.
+    /// `concurrency` and `upload_buffer_bytes` apply only to the native backend;
+    /// passing either with a boto3 option raises ValueError. The boto3 backend
+    /// resolves SDK configuration when constructed and can raise SDK errors
+    /// then. Its create-only writes are unsupported.
+    ///
+    /// - An invalid location, a URL with `prefix` too, or a native backend
+    ///   without a region raises ValueError.
     /// - Keys must be UTF-8 with non-empty `/`-separated segments other than
     ///   `.` and `..`; other keys raise StoreError.
-    /// - Credentials are fetched at the first request; missing or failed
-    ///   credentials raise StoreError then.
+    /// - The native backend fetches credentials at the first request; missing
+    ///   or failed credentials raise StoreError then.
     /// - Without `s3:ListBucket`, S3 answers 403 for a missing key, so reading
     ///   one raises StoreError instead of returning None or False.
     #[staticmethod]
-    #[pyo3(signature = (location, prefix = None, *, region = None, profile = None, concurrency = None, upload_buffer_bytes = None))]
+    #[pyo3(signature = (location, prefix = None, *, region = None, profile = None, concurrency = None, upload_buffer_bytes = None, storage_class = None, standard_below = 0, client = None))]
+    #[allow(clippy::too_many_arguments)]
     fn s3(
         py: Python<'_>,
         location: &str,
@@ -674,7 +683,29 @@ impl PyKv {
         profile: Option<String>,
         concurrency: Option<usize>,
         upload_buffer_bytes: Option<u64>,
+        storage_class: Option<&str>,
+        standard_below: u64,
+        client: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
+        if storage_class.is_some() || standard_below != 0 || client.is_some() {
+            if concurrency.is_some() || upload_buffer_bytes.is_some() {
+                return Err(fail(
+                    "concurrency and upload_buffer_bytes are supported only by the native S3 backend",
+                ));
+            }
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("region", region)?;
+            kwargs.set_item("profile", profile)?;
+            kwargs.set_item("storage_class", storage_class.unwrap_or("STANDARD"))?;
+            kwargs.set_item("standard_below", standard_below)?;
+            kwargs.set_item("client", client)?;
+            let object = py
+                .import("covalence._cloud")?
+                .getattr("S3Backend")?
+                .call((location, prefix), Some(&kwargs))?
+                .unbind();
+            return Self::from_backend(py, object);
+        }
         let location = match (location.strip_prefix("s3://"), prefix) {
             (None, prefix) => S3Location::new(location, prefix.unwrap_or_default()),
             (Some(_), None) => location.parse(),
@@ -700,6 +731,35 @@ impl PyKv {
         Ok(Self {
             inner: kv.into_dyn(),
         })
+    }
+
+    /// A Google Cloud Storage store, using `covalence[gcs]` and Google credentials.
+    ///
+    /// `bucket` is a bare bucket name and `prefix` an opaque object prefix.
+    /// `storage_class` applies to uploads. `project` selects the billing
+    /// project; `credentials_file` selects a service account JSON file instead
+    /// of Application Default Credentials. File transfers stream through disk.
+    /// Create-only writes are unsupported.
+    #[staticmethod]
+    #[pyo3(signature = (bucket, prefix = "", *, storage_class = "STANDARD", project = None, credentials_file = None))]
+    fn gcs(
+        py: Python<'_>,
+        bucket: &str,
+        prefix: &str,
+        storage_class: &str,
+        project: Option<&str>,
+        credentials_file: Option<PathBuf>,
+    ) -> PyResult<Self> {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("storage_class", storage_class)?;
+        kwargs.set_item("project", project)?;
+        kwargs.set_item("credentials_file", credentials_file)?;
+        let object = py
+            .import("covalence._cloud")?
+            .getattr("GcsBackend")?
+            .call((bucket, prefix), Some(&kwargs))?
+            .unbind();
+        Self::from_backend(py, object)
     }
 
     /// The value under `key`, or None if there is none.
