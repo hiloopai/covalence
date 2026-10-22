@@ -259,8 +259,8 @@ class Value:
 class Kv:
     """A store of byte values under byte keys.
 
-    Build one with `memory`, `s3` or `from_backend`. A failure of the
-    storage underneath raises StoreError.
+    Build one with `memory`, `s3`, `gcs` or `from_backend`. A failure of
+    the storage underneath raises StoreError.
 
     >>> from covalence import Kv
     >>> kv = Kv.memory()
@@ -283,7 +283,7 @@ class Kv:
         calls. Create-only writes are unsupported.
         """
     @staticmethod
-    def s3(location: str, prefix: str | None = None, *, region: str | None = None, profile: str | None = None, concurrency: int | None = None, upload_buffer_bytes: int | None = None) -> Kv:
+    def s3(location: str, prefix: str | None = None, *, region: str | None = None, profile: str | None = None, concurrency: int | None = None, upload_buffer_bytes: int | None = None, storage_class: str | None = None, standard_below: int = 0, client: object | None = None) -> Kv:
         """A store in S3, configured as the AWS SDKs are.
 
         `location` is an `s3://bucket/prefix/` URL, or a bucket name with
@@ -302,14 +302,32 @@ class Kv:
         additional memory; this is not an RSS limit. Already owned values also
         reserve their planned payload, though their parts share that allocation.
 
-        - An invalid location, a URL with `prefix` too, or no region raises
-          ValueError.
+        `storage_class`, nonzero `standard_below` or `client` selects the
+        optional boto3 backend (`covalence[s3-python]`). Objects smaller than
+        `standard_below` use STANDARD; others use `storage_class` or STANDARD.
+        `concurrency` and `upload_buffer_bytes` apply only to the native backend;
+        passing either with a boto3 option raises ValueError. The boto3 backend
+        resolves SDK configuration when constructed and can raise SDK errors
+        then. Its create-only writes are unsupported.
+
+        - An invalid location, a URL with `prefix` too, or a native backend
+          without a region raises ValueError.
         - Keys must be UTF-8 with non-empty `/`-separated segments other than
           `.` and `..`; other keys raise StoreError.
-        - Credentials are fetched at the first request; missing or failed
-          credentials raise StoreError then.
+        - The native backend fetches credentials at the first request; missing
+          or failed credentials raise StoreError then.
         - Without `s3:ListBucket`, S3 answers 403 for a missing key, so reading
           one raises StoreError instead of returning None or False.
+        """
+    @staticmethod
+    def gcs(bucket: str, prefix: str = "", *, storage_class: str = "STANDARD", project: str | None = None, credentials_file: str | PathLike[str] | None = None) -> Kv:
+        """A Google Cloud Storage store, using `covalence[gcs]` and Google credentials.
+
+        `bucket` is a bare bucket name and `prefix` an opaque object prefix.
+        `storage_class` applies to uploads. `project` selects the billing
+        project; `credentials_file` selects a service account JSON file instead
+        of Application Default Credentials. File transfers stream through disk.
+        Create-only writes are unsupported.
         """
     def get(self, key: _BytesLike) -> bytes | None:
         """The value under `key`, or None if there is none."""

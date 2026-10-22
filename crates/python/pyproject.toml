@@ -11,6 +11,10 @@ license = "CC0-1.0 OR MIT OR Apache-2.0"
 license-files = ["LICENSE-APACHE", "LICENSE-CC0", "LICENSE-MIT"]
 requires-python = ">=3.11"
 
+[project.optional-dependencies]
+s3-python = ["boto3>=1.43.112"]
+gcs = ["google-cloud-storage>=3.0"]
+
 [project.urls]
 Repository = "https://github.com/hiloopai/covalence"
 Documentation = "https://github.com/hiloopai/covalence/blob/main/crates/python/README.md"
