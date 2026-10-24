@@ -34,6 +34,8 @@ def public_docs():
         yield name, cls.__doc__
         for member, value in public_members(cls):
             yield f"{name}.{member}", value.__doc__
+    for name in covalence.config.__all__:
+        yield f"config.{name}", getattr(covalence.config, name).__doc__
 
 
 class DocsTests(unittest.TestCase):
@@ -82,6 +84,17 @@ class DocsTests(unittest.TestCase):
                     compared += 1
         self.assertGreater(compared, 60)
 
+    def test_config_stub_docstrings_match_runtime(self):
+        stub = importlib.resources.files("covalence").joinpath("config.pyi").read_text(encoding="utf-8")
+        functions = {node.name: node for node in ast.parse(stub).body if isinstance(node, ast.FunctionDef)}
+        self.assertEqual(set(functions), set(covalence.config.__all__))
+        for name, node in functions.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    ast.get_docstring(node),
+                    inspect.cleandoc(getattr(covalence.config, name).__doc__ or ""),
+                )
+
     def test_examples_are_found(self):
         found = {case._dt_test.name for case in doctests()}
         expected = {f"covalence.{name}" for name, doc in public_docs() if ">>>" in (doc or "")}
@@ -118,6 +131,7 @@ def doctests():
     readme = Path(__file__).resolve().parent.parent / "README.md"
     options = doctest.ELLIPSIS
     suite = doctest.DocTestSuite(covalence, test_finder=NativeFinder(), optionflags=options)
+    suite.addTests(doctest.DocTestSuite(covalence.config, optionflags=options))
     suite.addTests(doctest.DocFileSuite(str(readme), module_relative=False, optionflags=options))
     return suite
 

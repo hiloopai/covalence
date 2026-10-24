@@ -3,6 +3,8 @@
 Content identifiers (CIDs), DASL values, and content-addressed and key-value
 stores, from Python.
 
+`covalence.config` also provides application directories and TOML configuration.
+
 ```pycon
 >>> from covalence import Cid, Value
 >>> cid = Cid.of(b"payload", "sha256")
@@ -44,6 +46,46 @@ pip install covalence==0.1.0.dev6
   encoding, which CIDs label with the `dag-cbor` codec.
 - A **CAS** (content-addressed store) keeps bytes and finds them by their
   CIDs.
+
+## Configuration
+
+`covalence.config` selects application directories and reads TOML using the
+same Rust implementation as `covalence-lib-config`.
+
+```pycon
+>>> from covalence import config
+>>> str(config.config_dir("example", override_dir="settings"))
+'settings'
+>>> config.parse('enabled = true\nworkers = 2')
+{'enabled': True, 'workers': 2}
+
+```
+
+- `config_dir`, `cache_dir`, `data_dir`, `state_dir` and `runtime_dir` return
+  `pathlib.Path`. Each takes an application name and an optional keyword
+  `override_dir`. An override is returned unchanged, including relative paths.
+  Without an override, names must be a single non-empty directory component;
+  `.`, `..`, separators, colons and NUL raise `ValueError`.
+- Unix, including macOS, uses `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
+  `XDG_DATA_HOME`, `XDG_STATE_HOME` and `XDG_RUNTIME_DIR`, respectively. Unset,
+  empty and relative variables fall back to `~/.config`, `~/.cache`,
+  `~/.local/share` and `~/.local/state`. Runtime falls back to state.
+- Windows uses roaming application data for config, data, state and runtime,
+  and local application data for cache. An unavailable home raises `OSError`.
+- Directory lookups do not create paths or enforce permissions. A runtime
+  fallback does not have session lifetime or permission guarantees.
+- `parse(text)` returns a dict. `read(path)` reads a UTF-8 file and returns
+  `{}` if it is missing, including a missing parent. `read_required(path)`
+  raises `FileNotFoundError` instead, suitable for a user-supplied config path.
+  Invalid TOML raises `ValueError`; other read failures raise `OSError`.
+- TOML tables, arrays and scalars become dicts, lists, str, bool, signed 64-bit
+  int and float. Date/time values become `datetime.datetime`, `datetime.date`
+  or `datetime.time`, retaining offsets and truncating fractions to
+  microseconds. Integers outside the signed 64-bit range, and dates Python
+  cannot represent, raise `ValueError`.
+- Files are read in full. This API adds no file-size limit, schema validation,
+  interpolation, environment expansion or layer merging; callers validate
+  their configuration fields. Normal filesystem symlink semantics apply.
 
 ## CIDs, hashes and codecs
 

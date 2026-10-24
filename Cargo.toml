@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lib/error", "crates/lib/cli", "tools/glu", "crates/lib/serde", "crates/lib/data", "crates/lib/python", "crates/python", "crates/lib/cid", "crates/lib/sqlite", "crates/lib/dasl", "crates/cas/trait", "crates/cas/memory", "crates/lib/rand", "crates/cas/sqlite", "crates/kv/trait", "crates/kv/memory", "crates/kv/s3", "crates/cas/kv", "crates/blob/trait"]
+members = ["crates/lib/error", "crates/lib/cli", "tools/glu", "crates/lib/serde", "crates/lib/config", "crates/lib/data", "crates/lib/python", "crates/python", "crates/lib/cid", "crates/lib/sqlite", "crates/lib/dasl", "crates/cas/trait", "crates/cas/memory", "crates/lib/rand", "crates/cas/sqlite", "crates/kv/trait", "crates/kv/memory", "crates/kv/s3", "crates/cas/kv", "crates/blob/trait"]
 resolver = "3"
 
 [workspace.package]
@@ -27,6 +27,7 @@ covalence-kv-s3 = { path = "crates/kv/s3", version = "=0.1.0-dev.6" }
 covalence-kv-trait = { path = "crates/kv/trait", version = "=0.1.0-dev.6" }
 covalence-lib-cid = { path = "crates/lib/cid", version = "=0.1.0-dev.6" }
 covalence-lib-cli = { path = "crates/lib/cli", version = "=0.1.0-dev.6" }
+covalence-lib-config = { path = "crates/lib/config", version = "=0.1.0-dev.6" }
 covalence-lib-dasl = { path = "crates/lib/dasl", version = "=0.1.0-dev.6" }
 covalence-lib-data = { path = "crates/lib/data", version = "=0.1.0-dev.6" }
 covalence-lib-error = { path = "crates/lib/error", version = "=0.1.0-dev.6" }

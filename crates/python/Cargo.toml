@@ -26,11 +26,13 @@ covalence-kv-memory.workspace = true
 covalence-kv-s3.workspace = true
 covalence-kv-trait.workspace = true
 covalence-lib-cid.workspace = true
+covalence-lib-config.workspace = true
 covalence-lib-dasl = { workspace = true, features = ["json"] }
 covalence-lib-data.workspace = true
 covalence-lib-python = { path = "../lib/python" }
 pep440_rs = { version = "0.7.3", default-features = false }
 tempfile = "3"
+toml = "1.1"
 
 [lints]
 workspace = true
