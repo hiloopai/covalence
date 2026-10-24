@@ -1,8 +1,25 @@
 """Typed use of the public API, which `mypy --strict` checks in test_stubs.py."""
 
 from typing import assert_type
+from pathlib import Path
 
 from covalence import Blob, BlobFact, Cas, Cid, Codec, Error, Fact, Hash, IntegrityError, Kv, Value
+from covalence import config
+
+
+def use_config(path: Path) -> None:
+    assert_type(config.config_dir("example"), Path)
+    assert_type(config.cache_dir("example", override_dir=path), Path)
+    assert_type(config.data_dir("example"), Path)
+    assert_type(config.state_dir("example"), Path)
+    assert_type(config.runtime_dir("example"), Path)
+    assert_type(config.parse("enabled = true")["enabled"] == True, bool)
+    for value in config.read(path).values():
+        if isinstance(value, str):
+            assert_type(value, str)
+    for value in config.read_required(str(path)).values():
+        if isinstance(value, int):
+            assert_type(value, int)
 
 
 def use_cids() -> None:

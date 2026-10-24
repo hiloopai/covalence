@@ -25,6 +25,8 @@ class InstalledPackageTests(unittest.TestCase):
         self.assertTrue(package.joinpath("py.typed").is_file())
         stub = package.joinpath("_native.pyi").read_text(encoding="utf-8")
         self.assertIn("__version__: str", stub)
+        self.assertTrue(package.joinpath("config.py").is_file())
+        self.assertTrue(package.joinpath("config.pyi").is_file())
 
 
 if __name__ == "__main__":
