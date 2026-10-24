@@ -1,6 +1,8 @@
 """Python bindings for Covalence."""
 import abc
 
+from . import config
+
 from ._native import (
     Blob,
     BlobFact,
@@ -53,4 +55,5 @@ __all__ = [
     "UnsupportedError",
     "Value",
     "__version__",
+    "config",
 ]

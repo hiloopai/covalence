@@ -1,3 +1,4 @@
+mod config;
 mod errors;
 mod streams;
 
@@ -1470,6 +1471,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCas>()?;
     m.add_class::<PyBlob>()?;
     m.add_class::<PyBlobFact>()?;
+    config::add(m)?;
     errors::add(m)
 }
 

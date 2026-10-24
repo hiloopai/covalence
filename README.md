@@ -72,6 +72,10 @@ Python:
 
 - [`crates/python`](crates/python/README.md): the `covalence` Python package.
 
+Configuration:
+
+- [`crates/lib/config`](crates/lib/config/README.md): application directories and typed TOML configuration.
+
 Internal facades, which re-export other crates for the workspace's own use:
 
 - `crates/lib/error`: SNAFU and miette facade and `BoxError`; terminal rendering is opt-in.

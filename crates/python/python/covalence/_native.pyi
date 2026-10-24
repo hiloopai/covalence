@@ -7,6 +7,7 @@ from _typeshed import SupportsWrite as _SupportsWrite
 from typing_extensions import disjoint_base
 
 from . import Fact
+from . import config as config
 
 __all__ = [
     "__version__",
@@ -22,6 +23,7 @@ __all__ = [
     "IntegrityError",
     "StoreError",
     "UnsupportedError",
+    "config",
 ]
 
 __version__: str

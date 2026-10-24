@@ -1,0 +1,28 @@
+[package]
+name = "covalence-lib-config"
+description = "Application directories and typed TOML configuration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/covalence-lib-config"
+readme = "README.md"
+keywords = ["configuration", "toml", "xdg"]
+categories = ["config", "filesystem"]
+publish = true
+
+[dependencies]
+covalence-lib-error.workspace = true
+covalence-lib-serde.workspace = true
+etcetera = "0.10"
+toml = "1.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
