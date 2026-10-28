@@ -9,6 +9,8 @@ Shared libraries for content-addressed data, in Rust with Python bindings.
 
 Status: pre-alpha. APIs may change without notice.
 
+See the [changelog](CHANGELOG.md) for release notes.
+
 ## Getting started
 
 Install [Nix](https://nixos.org/download/) with flakes enabled, then:
