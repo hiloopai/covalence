@@ -1,18 +1,17 @@
 # Changelog
 
-All notable changes to Covalence are documented in this file.
+All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/).
-Versions cover the Rust libraries and Python bindings and follow
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html). These pre-alpha
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Versions cover the Rust libraries and Python bindings. These pre-alpha
 development releases may contain incompatible API changes.
 Rust versions such as `0.1.0-dev.7` appear as `0.1.0.dev7` on PyPI.
 
 Dates are the first public release dates in UTC; registry publication may
 follow later. Source tags and distribution artifacts for dev.2 onward are
 listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
-The dev.1–dev.7 history was reconstructed on 2026-10-28 from source tags and
-published artifacts.
 
 ## [Unreleased]
 
