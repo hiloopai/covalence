@@ -25,7 +25,7 @@ enum Task {
     },
     /// Run all project tests.
     Test,
-    /// Check formatting and lint the Rust workspace.
+    /// Check the changelog, formatting and Rust workspace lints.
     Check,
     /// Format Rust sources.
     Fmt,
@@ -220,7 +220,17 @@ fn check() -> Result<(), Error> {
         "--",
         "-D",
         "warnings",
-    ])
+    ])?;
+    subprocess(
+        "Changelog check",
+        "python3",
+        [
+            OsStr::new("-I"),
+            OsStr::new("-B"),
+            root().join("tools/glu/check_changelog.py").as_os_str(),
+        ],
+        &root(),
+    )
 }
 
 fn doc() -> Result<(), Error> {

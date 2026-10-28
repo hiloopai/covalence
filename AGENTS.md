@@ -30,6 +30,13 @@ Documentation is public; write it for readers outside the team:
   Prefer a doctest to a sentence that asserts the same thing.
 - Link only what readers can follow: no internal tickets, private
   repositories or internal hostnames.
+- Keep `CHANGELOG.md` based on Keep a Changelog 2.0.0. For notable user-facing
+  changes, summarize the effect under `Unreleased` using Added, Changed,
+  Deprecated, Removed, Fixed or Security. Mark incompatible changes with
+  `**Breaking:**` and give a short upgrade note or migration link. Curate the
+  entries for readers rather than copying commits; omit trivial changes.
+  `glu check` validates structure, not accuracy or significance; a changelog
+  edit is not required for every pull request.
 - Python: docstrings are the Rust `///` comments on the PyO3 items, and
   `covalence/_native.pyi` repeats them word for word (a test checks this).
   Readers see `covalence.X`, never `covalence._native.X`.

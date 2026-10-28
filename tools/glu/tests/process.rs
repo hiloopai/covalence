@@ -35,8 +35,10 @@ case "${0##*/}" in
     touch "$2/covalence-test.whl"
     ;;
   python3)
-    mkdir -p "$4/bin"
-    cp "$0" "$4/bin/python"
+    if [ "${1:-}" = -I ] && [ "${2:-}" = -m ] && [ "${3:-}" = venv ]; then
+      mkdir -p "$4/bin"
+      cp "$0" "$4/bin/python"
+    fi
     ;;
 esac
 "#,
@@ -191,13 +193,13 @@ fn ci_builds_one_wheel_and_tests_an_isolated_install() {
     assert_eq!(
         calls.lines().collect::<Vec<_>>(),
         [
-            "cargo", "cargo", "cargo", "cargo", "cargo", "maturin", "cargo", "python3", "python",
-            "python"
+            "cargo", "cargo", "python3", "cargo", "cargo", "cargo", "maturin", "cargo", "python3",
+            "python", "python"
         ]
     );
     let args = fixture.args();
     assert_eq!(args.iter().filter(|arg| *arg == "--isolated").count(), 1);
-    assert_eq!(args.iter().filter(|arg| *arg == "-I").count(), 3);
+    assert_eq!(args.iter().filter(|arg| *arg == "-I").count(), 4);
     assert!(!args.iter().any(|arg| arg == "--clear"));
     let cwd = fs::read_to_string(fixture.dir.join("cwd")).unwrap();
     assert_eq!(
@@ -249,4 +251,43 @@ fn build_propagates_python_packaging_failure() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(23));
+}
+
+#[test]
+fn check_propagates_changelog_failure() {
+    let fixture = Fixture::new("changelog_failure");
+    let output = fixture
+        .command(env!("CARGO_BIN_EXE_glu"))
+        .arg("check")
+        .env("GLU_TEST_FAIL_PROGRAM", "python3")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(23));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Changelog check failed"));
+    assert!(
+        fixture
+            .args()
+            .iter()
+            .any(|arg| arg.ends_with("tools/glu/check_changelog.py"))
+    );
+}
+
+#[test]
+fn changelog_checker_regression_cases() {
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "-B",
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tools/glu",
+            "-p",
+            "test_changelog.py",
+        ])
+        .current_dir(root())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
 }
