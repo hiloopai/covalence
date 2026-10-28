@@ -169,13 +169,18 @@ same Rust implementation as `covalence-lib-config`.
 ## Content-addressed stores
 
 ```pycon
->>> from covalence import Cas
+>>> from covalence import Cas, Kv
 >>> cas = Cas.memory()
 >>> cid = cas.put(b"hello")
 >>> cas.size(cid)
 5
 >>> cas.get_range(cid, 1, 3), cas.get_range(cid, 4, 10)
 (b'ell', b'o')
+>>> compressed = Cas.kv(Kv.memory(), compression="zstd")
+>>> compressed.put(b"hello") == cid
+True
+>>> compressed.get(cid)
+b'hello'
 
 ```
 
@@ -184,6 +189,16 @@ same Rust implementation as `covalence-lib-config`.
   - `Cas.sqlite(path)`, in memory without a path;
   - `Cas.kv(kv, prefix)`, keeping blocks in a `Kv` under
     `prefix/blake3/<digest>/bytes`.
+- `Cas.kv(kv, compression="zstd", level=3)` keeps Zstandard frames under
+  `bytes.zst`, with CIDs of the uncompressed bytes. Raw and compressed
+  stores use separate keys. Existing Zstandard frames, including frames
+  without a content size and concatenated frames, can be read.
+- Compressed streaming writes finish and check a frame on temporary disk
+  before storage; reads decode as the backend supplies bytes. Sizes and
+  ranges scan the complete frame, retaining only a count or the requested
+  bytes. These operations still depend on the backend's transfer buffering.
+  Rust async reads fetch the encoded value whole before decoding; they do not
+  collect the expanded block for a size or range.
 - `put` returns the raw BLAKE3 `Cid`, after checking that the store kept the
   data under it.
 - `Cas.kv` never replaces a block its `Kv` already holds: on `Kv.s3` each

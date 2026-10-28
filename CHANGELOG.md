@@ -18,6 +18,14 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 ### Added
 
 - Release notes and automated changelog format checks in `glu check` and CI.
+- Opt-in Zstandard storage for Rust `KvCas` through
+  `with_compression(Compression::zstd(level))` and Python
+  `Cas.kv(kv, compression="zstd", level=3)`. CIDs still identify the
+  uncompressed bytes. Raw storage remains the default; raw and compressed
+  stores use separate keys, without automatically migrating existing blocks.
+- Explicit raw storage through Rust `Compression::raw()` and
+  `Compression::default()`, usable with `KvCas::with_compression`. Raw storage
+  remains the default.
 
 ## [0.1.0-dev.7] - 2026-10-24
 
