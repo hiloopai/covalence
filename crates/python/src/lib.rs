@@ -12,7 +12,7 @@ use std::{
 };
 
 use covalence_blob_trait::{Blob, BlobExt, Slice};
-use covalence_cas_kv::KvCas;
+use covalence_cas_kv::{Compression, KvCas};
 use covalence_cas_memory::MemoryCas;
 use covalence_cas_sqlite::SqliteCas;
 use covalence_cas_trait::{Cas, GetExt};
@@ -988,24 +988,66 @@ impl PyCas {
         })
     }
 
-    /// A store of blocks in `kv`, each under `prefix/blake3/<digest>/bytes`.
+    /// A store of blocks in `kv`, with optional compression.
     ///
-    /// - Without a prefix, the key is `blake3/<digest>/bytes`.
+    /// - `compression="identity"` (the default) and `compression=None` store
+    ///   unchanged bytes under `prefix/blake3/<digest>/bytes`; without a prefix,
+    ///   the key is `blake3/<digest>/bytes`.
     /// - The digest is the BLAKE3 digest in lowercase unpadded base32.
     /// - A trailing `/` on `prefix` is optional; an invalid prefix raises
     ///   ValueError.
+    /// - `compression="zstd"` stores Zstandard frames under `bytes.zst`,
+    ///   keeping CIDs of the uncompressed bytes. `level` sets its compression
+    ///   level; zero selects the default and other levels clamp to the supported
+    ///   range.
+    /// - `compression="deflate"` stores RFC 1950 zlib-wrapped DEFLATE under
+    ///   `bytes.deflate`, compatible with Python `zlib` and the browser's
+    ///   `CompressionStream("deflate")`. This is not raw DEFLATE.
+    /// - `compression="gzip"` stores RFC 1952 gzip under `bytes.gz`, compatible
+    ///   with Python `gzip` and the browser's `CompressionStream("gzip")`.
+    /// - `compression="br"` stores RFC 7932 Brotli under `bytes.br`. Its HTTP
+    ///   token is `br`; the Compression Streams API calls it `"brotli"`, where
+    ///   supported. Brotli levels clamp to 0 through 11; zero is the fastest.
+    /// - Deflate and gzip levels clamp to 0 through 9; zero disables compression
+    ///   while retaining the wrapper. `level` defaults to 3 for every codec.
+    ///   Other compression names raise ValueError. Each codec has separate keys.
+    ///   Python wheels include all codecs; using one disabled in a custom Rust
+    ///   build raises UnsupportedError.
+    /// - Deflate and gzip reads require one stream or member, validate checksums
+    ///   and reject trailing data, following the browser compression profile.
+    ///   Brotli reads require one complete stream and reject trailing data.
+    /// - Compressed streaming writes stage a complete frame on temporary disk
+    ///   before storage. Reads stream through the backend; sizes and ranges
+    ///   decode the complete frame, retaining only the requested output.
     /// - Never replaces a block `kv` already holds: on `Kv.s3` each write is
     ///   conditional, so concurrent writers of one block race safely.
     #[staticmethod]
-    #[pyo3(signature = (kv, prefix = None))]
-    fn kv(kv: PyRef<'_, PyKv>, prefix: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (kv, prefix = None, *, compression = "identity", level = 3))]
+    fn kv(
+        kv: PyRef<'_, PyKv>,
+        prefix: Option<&str>,
+        compression: Option<&str>,
+        level: i32,
+    ) -> PyResult<Self> {
         let kv = kv.inner.clone();
         let store = match prefix {
             Some(prefix) => KvCas::with_prefix(kv, prefix).map_err(fail)?,
             None => KvCas::new(kv),
         };
+        let compression = match compression {
+            None | Some("identity") => Compression::identity(),
+            Some("zstd") => Compression::zstd(level),
+            Some("deflate") => Compression::deflate(level),
+            Some("gzip") => Compression::gzip(level),
+            Some("br") => Compression::br(level),
+            Some(_) => {
+                return Err(fail(
+                    "compression must be 'identity', 'gzip', 'deflate', 'zstd', 'br', or None",
+                ));
+            }
+        };
         Ok(Self {
-            inner: store.into_dyn(),
+            inner: store.with_compression(compression).into_dyn(),
         })
     }
 

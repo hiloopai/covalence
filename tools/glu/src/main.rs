@@ -258,7 +258,21 @@ fn package() -> Result<(), Error> {
 }
 
 fn test_rust() -> Result<(), Error> {
-    cargo(["test", "--workspace", "--locked"])
+    cargo(["test", "--workspace", "--locked"])?;
+    let minimal = [
+        "test",
+        "-p",
+        "covalence-cas-kv",
+        "--locked",
+        "--no-default-features",
+    ];
+    eprintln!("Testing KvCas with identity storage only");
+    cargo(minimal)?;
+    for codec in ["zstd", "deflate", "brotli"] {
+        eprintln!("Testing KvCas with only the {codec} codec feature");
+        cargo(minimal.into_iter().chain(["--features", codec]))?;
+    }
+    Ok(())
 }
 fn test() -> Result<(), Error> {
     test_rust()?;

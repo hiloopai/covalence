@@ -45,6 +45,13 @@ def use_values(cid: Cid) -> None:
 
 def use_stores(path: str) -> None:
     cas = Cas.kv(Kv.memory(), prefix="blobs/")
+    compressed = Cas.kv(Kv.memory(), compression="zstd", level=3)
+    assert_type(compressed, Cas)
+    assert_type(compressed.put(b"data"), Cid)
+    assert_type(Cas.kv(Kv.memory(), compression="identity"), Cas)
+    assert_type(Cas.kv(Kv.memory(), compression="deflate", level=0), Cas)
+    assert_type(Cas.kv(Kv.memory(), compression="gzip"), Cas)
+    assert_type(Cas.kv(Kv.memory(), compression="br"), Cas)
     cid = cas.put(bytearray(b"data"))
     assert_type(cas.get(cid), bytes | None)
     assert_type(cas.get_range(cid, 0, 2), bytes | None)

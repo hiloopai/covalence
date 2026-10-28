@@ -5,7 +5,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use covalence_cas_kv::KvCas;
+use covalence_cas_kv::{Compression, KvCas};
 use covalence_cas_trait::{AsyncGet, AsyncGetExt, AsyncPut, Cas, Error, Get, GetExt, Put};
 use covalence_kv_memory::MemoryKv;
 use covalence_kv_s3::{Credentials, S3Kv};
@@ -121,19 +121,22 @@ impl Kv for Blind {
 #[test]
 fn existing_blocks_leave_unused_stream_bytes_unchecked() {
     for consumed in [0, 2] {
-        // A backend may skip immediately or after reading part of the source.
-        let store = KvCas::new(Blind(MemoryKv::default(), consumed).into_dyn());
-        let cid: Cid = store.put("hello".into()).unwrap();
-        let claim = Blake3::of(b"hello");
-        for data in [&b"wrong"[..], &b"bad"[..]] {
-            let mut source = std::io::Cursor::new(data);
+        for compression in [Compression::default(), Compression::identity()] {
+            // A backend may skip immediately or after reading part of the source.
+            let store = KvCas::new(Blind(MemoryKv::default(), consumed).into_dyn())
+                .with_compression(compression);
+            let cid: Cid = store.put("hello".into()).unwrap();
+            let claim = Blake3::of(b"hello");
+            for data in [&b"wrong"[..], &b"bad"[..]] {
+                let mut source = std::io::Cursor::new(data);
+                assert_eq!(store.put_from(claim, &mut source, 5).unwrap(), cid);
+                assert_eq!(source.position(), consumed as u64);
+            }
+            // An error beyond the consumed prefix must not be observed either.
+            let mut source = std::io::Read::chain(std::io::Cursor::new(b"he"), FailingReader);
             assert_eq!(store.put_from(claim, &mut source, 5).unwrap(), cid);
-            assert_eq!(source.position(), consumed as u64);
+            assert_eq!(source.get_ref().0.position(), consumed as u64);
         }
-        // An error beyond the consumed prefix must not be observed either.
-        let mut source = std::io::Read::chain(std::io::Cursor::new(b"he"), FailingReader);
-        assert_eq!(store.put_from(claim, &mut source, 5).unwrap(), cid);
-        assert_eq!(source.get_ref().0.position(), consumed as u64);
     }
 }
 

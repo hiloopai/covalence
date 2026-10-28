@@ -169,13 +169,24 @@ same Rust implementation as `covalence-lib-config`.
 ## Content-addressed stores
 
 ```pycon
->>> from covalence import Cas
+>>> from covalence import Cas, Kv
 >>> cas = Cas.memory()
 >>> cid = cas.put(b"hello")
 >>> cas.size(cid)
 5
 >>> cas.get_range(cid, 1, 3), cas.get_range(cid, 4, 10)
 (b'ell', b'o')
+>>> compressed = Cas.kv(Kv.memory(), compression="zstd")
+>>> compressed.put(b"hello") == cid
+True
+>>> compressed.get(cid)
+b'hello'
+>>> browser_compatible = Cas.kv(Kv.memory(), compression="deflate")
+>>> browser_compatible.put(b"hello") == cid
+True
+>>> brotli = Cas.kv(Kv.memory(), compression="br")
+>>> brotli.put(b"hello") == cid
+True
 
 ```
 
@@ -184,6 +195,42 @@ same Rust implementation as `covalence-lib-config`.
   - `Cas.sqlite(path)`, in memory without a path;
   - `Cas.kv(kv, prefix)`, keeping blocks in a `Kv` under
     `prefix/blake3/<digest>/bytes`.
+- `Cas.kv(kv, compression="zstd", level=3)` keeps Zstandard frames under
+  `bytes.zst`, with CIDs of the uncompressed bytes. Raw and compressed
+  stores use separate keys. Existing Zstandard frames, including frames
+  without a content size and concatenated frames, can be read.
+- `compression="identity"` (the default) and `compression=None` store the
+  unchanged bytes. Codec names follow HTTP content encodings.
+- `Cas.kv(kv, compression="deflate", level=3)` stores RFC 1950 zlib-wrapped
+  DEFLATE under `bytes.deflate`, with the same logical CIDs. These streams work
+  with Python's `zlib` and the browser's `CompressionStream("deflate")` and
+  `DecompressionStream("deflate")`; this is not raw DEFLATE.
+- `Cas.kv(kv, compression="gzip", level=3)` stores RFC 1952 gzip under
+  `bytes.gz`, compatible with Python's `gzip` and the browser's
+  `CompressionStream("gzip")` and `DecompressionStream("gzip")`.
+- `Cas.kv(kv, compression="br", level=3)` stores RFC 7932 Brotli under
+  `bytes.br`, with the same logical CIDs. The HTTP content encoding is `br`;
+  the Compression Streams API calls it `"brotli"`, where supported. Levels
+  clamp to 0 through 11, with zero selecting the fastest compression. Reads
+  require one complete stream and reject trailing data.
+- Deflate and gzip levels clamp to 0 through 9, where zero keeps the wrapper
+  but disables compression. Zstandard's zero instead selects its default level.
+  Each codec uses separate keys, with no automatic migration. Deflate and gzip
+  reads reject truncated streams, invalid checksums and trailing data.
+  Gzip follows the browser profile: exactly one member, with concatenated
+  members rejected.
+- Python wheels include all codecs. Custom Rust builds can disable codec
+  families; using a disabled codec raises `UnsupportedError`.
+- Codec names select storage formats. HTTP headers and negotiation belong to
+  the serving application. Before serving stored Zstandard frames directly,
+  apply the [RFC 9659](https://www.rfc-editor.org/rfc/rfc9659.html) requirements:
+  storage frames may require a decoder window larger than HTTP's 8 MiB limit.
+- Compressed streaming writes finish and check a frame on temporary disk
+  before storage; reads decode as the backend supplies bytes. Sizes and
+  ranges scan the complete frame, retaining only a count or the requested
+  bytes. These operations still depend on the backend's transfer buffering.
+  Rust async reads fetch the encoded value whole before decoding; they do not
+  collect the expanded block for a size or range.
 - `put` returns the raw BLAKE3 `Cid`, after checking that the store kept the
   data under it.
 - `Cas.kv` never replaces a block its `Kv` already holds: on `Kv.s3` each

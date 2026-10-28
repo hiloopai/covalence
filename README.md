@@ -52,6 +52,9 @@ Cargo owns Rust compilation and caching. `bin/glu` compiles only the Rust
 dispatcher and its dependencies on launch. `glu build` builds the Rust workspace
 and the Python wheel.
 
+`glu test` and `glu ci` also test `covalence-cas-kv` with its codec features
+disabled and with each codec family enabled separately.
+
 `glu check` (also run by `glu ci`) checks the changelog's
 [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/) conventions:
 release headings, dates, order, change categories and release/comparison links.
