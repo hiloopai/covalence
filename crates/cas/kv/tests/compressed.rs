@@ -45,6 +45,101 @@ fn empty_blocks_round_trip_with_logical_sizes_and_ranges() {
 }
 
 #[test]
+fn raw_defaults_share_the_raw_namespace_without_copying_values() {
+    let kv = Arc::new(MemoryKv::default());
+    let bytes = Bytes::from(b"hello".to_vec());
+    let cid: Cid = Blake3::of(&bytes).into();
+    let raw_key = HELLO.strip_suffix(".zst").unwrap().as_bytes();
+    for store in [
+        KvCas::new(kv.clone()),
+        KvCas::new(kv.clone()).with_compression(Compression::default()),
+        compressed(kv.clone()).with_compression(Compression::raw()),
+    ] {
+        let store = store.into_dyn();
+        assert_eq!(store.put(bytes.clone()).unwrap(), cid);
+        assert_eq!(block_on(store.aput(bytes.clone())).unwrap(), cid);
+        let stored = kv.get(raw_key).unwrap().unwrap();
+        assert_eq!(stored, bytes);
+        assert_eq!(stored.as_ptr(), bytes.as_ptr());
+        let read = store.get_unchecked(&cid).unwrap().unwrap();
+        assert_eq!(read.as_ptr(), bytes.as_ptr());
+        let read = block_on(store.aget_unchecked(&cid)).unwrap().unwrap();
+        assert_eq!(read.as_ptr(), bytes.as_ptr());
+        assert_eq!(
+            store.info().unwrap(),
+            KvCas::new(kv.clone()).info().unwrap()
+        );
+    }
+    assert!(!kv.exists(HELLO.as_bytes()).unwrap());
+}
+
+/// Only native metadata and range reads are available; whole reads fail.
+struct NativeRawKv(MemoryKv);
+impl Kv for NativeRawKv {
+    fn get(&self, _: &[u8]) -> Result<Option<Bytes>, covalence_kv_trait::Error> {
+        Err(Op::Get.unsupported())
+    }
+    fn put(&self, _: &[u8], _: Bytes) -> Result<(), covalence_kv_trait::Error> {
+        Err(Op::Put.unsupported())
+    }
+    fn aget<'a>(&'a self, key: &'a [u8]) -> KvFuture<'a, Option<Bytes>> {
+        ready(self.get(key))
+    }
+    fn aput<'a>(&'a self, key: &'a [u8], value: Bytes) -> KvFuture<'a, ()> {
+        ready(self.put(key, value))
+    }
+    fn size(&self, key: &[u8]) -> Result<Option<u64>, covalence_kv_trait::Error> {
+        self.0.size(key)
+    }
+    fn get_range(
+        &self,
+        key: &[u8],
+        start: u64,
+        len: u64,
+    ) -> Result<Option<Bytes>, covalence_kv_trait::Error> {
+        self.0.get_range(key, start, len)
+    }
+    fn asize<'a>(&'a self, key: &'a [u8]) -> KvFuture<'a, Option<u64>> {
+        self.0.asize(key)
+    }
+    fn aget_range<'a>(
+        &'a self,
+        key: &'a [u8],
+        start: u64,
+        len: u64,
+    ) -> KvFuture<'a, Option<Bytes>> {
+        self.0.aget_range(key, start, len)
+    }
+}
+
+#[test]
+fn raw_sizes_and_ranges_keep_backend_native_operations() {
+    let memory = MemoryKv::default();
+    memory
+        .put(
+            HELLO.strip_suffix(".zst").unwrap().as_bytes(),
+            "hello".into(),
+        )
+        .unwrap();
+    let kv = NativeRawKv(memory).into_dyn();
+    let cid: Cid = Blake3::of(b"hello").into();
+    for store in [
+        KvCas::new(kv.clone()),
+        KvCas::new(kv.clone()).with_compression(Compression::default()),
+        KvCas::new(kv.clone()).with_compression(Compression::raw()),
+    ] {
+        let store = store.into_dyn();
+        assert_eq!(store.size(&cid).unwrap(), Some(5));
+        assert_eq!(block_on(store.asize(&cid)).unwrap(), Some(5));
+        assert_eq!(store.get_range(&cid, 1, 3).unwrap().unwrap(), "ell");
+        assert_eq!(
+            block_on(store.aget_range(&cid, 1, 3)).unwrap().unwrap(),
+            "ell"
+        );
+    }
+}
+
+#[test]
 fn legacy_frames_logical_addresses_and_raw_isolation() {
     let kv = Arc::new(MemoryKv::default());
     kv.put(HELLO.as_bytes(), LEGACY_HELLO.into()).unwrap();
@@ -341,12 +436,10 @@ impl Kv for ReadKv {
 
 #[test]
 fn writes_require_atomic_create_support_with_or_without_compression() {
-    for compression in [None, Some(Compression::zstd(3))] {
-        let mut store = KvCas::new(ReadKv(|_| unreachable!()).into_dyn());
-        if let Some(compression) = compression {
-            store = store.with_compression(compression);
-        }
-        let store = store.into_dyn();
+    for compression in [Compression::raw(), Compression::zstd(3)] {
+        let store = KvCas::new(ReadKv(|_| unreachable!()).into_dyn())
+            .with_compression(compression)
+            .into_dyn();
         for error in [
             store.put("hello".into()).unwrap_err(),
             block_on(store.aput("hello".into())).unwrap_err(),
