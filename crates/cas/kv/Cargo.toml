@@ -20,6 +20,8 @@ covalence-lib-dasl.workspace = true
 covalence-lib-data.workspace = true
 covalence-lib-error.workspace = true
 data-encoding = "2.11.1"
+tempfile = "3"
+zstd = "0.13"
 
 [dev-dependencies]
 covalence-kv-memory.workspace = true
@@ -28,7 +30,6 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 pollster = "1.0.1"
 s3s = "0.17"
 s3s-fs = "0.17"
-tempfile = "3"
 tokio = { version = "1", features = ["net", "rt", "sync"] }
 
 [package.metadata.docs.rs]

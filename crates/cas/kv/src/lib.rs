@@ -5,6 +5,10 @@
 //! `blake3/<digest>/bytes`, after an optional prefix, where `<digest>` is its
 //! [BLAKE3](https://github.com/BLAKE3-team/BLAKE3-specs) digest in lowercase,
 //! unpadded [base32](https://www.rfc-editor.org/rfc/rfc4648#section-6).
+//! A [content identifier (CID)](https://github.com/multiformats/cid)
+//! addresses the uncompressed bytes of a block.
+//! [`KvCas::with_compression`] instead stores a Zstandard frame under
+//! `bytes.zst`, with the same digest of the uncompressed bytes.
 //!
 //! ```
 //! use covalence_cas_kv::KvCas;
@@ -23,6 +27,8 @@
 //! ```
 #![deny(missing_docs)]
 
+mod zstd;
+
 use std::{
     io::{self, Read, Write},
     sync::Arc,
@@ -38,6 +44,57 @@ use covalence_lib_data::Bytes;
 use covalence_lib_error::snafu::Snafu;
 use data_encoding::BASE32_NOPAD;
 
+/// Compression settings for the stored bytes of a block.
+#[derive(Clone, Debug)]
+pub struct Compression {
+    codec: Codec,
+}
+
+#[derive(Clone, Debug)]
+enum Codec {
+    Zstd { level: i32 },
+}
+
+impl Compression {
+    /// Zstandard frames, stored under `bytes.zst`.
+    ///
+    /// Zero selects Zstandard's default level; other levels are clamped to
+    /// its supported range. Compression does not change the block's CID.
+    pub fn zstd(level: i32) -> Self {
+        Self {
+            codec: Codec::Zstd { level },
+        }
+    }
+
+    fn suffix(&self) -> &'static str {
+        match self.codec {
+            Codec::Zstd { .. } => ".zst",
+        }
+    }
+
+    fn encode(&self, bytes: Bytes) -> Result<Bytes, Error> {
+        match self.codec {
+            Codec::Zstd { level } => zstd::encode(bytes, level),
+        }
+    }
+
+    fn stage(&self, reader: &mut dyn Read, len: u64, cid: &Blake3) -> Result<std::fs::File, Error> {
+        match self.codec {
+            Codec::Zstd { level } => zstd::stage(reader, len, cid, level),
+        }
+    }
+
+    fn decode_to(
+        &self,
+        writer: &mut dyn Write,
+        read: impl FnOnce(&mut dyn Write) -> Result<Option<u64>, Error>,
+    ) -> Result<Option<(blake3::Hasher, u64)>, Error> {
+        match self.codec {
+            Codec::Zstd { .. } => zstd::decode_to(writer, read),
+        }
+    }
+}
+
 /// A store of blocks in a [`Kv`]; see the [crate] docs for the key layout.
 ///
 /// - A CID with a 32-byte BLAKE3 digest finds its bytes whatever its codec;
@@ -52,17 +109,24 @@ use data_encoding::BASE32_NOPAD;
 ///   the key-value store's [`Kv::put_new`], [`Kv::aput_new`] and
 ///   [`Kv::put_new_from`], so concurrent writers of one block race safely.
 ///   Writes fail if the backend does not implement atomic create-only writes.
-/// - `put_from` and `get_to` stream through the key-value store's own
-///   `put_new_from` and `get_to`, hashing the bytes as they pass.
+/// - Compression keeps CIDs of the uncompressed bytes. Streaming writes
+///   finish and check a compressed temporary file before publishing it;
+///   streamed reads decode and hash the bytes as they pass. Sizes and ranges
+///   scan the complete frame, retaining only the requested output. Async
+///   reads fetch the encoded value whole, as the key-value trait requires.
+/// - Without compression, `put_from` and `get_to` stream through the
+///   key-value store's `put_new_from` and `get_to`, hashing the bytes as they
+///   pass.
 ///   If the backend skips an existing block, `put_from` returns without
 ///   consuming or checking any remaining input.
-/// - If the bytes `put_from` reads do not hash to the CID, the read that would
-///   hand over the last byte fails instead. The key-value store's `put_from`
-///   then fails as [`Kv::put_from`] says, storing nothing, and `put_from`
-///   fails with [`Error::Check`]; or with [`Error::Backend`] if the key-value
-///   store reports a further failure, such as failing to clean up.
+/// - Without compression, if the bytes `put_from` reads do not hash to the
+///   CID, the read that would hand over the last byte fails instead. The
+///   key-value store's `put_new_from` then fails, storing nothing, and
+///   `put_from` fails with [`Error::Check`]; or with [`Error::Backend`] if the
+///   key-value store reports a further failure, such as failing to clean up.
 /// - [`Cas::info`] is `{"name": "kv", "prefix": <prefix>, "kv": <the
-///   key-value store's info>}`; [`Cas::stats`] is the key-value store's.
+///   key-value store's info>}`, with `compression` and `level` fields when
+///   compressed; [`Cas::stats`] is the key-value store's.
 ///
 /// # S3
 ///
@@ -72,12 +136,13 @@ use data_encoding::BASE32_NOPAD;
 /// `has` uses a HEAD request. S3 answers a HEAD for a missing key with 403 to
 /// a client that may not list the bucket.
 ///
-/// S3 may consume the source before discovering that a block already exists.
-/// Once the backend skips insertion, `put_from` leaves any remaining input
-/// unread.
+/// For uncompressed blocks, S3 may consume the source before discovering that
+/// a block already exists. Once the backend skips insertion, `put_from`
+/// leaves any remaining input unread.
 pub struct KvCas {
     kv: Arc<dyn Kv>,
     prefix: String,
+    compression: Option<Compression>,
 }
 
 /// A prefix that is not `/`-separated, non-empty segments other than `.` and
@@ -95,6 +160,7 @@ impl KvCas {
         Self {
             kv,
             prefix: String::new(),
+            compression: None,
         }
     }
 
@@ -123,14 +189,80 @@ impl KvCas {
         Ok(Self {
             kv,
             prefix: format!("{trimmed}/"),
+            compression: None,
         })
+    }
+
+    /// Compress stored blocks, keeping CIDs of the uncompressed bytes.
+    ///
+    /// The compression selects a separate key suffix, so raw and compressed
+    /// stores do not read each other's blocks. Zstandard clamps levels to its
+    /// supported range. Streaming writes stage a frame on temporary disk before
+    /// uploading it; the key-value backend controls transfer buffering.
+    ///
+    /// ```
+    /// use covalence_cas_kv::{Compression, KvCas};
+    /// use covalence_cas_trait::{Get, Put};
+    /// use covalence_kv_memory::MemoryKv;
+    /// use covalence_kv_trait::Kv;
+    /// use covalence_lib_cid::Cid;
+    /// let store = KvCas::new(MemoryKv::default().into_dyn())
+    ///     .with_compression(Compression::zstd(3));
+    /// let cid: Cid = store.put("hello".into())?;
+    /// assert_eq!(store.get(&cid)?.unwrap(), "hello");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = Some(compression);
+        self
+    }
+
+    fn encode(&self, bytes: Bytes) -> Result<Bytes, Error> {
+        match self.compression.as_ref() {
+            Some(compression) => compression.encode(bytes),
+            None => Ok(bytes),
+        }
+    }
+
+    /// Decode through the backend's streamed read, optionally checking the CID.
+    fn read_compressed(
+        &self,
+        compression: &Compression,
+        cid: &Blake3,
+        writer: &mut dyn Write,
+        check: bool,
+    ) -> Result<Option<u64>, Error> {
+        let key = self.key(cid);
+        let result = compression.decode_to(writer, |decoding| {
+            self.kv.get_to(key.as_bytes(), decoding).map_err(backend)
+        })?;
+        result
+            .map(|(hasher, len)| {
+                if check && !hashes_to(&hasher, cid) {
+                    return Err(corrupt());
+                }
+                Ok(len)
+            })
+            .transpose()
     }
 
     /// The key for `cid`.
     fn key(&self, cid: &Blake3) -> String {
         let digest = BASE32_NOPAD.encode(cid.digest()).to_ascii_lowercase();
-        format!("{}blake3/{digest}/bytes", self.prefix)
+        format!(
+            "{}blake3/{digest}/bytes{}",
+            self.prefix,
+            self.compression.as_ref().map_or("", Compression::suffix)
+        )
     }
+}
+
+fn corrupt() -> Error {
+    covalence_lib_cid::Error::Mismatch.into()
+}
+
+fn io_error(source: io::Error) -> Error {
+    Error::Io { source }
 }
 
 fn backend(error: covalence_kv_trait::Error) -> Error {
@@ -181,12 +313,24 @@ impl Read for Checked<'_> {
 struct Hashing<'a> {
     writer: &'a mut dyn Write,
     hasher: blake3::Hasher,
+    len: u64,
+}
+
+impl<'a> Hashing<'a> {
+    fn new(writer: &'a mut dyn Write) -> Self {
+        Self {
+            writer,
+            hasher: blake3::Hasher::new(),
+            len: 0,
+        }
+    }
 }
 
 impl Write for Hashing<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let written = self.writer.write(buf)?;
         self.hasher.update(&buf[..written]);
+        self.len += written as u64;
         Ok(written)
     }
 
@@ -195,12 +339,54 @@ impl Write for Hashing<'_> {
     }
 }
 
+/// A slice sink that discards bytes before and after the requested range.
+struct Range {
+    skip: u64,
+    left: u64,
+    bytes: Vec<u8>,
+}
+
+impl Range {
+    fn new(start: u64, len: u64) -> Self {
+        Self {
+            skip: start,
+            left: len,
+            bytes: Vec::new(),
+        }
+    }
+}
+
+impl Write for Range {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let skipped = self.skip.min(bytes.len() as u64) as usize;
+        self.skip -= skipped as u64;
+        let selected = self.left.min((bytes.len() - skipped) as u64) as usize;
+        self.bytes
+            .extend_from_slice(&bytes[skipped..skipped + selected]);
+        self.left -= selected as u64;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Get<Blake3> for KvCas {
     fn get_unchecked(&self, key: &Blake3) -> Result<Option<Bytes>, Error> {
+        if let Some(compression) = &self.compression {
+            let mut bytes = Vec::new();
+            return Ok(self
+                .read_compressed(compression, key, &mut bytes, false)?
+                .map(|_| bytes.into()));
+        }
         self.kv.get(self.key(key).as_bytes()).map_err(backend)
     }
 
     fn size_unchecked(&self, key: &Blake3) -> Result<Option<u64>, Error> {
+        if let Some(compression) = &self.compression {
+            return self.read_compressed(compression, key, &mut io::sink(), false);
+        }
         self.kv.size(self.key(key).as_bytes()).map_err(backend)
     }
 
@@ -210,6 +396,12 @@ impl Get<Blake3> for KvCas {
         start: u64,
         len: u64,
     ) -> Result<Option<Bytes>, Error> {
+        if let Some(compression) = &self.compression {
+            let mut range = Range::new(start, len);
+            return Ok(self
+                .read_compressed(compression, key, &mut range, false)?
+                .map(|_| range.bytes.into()));
+        }
         self.kv
             .get_range(self.key(key).as_bytes(), start, len)
             .map_err(backend)
@@ -250,6 +442,17 @@ impl AsyncGet for KvCas {
                 return Ok(None);
             };
             let key = self.key(&key);
+            if let Some(compression) = &self.compression {
+                let Some(bytes) = self.kv.aget(key.as_bytes()).await.map_err(backend)? else {
+                    return Ok(None);
+                };
+                return Ok(compression
+                    .decode_to(&mut io::sink(), |writer| {
+                        writer.write_all(&bytes).map_err(io_error)?;
+                        Ok(Some(bytes.len() as u64))
+                    })?
+                    .map(|(_, len)| len));
+            }
             self.kv.asize(key.as_bytes()).await.map_err(backend)
         })
     }
@@ -265,6 +468,18 @@ impl AsyncGet for KvCas {
                 return Ok(None);
             };
             let key = self.key(&key);
+            if let Some(compression) = &self.compression {
+                let Some(bytes) = self.kv.aget(key.as_bytes()).await.map_err(backend)? else {
+                    return Ok(None);
+                };
+                let mut range = Range::new(start, len);
+                return Ok(compression
+                    .decode_to(&mut range, |writer| {
+                        writer.write_all(&bytes).map_err(io_error)?;
+                        Ok(Some(bytes.len() as u64))
+                    })?
+                    .map(|_| range.bytes.into()));
+            }
             self.kv
                 .aget_range(key.as_bytes(), start, len)
                 .await
@@ -278,7 +493,19 @@ impl AsyncGet for KvCas {
                 return Ok(None);
             };
             let key = self.key(&key);
-            self.kv.aget(key.as_bytes()).await.map_err(backend)
+            let Some(bytes) = self.kv.aget(key.as_bytes()).await.map_err(backend)? else {
+                return Ok(None);
+            };
+            if let Some(compression) = &self.compression {
+                let mut decoded = Vec::new();
+                return Ok(compression
+                    .decode_to(&mut decoded, |writer| {
+                        writer.write_all(&bytes).map_err(io_error)?;
+                        Ok(Some(bytes.len() as u64))
+                    })?
+                    .map(|_| decoded.into()));
+            }
+            Ok(Some(bytes))
         })
     }
 
@@ -292,7 +519,7 @@ impl Put<Blake3> for KvCas {
     fn put(&self, bytes: Bytes) -> Result<Blake3, Error> {
         let cid = Blake3::of(&bytes);
         self.kv
-            .put_new(self.key(&cid).as_bytes(), bytes)
+            .put_new(self.key(&cid).as_bytes(), self.encode(bytes)?)
             .map_err(backend)?;
         Ok(cid)
     }
@@ -310,7 +537,7 @@ impl AsyncPut for KvCas {
             let cid = Blake3::of(&bytes);
             let key = self.key(&cid);
             self.kv
-                .aput_new(key.as_bytes(), bytes)
+                .aput_new(key.as_bytes(), self.encode(bytes)?)
                 .await
                 .map_err(backend)?;
             Ok(cid.into())
@@ -326,13 +553,21 @@ impl Cas for KvCas {
         })
     }
 
-    /// The name `kv`, the key prefix, and the key-value store's info.
+    /// The name, key prefix, backend info, and any compression settings.
     fn info(&self) -> Result<Value, Error> {
-        Ok(map([
-            ("name", Value::String("kv".into())),
-            ("prefix", Value::String(self.prefix.as_str().into())),
-            ("kv", self.kv.info().map_err(backend)?),
-        ]))
+        let name = Value::String("kv".into());
+        let prefix = Value::String(self.prefix.as_str().into());
+        let kv = self.kv.info().map_err(backend)?;
+        Ok(match self.compression.as_ref().map(|c| &c.codec) {
+            None => map([("name", name), ("prefix", prefix), ("kv", kv)]),
+            Some(Codec::Zstd { level }) => map([
+                ("name", name),
+                ("prefix", prefix),
+                ("kv", kv),
+                ("compression", Value::String("zstd".into())),
+                ("level", Value::Integer((*level).into())),
+            ]),
+        })
     }
 
     fn stats(&self) -> Result<Value, Error> {
@@ -340,6 +575,14 @@ impl Cas for KvCas {
     }
 
     fn put_from(&self, cid: Blake3, reader: &mut dyn Read, len: u64) -> Result<Cid, Error> {
+        if let Some(compression) = &self.compression {
+            let mut file = compression.stage(reader, len, &cid)?;
+            let encoded_len = file.metadata().map_err(io_error)?.len();
+            self.kv
+                .put_new_from(self.key(&cid).as_bytes(), &mut file, encoded_len)
+                .map_err(backend)?;
+            return Ok(cid.into());
+        }
         // No read hands over the last byte of nothing, so check it here.
         if len == 0 && !hashes_to(&blake3::Hasher::new(), &cid) {
             return Err(covalence_lib_cid::Error::Mismatch.into());
@@ -367,10 +610,10 @@ impl Cas for KvCas {
         let Some(cid) = key.raw_blake3() else {
             return Ok(None);
         };
-        let mut hashing = Hashing {
-            writer,
-            hasher: blake3::Hasher::new(),
-        };
+        if let Some(compression) = &self.compression {
+            return self.read_compressed(compression, &cid, writer, true);
+        }
+        let mut hashing = Hashing::new(writer);
         let key = self.key(&cid);
         let Some(len) = self
             .kv
