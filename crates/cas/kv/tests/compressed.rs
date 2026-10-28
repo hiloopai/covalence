@@ -53,7 +53,7 @@ fn raw_defaults_share_the_raw_namespace_without_copying_values() {
     for store in [
         KvCas::new(kv.clone()),
         KvCas::new(kv.clone()).with_compression(Compression::default()),
-        compressed(kv.clone()).with_compression(Compression::raw()),
+        compressed(kv.clone()).with_compression(Compression::identity()),
     ] {
         let store = store.into_dyn();
         assert_eq!(store.put(bytes.clone()).unwrap(), cid);
@@ -126,7 +126,7 @@ fn raw_sizes_and_ranges_keep_backend_native_operations() {
     for store in [
         KvCas::new(kv.clone()),
         KvCas::new(kv.clone()).with_compression(Compression::default()),
-        KvCas::new(kv.clone()).with_compression(Compression::raw()),
+        KvCas::new(kv.clone()).with_compression(Compression::identity()),
     ] {
         let store = store.into_dyn();
         assert_eq!(store.size(&cid).unwrap(), Some(5));
@@ -436,7 +436,12 @@ impl Kv for ReadKv {
 
 #[test]
 fn writes_require_atomic_create_support_with_or_without_compression() {
-    for compression in [Compression::raw(), Compression::zstd(3)] {
+    for compression in [
+        Compression::identity(),
+        Compression::zstd(3),
+        Compression::deflate(3),
+        Compression::gzip(3),
+    ] {
         let store = KvCas::new(ReadKv(|_| unreachable!()).into_dyn())
             .with_compression(compression)
             .into_dyn();
@@ -643,24 +648,32 @@ impl Write for Counting {
 
 #[test]
 fn streamed_reads_sizes_and_ranges_never_use_whole_backend_reads() {
-    let len = 32 << 20;
-    let mut hasher = blake3::Hasher::new();
-    io::copy(&mut Repeated(len), &mut hasher).unwrap();
-    let cid = Blake3::new(Format::BLAKE3, hasher.finalize().as_bytes()).unwrap();
-    let store = compressed(StreamingKv(Mutex::new(None)).into_dyn()).into_dyn();
-    store.put_from(cid, &mut Repeated(len), len).unwrap();
-    let mut sink = Counting(0);
-    assert_eq!(store.get_to(&cid.into(), &mut sink).unwrap(), Some(len));
-    assert_eq!(sink.0, len);
-    assert_eq!(store.size(&cid.into()).unwrap(), Some(len));
-    assert_eq!(
-        store
-            .get_range(&cid.into(), len - 7, 32)
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        b"xxxxxxx"
-    );
+    for compression in [
+        Compression::zstd(3),
+        Compression::deflate(3),
+        Compression::gzip(3),
+    ] {
+        let len = 32 << 20;
+        let mut hasher = blake3::Hasher::new();
+        io::copy(&mut Repeated(len), &mut hasher).unwrap();
+        let cid = Blake3::new(Format::BLAKE3, hasher.finalize().as_bytes()).unwrap();
+        let store = KvCas::new(StreamingKv(Mutex::new(None)).into_dyn())
+            .with_compression(compression)
+            .into_dyn();
+        store.put_from(cid, &mut Repeated(len), len).unwrap();
+        let mut sink = Counting(0);
+        assert_eq!(store.get_to(&cid.into(), &mut sink).unwrap(), Some(len));
+        assert_eq!(sink.0, len);
+        assert_eq!(store.size(&cid.into()).unwrap(), Some(len));
+        assert_eq!(
+            store
+                .get_range(&cid.into(), len - 7, 32)
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            b"xxxxxxx"
+        );
+    }
 }
 
 /// Async reads must use the backend's async view, which can differ from its sync view.
@@ -685,16 +698,24 @@ impl Kv for AsyncOnly {
 
 #[test]
 fn async_reads_keep_the_backends_async_view() {
-    let store = compressed(AsyncOnly(MemoryKv::default()).into_dyn()).into_dyn();
-    let cid = block_on(store.aput("hello".into())).unwrap();
-    assert!(store.get(&cid).is_err());
-    assert_eq!(block_on(store.aget(&cid)).unwrap().unwrap(), "hello");
-    assert_eq!(block_on(store.asize(&cid)).unwrap(), Some(5));
-    assert_eq!(
-        block_on(store.aget_range(&cid, 1, 3)).unwrap().unwrap(),
-        "ell"
-    );
-    let missing: Cid = Blake3::of(b"missing").into();
-    assert_eq!(block_on(store.asize(&missing)).unwrap(), None);
-    assert_eq!(block_on(store.aget_range(&missing, 0, 0)).unwrap(), None);
+    for compression in [
+        Compression::zstd(3),
+        Compression::deflate(3),
+        Compression::gzip(3),
+    ] {
+        let store = KvCas::new(AsyncOnly(MemoryKv::default()).into_dyn())
+            .with_compression(compression)
+            .into_dyn();
+        let cid = block_on(store.aput("hello".into())).unwrap();
+        assert!(store.get(&cid).is_err());
+        assert_eq!(block_on(store.aget(&cid)).unwrap().unwrap(), "hello");
+        assert_eq!(block_on(store.asize(&cid)).unwrap(), Some(5));
+        assert_eq!(
+            block_on(store.aget_range(&cid, 1, 3)).unwrap().unwrap(),
+            "ell"
+        );
+        let missing: Cid = Blake3::of(b"missing").into();
+        assert_eq!(block_on(store.asize(&missing)).unwrap(), None);
+        assert_eq!(block_on(store.aget_range(&missing, 0, 0)).unwrap(), None);
+    }
 }

@@ -20,6 +20,7 @@ covalence-lib-dasl.workspace = true
 covalence-lib-data.workspace = true
 covalence-lib-error.workspace = true
 data-encoding = "2.11.1"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 tempfile = "3"
 zstd = "0.13"
 

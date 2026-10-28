@@ -121,7 +121,7 @@ impl Kv for Blind {
 #[test]
 fn existing_blocks_leave_unused_stream_bytes_unchecked() {
     for consumed in [0, 2] {
-        for compression in [Compression::default(), Compression::raw()] {
+        for compression in [Compression::default(), Compression::identity()] {
             // A backend may skip immediately or after reading part of the source.
             let store = KvCas::new(Blind(MemoryKv::default(), consumed).into_dyn())
                 .with_compression(compression);

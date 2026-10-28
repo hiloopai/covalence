@@ -7,9 +7,13 @@
 //! unpadded [base32](https://www.rfc-editor.org/rfc/rfc4648#section-6).
 //! A [content identifier (CID)](https://github.com/multiformats/cid)
 //! addresses the uncompressed bytes of a block.
-//! [`Compression::raw`] is the default. [`Compression::zstd`] instead stores
-//! a Zstandard frame under `bytes.zst`, with the same digest of the
-//! uncompressed bytes; select it with [`KvCas::with_compression`].
+//! [`Compression::identity`] is the default. [`Compression::zstd`] instead stores
+//! a Zstandard frame under `bytes.zst`; [`Compression::deflate`] stores a zlib
+//! stream under `bytes.zlib`, and [`Compression::gzip`] uses `bytes.gz`.
+//! All use the same digest of the uncompressed
+//! bytes; select a representation with [`KvCas::with_compression`].
+//! These format names do not implement HTTP negotiation. Stored Zstandard
+//! frames are not restricted to [HTTP's 8 MiB window](https://www.rfc-editor.org/rfc/rfc9659.html#section-3.1.1).
 //!
 //! ```
 //! use covalence_cas_kv::KvCas;
@@ -28,6 +32,8 @@
 //! ```
 #![deny(missing_docs)]
 
+mod gzip;
+mod zlib;
 mod zstd;
 
 use std::{
@@ -45,7 +51,7 @@ use covalence_lib_data::Bytes;
 use covalence_lib_error::snafu::Snafu;
 use data_encoding::BASE32_NOPAD;
 
-/// The stored representation of a block: raw bytes by default.
+/// The stored representation of a block: identity by default.
 #[derive(Clone, Debug, Default)]
 pub struct Compression {
     codec: Option<Codec>,
@@ -54,6 +60,8 @@ pub struct Compression {
 #[derive(Clone, Debug)]
 enum Codec {
     Zstd { level: i32 },
+    Zlib { level: u32 },
+    Gzip { level: u32 },
 }
 
 impl Compression {
@@ -61,7 +69,7 @@ impl Compression {
     ///
     /// This is the default. Streaming writes pass through to the key-value
     /// backend, and sizes and ranges use its native operations.
-    pub const fn raw() -> Self {
+    pub const fn identity() -> Self {
         Self { codec: None }
     }
 
@@ -75,14 +83,44 @@ impl Compression {
         }
     }
 
+    /// A zlib-wrapped DEFLATE stream, stored under `bytes.zlib`.
+    ///
+    /// Levels clamp to 0 through 9; zero stores uncompressed DEFLATE blocks.
+    /// This is RFC 1950 zlib, as used by browser `CompressionStream("deflate")`,
+    /// rather than raw DEFLATE or gzip. Reads require one complete stream with
+    /// a valid checksum and no trailing bytes. Compression keeps the block's CID.
+    pub fn deflate(level: i32) -> Self {
+        Self {
+            codec: Some(Codec::Zlib {
+                level: level.clamp(0, 9) as u32,
+            }),
+        }
+    }
+
+    /// A single gzip member, stored under `bytes.gz`.
+    ///
+    /// Levels clamp to 0 through 9; zero stores uncompressed DEFLATE blocks.
+    /// Reads follow browser `DecompressionStream("gzip")`: the header and
+    /// checksum must be valid and trailing bytes, including another member,
+    /// are rejected. Compression keeps the block's CID.
+    pub fn gzip(level: i32) -> Self {
+        Self {
+            codec: Some(Codec::Gzip {
+                level: level.clamp(0, 9) as u32,
+            }),
+        }
+    }
+
     fn suffix(&self) -> &'static str {
         match self.codec {
             None => "",
             Some(Codec::Zstd { .. }) => ".zst",
+            Some(Codec::Zlib { .. }) => ".zlib",
+            Some(Codec::Gzip { .. }) => ".gz",
         }
     }
 
-    fn is_raw(&self) -> bool {
+    fn is_identity(&self) -> bool {
         self.codec.is_none()
     }
 
@@ -90,6 +128,8 @@ impl Compression {
         match self.codec {
             None => Ok(bytes),
             Some(Codec::Zstd { level }) => zstd::encode(bytes, level),
+            Some(Codec::Zlib { level }) => zlib::encode(bytes, level),
+            Some(Codec::Gzip { level }) => gzip::encode(bytes, level),
         }
     }
 
@@ -103,6 +143,8 @@ impl Compression {
         match self.codec {
             None => Ok(None),
             Some(Codec::Zstd { level }) => zstd::stage(reader, len, cid, level).map(Some),
+            Some(Codec::Zlib { level }) => zlib::stage(reader, len, cid, level).map(Some),
+            Some(Codec::Gzip { level }) => gzip::stage(reader, len, cid, level).map(Some),
         }
     }
 
@@ -117,6 +159,8 @@ impl Compression {
                 Ok(read(&mut hashing)?.map(|len| (hashing.hasher, len)))
             }
             Some(Codec::Zstd { .. }) => zstd::decode_to(writer, read),
+            Some(Codec::Zlib { .. }) => zlib::decode_to(writer, read),
+            Some(Codec::Gzip { .. }) => gzip::decode_to(writer, read),
         }
     }
 }
@@ -221,11 +265,11 @@ impl KvCas {
 
     /// Select the stored representation, keeping CIDs of the uncompressed bytes.
     ///
-    /// Raw bytes are the default; [`Compression::raw`] also restores that
-    /// representation. Zstandard selects a separate key suffix, so raw and
-    /// compressed stores do not read each other's blocks. It clamps levels to
-    /// its supported range and stages streaming writes on temporary disk before
-    /// uploading them; the key-value backend controls transfer buffering.
+    /// Raw bytes are the default; [`Compression::identity`] also restores that
+    /// representation. Each codec selects a separate key suffix, so stores
+    /// using different codecs do not read each other's blocks. Compressed
+    /// streaming writes stage on temporary disk before uploading; the
+    /// key-value backend controls transfer buffering.
     ///
     /// ```
     /// use covalence_cas_kv::{Compression, KvCas};
@@ -393,7 +437,7 @@ impl Write for Range {
 
 impl Get<Blake3> for KvCas {
     fn get_unchecked(&self, key: &Blake3) -> Result<Option<Bytes>, Error> {
-        if !self.compression.is_raw() {
+        if !self.compression.is_identity() {
             let mut bytes = Vec::new();
             return Ok(self.read_to(key, &mut bytes, false)?.map(|_| bytes.into()));
         }
@@ -401,7 +445,7 @@ impl Get<Blake3> for KvCas {
     }
 
     fn size_unchecked(&self, key: &Blake3) -> Result<Option<u64>, Error> {
-        if !self.compression.is_raw() {
+        if !self.compression.is_identity() {
             return self.read_to(key, &mut io::sink(), false);
         }
         self.kv.size(self.key(key).as_bytes()).map_err(backend)
@@ -413,7 +457,7 @@ impl Get<Blake3> for KvCas {
         start: u64,
         len: u64,
     ) -> Result<Option<Bytes>, Error> {
-        if !self.compression.is_raw() {
+        if !self.compression.is_identity() {
             let mut range = Range::new(start, len);
             return Ok(self
                 .read_to(key, &mut range, false)?
@@ -459,7 +503,7 @@ impl AsyncGet for KvCas {
                 return Ok(None);
             };
             let key = self.key(&key);
-            if !self.compression.is_raw() {
+            if !self.compression.is_identity() {
                 let Some(bytes) = self.kv.aget(key.as_bytes()).await.map_err(backend)? else {
                     return Ok(None);
                 };
@@ -486,7 +530,7 @@ impl AsyncGet for KvCas {
                 return Ok(None);
             };
             let key = self.key(&key);
-            if !self.compression.is_raw() {
+            if !self.compression.is_identity() {
                 let Some(bytes) = self.kv.aget(key.as_bytes()).await.map_err(backend)? else {
                     return Ok(None);
                 };
@@ -515,7 +559,7 @@ impl AsyncGet for KvCas {
             let Some(bytes) = self.kv.aget(key.as_bytes()).await.map_err(backend)? else {
                 return Ok(None);
             };
-            if !self.compression.is_raw() {
+            if !self.compression.is_identity() {
                 let mut decoded = Vec::new();
                 return Ok(self
                     .compression
@@ -585,6 +629,20 @@ impl Cas for KvCas {
                 ("prefix", prefix),
                 ("kv", kv),
                 ("compression", Value::String("zstd".into())),
+                ("level", Value::Integer((*level).into())),
+            ]),
+            Some(Codec::Zlib { level }) => map([
+                ("name", name),
+                ("prefix", prefix),
+                ("kv", kv),
+                ("compression", Value::String("deflate".into())),
+                ("level", Value::Integer((*level).into())),
+            ]),
+            Some(Codec::Gzip { level }) => map([
+                ("name", name),
+                ("prefix", prefix),
+                ("kv", kv),
+                ("compression", Value::String("gzip".into())),
                 ("level", Value::Integer((*level).into())),
             ]),
         })

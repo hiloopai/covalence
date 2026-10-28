@@ -181,6 +181,9 @@ same Rust implementation as `covalence-lib-config`.
 True
 >>> compressed.get(cid)
 b'hello'
+>>> browser_compatible = Cas.kv(Kv.memory(), compression="deflate")
+>>> browser_compatible.put(b"hello") == cid
+True
 
 ```
 
@@ -193,6 +196,25 @@ b'hello'
   `bytes.zst`, with CIDs of the uncompressed bytes. Raw and compressed
   stores use separate keys. Existing Zstandard frames, including frames
   without a content size and concatenated frames, can be read.
+- `compression="identity"` (the default) and `compression=None` store the
+  unchanged bytes. Codec names follow HTTP content encodings.
+- `Cas.kv(kv, compression="deflate", level=3)` stores RFC 1950 zlib-wrapped
+  DEFLATE under `bytes.zlib`, with the same logical CIDs. These streams work
+  with Python's `zlib` and the browser's `CompressionStream("deflate")` and
+  `DecompressionStream("deflate")`; this is not raw DEFLATE.
+- `Cas.kv(kv, compression="gzip", level=3)` stores RFC 1952 gzip under
+  `bytes.gz`, compatible with Python's `gzip` and the browser's
+  `CompressionStream("gzip")` and `DecompressionStream("gzip")`.
+- Deflate and gzip levels clamp to 0 through 9, where zero keeps the wrapper
+  but disables compression. Zstandard's zero instead selects its default level.
+  Each codec uses separate keys, with no automatic migration. Deflate and gzip
+  reads reject truncated streams, invalid checksums and trailing data.
+  Gzip follows the browser profile: exactly one member, with concatenated
+  members rejected.
+- Codec names select storage formats. HTTP headers and negotiation belong to
+  the serving application. Before serving stored Zstandard frames directly,
+  apply the [RFC 9659](https://www.rfc-editor.org/rfc/rfc9659.html) requirements:
+  storage frames may require a decoder window larger than HTTP's 8 MiB limit.
 - Compressed streaming writes finish and check a frame on temporary disk
   before storage; reads decode as the backend supplies bytes. Sizes and
   ranges scan the complete frame, retaining only a count or the requested

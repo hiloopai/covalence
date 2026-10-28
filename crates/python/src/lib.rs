@@ -990,7 +990,8 @@ impl PyCas {
 
     /// A store of blocks in `kv`, with optional compression.
     ///
-    /// - Raw blocks use `prefix/blake3/<digest>/bytes`; without a prefix,
+    /// - `compression="identity"` (the default) and `compression=None` store
+    ///   unchanged bytes under `prefix/blake3/<digest>/bytes`; without a prefix,
     ///   the key is `blake3/<digest>/bytes`.
     /// - The digest is the BLAKE3 digest in lowercase unpadded base32.
     /// - A trailing `/` on `prefix` is optional; an invalid prefix raises
@@ -998,15 +999,24 @@ impl PyCas {
     /// - `compression="zstd"` stores Zstandard frames under `bytes.zst`,
     ///   keeping CIDs of the uncompressed bytes. `level` sets its compression
     ///   level; zero selects the default and other levels clamp to the supported
-    ///   range. Other compression names raise ValueError. Raw and compressed
-    ///   stores use separate keys.
+    ///   range.
+    /// - `compression="deflate"` stores RFC 1950 zlib-wrapped DEFLATE under
+    ///   `bytes.zlib`, compatible with Python `zlib` and the browser's
+    ///   `CompressionStream("deflate")`. This is not raw DEFLATE.
+    /// - `compression="gzip"` stores RFC 1952 gzip under `bytes.gz`, compatible
+    ///   with Python `gzip` and the browser's `CompressionStream("gzip")`.
+    /// - Deflate and gzip levels clamp to 0 through 9; zero disables compression
+    ///   while retaining the wrapper. `level` defaults to 3 for every codec.
+    ///   Other compression names raise ValueError. Each codec has separate keys.
+    /// - Deflate and gzip reads require one stream or member, validate checksums
+    ///   and reject trailing data, following the browser compression profile.
     /// - Compressed streaming writes stage a complete frame on temporary disk
     ///   before storage. Reads stream through the backend; sizes and ranges
     ///   decode the complete frame, retaining only the requested output.
     /// - Never replaces a block `kv` already holds: on `Kv.s3` each write is
     ///   conditional, so concurrent writers of one block race safely.
     #[staticmethod]
-    #[pyo3(signature = (kv, prefix = None, *, compression = None, level = 3))]
+    #[pyo3(signature = (kv, prefix = None, *, compression = "identity", level = 3))]
     fn kv(
         kv: PyRef<'_, PyKv>,
         prefix: Option<&str>,
@@ -1019,9 +1029,15 @@ impl PyCas {
             None => KvCas::new(kv),
         };
         let compression = match compression {
-            None => Compression::raw(),
+            None | Some("identity") => Compression::identity(),
             Some("zstd") => Compression::zstd(level),
-            Some(_) => return Err(fail("compression must be 'zstd' or None")),
+            Some("deflate") => Compression::deflate(level),
+            Some("gzip") => Compression::gzip(level),
+            Some(_) => {
+                return Err(fail(
+                    "compression must be 'identity', 'gzip', 'deflate', 'zstd', or None",
+                ));
+            }
         };
         Ok(Self {
             inner: store.with_compression(compression).into_dyn(),

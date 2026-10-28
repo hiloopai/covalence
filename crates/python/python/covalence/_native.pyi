@@ -429,10 +429,11 @@ class Cas:
     def sqlite(path: str | PathLike[str] | None = None) -> Cas:
         """A store in the SQLite database at `path`, or in memory without one."""
     @staticmethod
-    def kv(kv: Kv, prefix: str | None = None, *, compression: Literal["zstd"] | None = None, level: int = 3) -> Cas:
+    def kv(kv: Kv, prefix: str | None = None, *, compression: Literal["identity", "gzip", "deflate", "zstd"] | None = "identity", level: int = 3) -> Cas:
         """A store of blocks in `kv`, with optional compression.
 
-        - Raw blocks use `prefix/blake3/<digest>/bytes`; without a prefix,
+        - `compression="identity"` (the default) and `compression=None` store
+          unchanged bytes under `prefix/blake3/<digest>/bytes`; without a prefix,
           the key is `blake3/<digest>/bytes`.
         - The digest is the BLAKE3 digest in lowercase unpadded base32.
         - A trailing `/` on `prefix` is optional; an invalid prefix raises
@@ -440,8 +441,17 @@ class Cas:
         - `compression="zstd"` stores Zstandard frames under `bytes.zst`,
           keeping CIDs of the uncompressed bytes. `level` sets its compression
           level; zero selects the default and other levels clamp to the supported
-          range. Other compression names raise ValueError. Raw and compressed
-          stores use separate keys.
+          range.
+        - `compression="deflate"` stores RFC 1950 zlib-wrapped DEFLATE under
+          `bytes.zlib`, compatible with Python `zlib` and the browser's
+          `CompressionStream("deflate")`. This is not raw DEFLATE.
+        - `compression="gzip"` stores RFC 1952 gzip under `bytes.gz`, compatible
+          with Python `gzip` and the browser's `CompressionStream("gzip")`.
+        - Deflate and gzip levels clamp to 0 through 9; zero disables compression
+          while retaining the wrapper. `level` defaults to 3 for every codec.
+          Other compression names raise ValueError. Each codec has separate keys.
+        - Deflate and gzip reads require one stream or member, validate checksums
+          and reject trailing data, following the browser compression profile.
         - Compressed streaming writes stage a complete frame on temporary disk
           before storage. Reads stream through the backend; sizes and ranges
           decode the complete frame, retaining only the requested output.
