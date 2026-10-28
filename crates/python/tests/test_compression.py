@@ -232,7 +232,6 @@ class CompressionTests(unittest.TestCase):
         for broken in (
             b"", b"not brotli", BROTLI_FRAME[:-1],
             BROTLI_FRAME + b"junk", BROTLI_FRAME + BROTLI_FRAME,
-            BROTLI_FRAME.replace(b"hello", b"jello"),
         ):
             with self.subTest(broken=broken), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -249,6 +248,24 @@ class CompressionTests(unittest.TestCase):
                     cas.get_file(cid, output)
                 self.assertEqual(output.read_bytes(), b"keep")
                 self.assertEqual(list(root.iterdir()), [output])
+
+    def test_valid_brotli_with_wrong_content_fails_checked_reads(self):
+        kv = Kv.memory()
+        # Brotli has no checksum: this is a valid stream for the wrong content.
+        kv.put(BROTLI_HELLO, BROTLI_FRAME.replace(b"hello", b"jello"))
+        cas = Cas.kv(kv, compression="br")
+        cid = Cid.of(b"hello")
+        self.assertEqual(cas.size(cid), 5)  # Sizes/ranges do not verify the CID.
+        self.assertEqual(cas.get_range(cid, 0, 1), b"j")
+        with self.assertRaises(IntegrityError):
+            cas.get(cid)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            output.write_bytes(b"keep")
+            with self.assertRaises(IntegrityError):
+                cas.get_file(cid, output)
+            self.assertEqual(output.read_bytes(), b"keep")
+            self.assertEqual(list(Path(directory).iterdir()), [output])
 
     def test_invalid_wrapped_downloads_preserve_the_destination(self):
         for codec, key, encode, _ in WRAPPED_CODECS:
