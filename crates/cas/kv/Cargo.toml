@@ -11,8 +11,15 @@ keywords = ["cas", "content-addressing", "cid", "storage", "key-value"]
 categories = ["database-implementations"]
 publish = true
 
+[features]
+default = ["zstd", "deflate", "brotli"]
+zstd = ["dep:zstd"]
+deflate = ["dep:flate2"]
+brotli = ["dep:brotli"]
+
 [dependencies]
 blake3.workspace = true
+brotli = { version = "9.1", default-features = false, features = ["std"], optional = true }
 covalence-cas-trait.workspace = true
 covalence-kv-trait.workspace = true
 covalence-lib-cid.workspace = true
@@ -20,9 +27,9 @@ covalence-lib-dasl.workspace = true
 covalence-lib-data.workspace = true
 covalence-lib-error.workspace = true
 data-encoding = "2.11.1"
-flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"], optional = true }
 tempfile = "3"
-zstd = "0.13"
+zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 covalence-kv-memory.workspace = true

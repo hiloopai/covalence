@@ -1,3 +1,5 @@
+#![cfg(feature = "zstd")]
+
 use std::{
     io::{self, Read, Seek, Write},
     sync::{
@@ -439,8 +441,12 @@ fn writes_require_atomic_create_support_with_or_without_compression() {
     for compression in [
         Compression::identity(),
         Compression::zstd(3),
+        #[cfg(feature = "deflate")]
         Compression::deflate(3),
+        #[cfg(feature = "deflate")]
         Compression::gzip(3),
+        #[cfg(feature = "brotli")]
+        Compression::br(3),
     ] {
         let store = KvCas::new(ReadKv(|_| unreachable!()).into_dyn())
             .with_compression(compression)
@@ -650,8 +656,12 @@ impl Write for Counting {
 fn streamed_reads_sizes_and_ranges_never_use_whole_backend_reads() {
     for compression in [
         Compression::zstd(3),
+        #[cfg(feature = "deflate")]
         Compression::deflate(3),
+        #[cfg(feature = "deflate")]
         Compression::gzip(3),
+        #[cfg(feature = "brotli")]
+        Compression::br(3),
     ] {
         let len = 32 << 20;
         let mut hasher = blake3::Hasher::new();
@@ -700,8 +710,12 @@ impl Kv for AsyncOnly {
 fn async_reads_keep_the_backends_async_view() {
     for compression in [
         Compression::zstd(3),
+        #[cfg(feature = "deflate")]
         Compression::deflate(3),
+        #[cfg(feature = "deflate")]
         Compression::gzip(3),
+        #[cfg(feature = "brotli")]
+        Compression::br(3),
     ] {
         let store = KvCas::new(AsyncOnly(MemoryKv::default()).into_dyn())
             .with_compression(compression)

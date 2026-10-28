@@ -1,29 +1,95 @@
+import base64
 import gzip
 import io
 import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from unittest import mock
 
 from covalence import Cas, Cid, IntegrityError, Kv
 
 HELLO = b"blake3/5khrmpntq2bjexseshc6ldklwnig56gbj23yvbxjbdcwestheahq/bytes.zst"
 # Produced by Python's streaming compression.zstd.ZstdCompressor, with no content size.
 LEGACY = bytes.fromhex("28b52ffd005829000068656c6c6f")
-ZLIB_HELLO = HELLO.removesuffix(b".zst") + b".zlib"
+DEFLATE_HELLO = HELLO.removesuffix(b".zst") + b".deflate"
 GZIP_HELLO = HELLO.removesuffix(b".zst") + b".gz"
+BROTLI_HELLO = HELLO.removesuffix(b".zst") + b".br"
+# Node.js 24.21.0 node:zlib.brotliCompressSync(Buffer.from("hello")), default options.
+BROTLI_FRAME = bytes.fromhex("0b028068656c6c6f03")
+CODECS = ("zstd", "deflate", "gzip", "br")
 WRAPPED_CODECS = (
-    ("deflate", ZLIB_HELLO, zlib.compress, zlib.decompress),
+    ("deflate", DEFLATE_HELLO, zlib.compress, zlib.decompress),
     ("gzip", GZIP_HELLO, gzip.compress, gzip.decompress),
 )
 
 
 class CompressionTests(unittest.TestCase):
+    def test_empty_objects_persist_and_read_across_all_codecs_and_ingestion_paths(self):
+        empty = Cid.of(b"")
+        digest = base64.b32encode(empty.digest).lower().rstrip(b"=")
+        key = b"blake3/" + digest + b"/bytes"
+        # Node.js 24.21.0 node:zlib Brotli/Zstandard encoders, default options.
+        codecs = (
+            ("identity", b"", b""),
+            ("gzip", b".gz", gzip.compress(b"")),
+            ("deflate", b".deflate", zlib.compress(b"")),
+            ("br", b".br", bytes.fromhex("3b")),
+            ("zstd", b".zst", bytes.fromhex("28b52ffd2000010000")),
+        )
+        for codec, suffix, independent in codecs:
+            for ingestion in ("put", "put_from", "fileobj", "independent"):
+                with self.subTest(codec=codec, ingestion=ingestion):
+                    kv = Kv.memory()
+                    cas = Cas.kv(kv, compression=codec)
+                    self.assertFalse(cas.has(empty))
+                    if ingestion == "put":
+                        self.assertEqual(cas.put(b""), empty)
+                    elif ingestion == "put_from":
+                        self.assertEqual(cas.put_from(empty, [b"", b""], 0), empty)
+                    elif ingestion == "fileobj":
+                        source = io.BytesIO()
+                        source.read = mock.Mock(wraps=source.read)
+                        self.assertEqual(
+                            cas.put_fileobj(source, max_bytes=0, expected_length=0), empty
+                        )
+                        self.assertFalse(source.closed)
+                        self.assertEqual(source.tell(), 0)
+                        self.assertTrue(source.read.called)
+                        for call in source.read.call_args_list:
+                            self.assertEqual(call.args, (1,))  # Bounded EOF probes only.
+                    else:
+                        kv.put(key + suffix, independent)
+                    encoded = kv.get(key + suffix)
+                    self.assertIsNotNone(encoded)
+                    if codec == "identity":
+                        self.assertEqual(encoded, b"")
+                    else:
+                        self.assertGreater(len(encoded), 0)
+                    if ingestion == "independent":
+                        self.assertEqual(encoded, independent)
+                    reader = Cas.kv(kv, compression=codec)
+                    self.assertTrue(reader.has(empty))
+                    self.assertEqual(reader.get(empty), b"")
+                    self.assertEqual(reader.size(empty), 0)
+                    self.assertEqual(reader.get_range(empty, 0, 0), b"")
+                    self.assertEqual(reader.get_range(empty, 0, 1), b"")
+                    self.assertEqual(reader.get_range(empty, 1, 1), b"")
+                    sink = mock.Mock()
+                    sink.write.side_effect = AssertionError("empty blocks must not call write")
+                    self.assertEqual(
+                        reader.get_to(empty, sink, max_bytes=0, expected_length=0), 0
+                    )
+                    sink.write.assert_not_called()
+                    sink.flush.assert_not_called()
+                    sink.close.assert_not_called()
+
     def test_constructor_rejects_invalid_options(self):
         for options, error in (
             ({"compression": "other"}, ValueError),
             ({"compression": "zlib"}, ValueError),
             ({"compression": "raw"}, ValueError),
+            ({"compression": "brotli"}, ValueError),
             ({"compression": 3}, TypeError),
             ({"compression": "zstd", "level": "3"}, TypeError),
             ({"compression": "zstd", "level": 1 << 31}, OverflowError),
@@ -36,7 +102,7 @@ class CompressionTests(unittest.TestCase):
             yield b"thr"
             raise RuntimeError("the client went away")
 
-        for compression in ("zstd", "deflate", "gzip"):
+        for compression in CODECS:
             with self.subTest(compression=compression):
                 cas = Cas.kv(Kv.memory(), compression=compression)
                 cid = Cid.of(b"hello")
@@ -52,8 +118,9 @@ class CompressionTests(unittest.TestCase):
     def test_file_objects_preserve_existing_frames_and_use_logical_bytes(self):
         for compression, key, frame in (
             ("zstd", HELLO, LEGACY),
-            ("deflate", ZLIB_HELLO, zlib.compress(b"hello")),
+            ("deflate", DEFLATE_HELLO, zlib.compress(b"hello")),
             ("gzip", GZIP_HELLO, gzip.compress(b"hello")),
+            ("br", BROTLI_HELLO, BROTLI_FRAME),
         ):
             with self.subTest(compression=compression):
                 kv = Kv.memory()
@@ -110,7 +177,7 @@ class CompressionTests(unittest.TestCase):
                     self.assertEqual(cas.get_range(cid, 5, 1), b"")
                     self.assertEqual(cas.info()["compression"], codec)
                     self.assertEqual(cas.info()["level"], 3)
-                    for other_codec in ("identity", "zstd", "deflate", "gzip"):
+                    for other_codec in ("identity", *CODECS):
                         if other_codec == codec:
                             continue
                         other = Cas.kv(kv, compression=other_codec)
@@ -127,6 +194,61 @@ class CompressionTests(unittest.TestCase):
                     self.assertEqual(cas.put(b"hello"), Cid.of(b"hello"))
                     self.assertEqual(decode(kv.get(b"p/" + key)), b"hello")
                     self.assertEqual(cas.info()["level"], effective)
+
+    def test_brotli_reads_independent_frames_and_keeps_logical_cids(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                kv = Kv.memory()
+                kv.put(BROTLI_HELLO, BROTLI_FRAME)
+                cas = Cas.kv(kv, compression="br")
+                cid = Cid.of(b"hello")
+                self.assertEqual(cas.get(cid), b"hello")
+                self.assertEqual(cas.size(cid), 5)
+                self.assertEqual(cas.get_range(cid, 1, 3), b"ell")
+                stored = cas.put_from(cid, [b"he", b"llo"], 5) if streaming else cas.put(b"hello")
+                self.assertEqual(stored, cid)
+                self.assertEqual(kv.get(BROTLI_HELLO), BROTLI_FRAME)
+                self.assertEqual(cas.info()["compression"], "br")
+                self.assertEqual(cas.info()["level"], 3)
+                for codec in ("identity", "zstd", "deflate", "gzip"):
+                    other = Cas.kv(kv, compression=codec)
+                    self.assertFalse(other.has(cid))
+                    self.assertEqual(other.put(b"hello"), cid)
+                    self.assertEqual(other.get(cid), b"hello")
+                    self.assertEqual(cas.get(cid), b"hello")
+
+    def test_brotli_levels_clamp(self):
+        for requested, effective in ((-1, 0), (0, 0), (11, 11), (100, 11)):
+            with self.subTest(level=requested):
+                kv = Kv.memory()
+                cas = Cas.kv(kv, "p/", compression="br", level=requested)
+                cid = cas.put(b"hello")
+                self.assertEqual(cid, Cid.of(b"hello"))
+                self.assertTrue(kv.exists(b"p/" + BROTLI_HELLO))
+                self.assertEqual(cas.get(cid), b"hello")
+                self.assertEqual(cas.info()["level"], effective)
+
+    def test_invalid_brotli_downloads_preserve_the_destination(self):
+        for broken in (
+            b"", b"not brotli", BROTLI_FRAME[:-1],
+            BROTLI_FRAME + b"junk", BROTLI_FRAME + BROTLI_FRAME,
+            BROTLI_FRAME.replace(b"hello", b"jello"),
+        ):
+            with self.subTest(broken=broken), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                kv = Kv.memory()
+                kv.put(BROTLI_HELLO, broken)
+                cas = Cas.kv(kv, compression="br")
+                cid = Cid.of(b"hello")
+                for operation in (cas.get, cas.size, lambda cid: cas.get_range(cid, 0, 1)):
+                    with self.assertRaises((IntegrityError, OSError)):
+                        operation(cid)
+                output = root / "output"
+                output.write_bytes(b"keep")
+                with self.assertRaises((IntegrityError, OSError)):
+                    cas.get_file(cid, output)
+                self.assertEqual(output.read_bytes(), b"keep")
+                self.assertEqual(list(root.iterdir()), [output])
 
     def test_invalid_wrapped_downloads_preserve_the_destination(self):
         for codec, key, encode, _ in WRAPPED_CODECS:
@@ -176,19 +298,20 @@ class CompressionTests(unittest.TestCase):
         self.assertNotIn("compression", Cas.kv(kv).info())
 
     def test_compressed_files_are_checked_before_publication(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            kv = Kv.memory()
-            cas = Cas.kv(kv, compression="zstd")
-            source = root / "source"
-            source.write_bytes(b"hello" * 100_000)
-            cid = cas.put_file(source)
-            self.assertEqual(cid, Cid.of(source.read_bytes()))
-            output = root / "output"
-            self.assertEqual(cas.get_file(cid, output), source.stat().st_size)
-            self.assertEqual(output.read_bytes(), source.read_bytes())
-            self.assertIsNone(cas.get_file(Cid.of(b"missing"), output))
-            self.assertEqual(output.read_bytes(), source.read_bytes())
+        for compression in CODECS:
+            with self.subTest(compression=compression), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                kv = Kv.memory()
+                cas = Cas.kv(kv, compression=compression)
+                source = root / "source"
+                source.write_bytes(b"hello" * 100_000)
+                cid = cas.put_file(source)
+                self.assertEqual(cid, Cid.of(source.read_bytes()))
+                output = root / "output"
+                self.assertEqual(cas.get_file(cid, output), source.stat().st_size)
+                self.assertEqual(output.read_bytes(), source.read_bytes())
+                self.assertIsNone(cas.get_file(Cid.of(b"missing"), output))
+                self.assertEqual(output.read_bytes(), source.read_bytes())
 
     def test_corrupt_compressed_download_preserves_destination(self):
         for broken, error in (

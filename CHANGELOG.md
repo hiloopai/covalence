@@ -18,11 +18,12 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 ### Added
 
 - Release notes and automated changelog format checks in `glu check` and CI.
-- Opt-in Zstandard, gzip and HTTP `deflate` storage for Rust `KvCas`
+- Opt-in Zstandard, gzip, Brotli and HTTP `deflate` storage for Rust `KvCas`
   through `with_compression(Compression::zstd(level))`,
-  `Compression::gzip(level)` and `Compression::deflate(level)`, and Python
-  `Cas.kv(kv, compression="zstd", level=3)` with `"gzip"` and `"deflate"`
-  options as well.
+  `Compression::gzip(level)`, `Compression::br(level)` and
+  `Compression::deflate(level)`, and Python
+  `Cas.kv(kv, compression="zstd", level=3)` with `"gzip"`, `"br"` and
+  `"deflate"` options as well.
   CIDs still identify the uncompressed bytes. Each representation uses
   separate keys, without automatically migrating existing blocks. HTTP
   `deflate` uses the zlib wrapper; gzip and deflate reads require a complete
@@ -31,6 +32,9 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
   and `Compression::default()`, usable with `KvCas::with_compression`,
   and Python `Cas.kv(kv, compression="identity")`. Uncompressed storage
   remains the default.
+- Default-enabled `zstd`, `deflate` (shared by gzip) and `brotli` Cargo
+  features for `covalence-cas-kv`. Builds can omit codec dependencies;
+  operations using an omitted codec return `Unsupported`.
 
 ## [0.1.0-dev.7] - 2026-10-24
 

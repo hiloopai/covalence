@@ -184,6 +184,9 @@ b'hello'
 >>> browser_compatible = Cas.kv(Kv.memory(), compression="deflate")
 >>> browser_compatible.put(b"hello") == cid
 True
+>>> brotli = Cas.kv(Kv.memory(), compression="br")
+>>> brotli.put(b"hello") == cid
+True
 
 ```
 
@@ -199,18 +202,25 @@ True
 - `compression="identity"` (the default) and `compression=None` store the
   unchanged bytes. Codec names follow HTTP content encodings.
 - `Cas.kv(kv, compression="deflate", level=3)` stores RFC 1950 zlib-wrapped
-  DEFLATE under `bytes.zlib`, with the same logical CIDs. These streams work
+  DEFLATE under `bytes.deflate`, with the same logical CIDs. These streams work
   with Python's `zlib` and the browser's `CompressionStream("deflate")` and
   `DecompressionStream("deflate")`; this is not raw DEFLATE.
 - `Cas.kv(kv, compression="gzip", level=3)` stores RFC 1952 gzip under
   `bytes.gz`, compatible with Python's `gzip` and the browser's
   `CompressionStream("gzip")` and `DecompressionStream("gzip")`.
+- `Cas.kv(kv, compression="br", level=3)` stores RFC 7932 Brotli under
+  `bytes.br`, with the same logical CIDs. The HTTP content encoding is `br`;
+  the Compression Streams API calls it `"brotli"`, where supported. Levels
+  clamp to 0 through 11, with zero selecting the fastest compression. Reads
+  require one complete stream and reject trailing data.
 - Deflate and gzip levels clamp to 0 through 9, where zero keeps the wrapper
   but disables compression. Zstandard's zero instead selects its default level.
   Each codec uses separate keys, with no automatic migration. Deflate and gzip
   reads reject truncated streams, invalid checksums and trailing data.
   Gzip follows the browser profile: exactly one member, with concatenated
   members rejected.
+- Python wheels include all codecs. Custom Rust builds can disable codec
+  families; using a disabled codec raises `UnsupportedError`.
 - Codec names select storage formats. HTTP headers and negotiation belong to
   the serving application. Before serving stored Zstandard frames directly,
   apply the [RFC 9659](https://www.rfc-editor.org/rfc/rfc9659.html) requirements:

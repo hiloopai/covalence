@@ -1,3 +1,5 @@
+#![cfg(any(feature = "deflate", feature = "brotli"))]
+
 use std::{
     io::{self, Read, Write},
     sync::Arc,
@@ -14,17 +16,28 @@ use pollster::block_on;
 
 const BASE: &str = "blake3/5khrmpntq2bjexseshc6ldklwnig56gbj23yvbxjbdcwestheahq/bytes";
 // Python stdlib zlib.compress(b"hello") and gzip.compress(b"hello", mtime=0).
+#[cfg(feature = "deflate")]
 const ZLIB: &[u8] = b"\x78\x9c\xcb\x48\xcd\xc9\xc9\x07\x00\x06\x2c\x02\x15";
+#[cfg(feature = "deflate")]
 const GZIP: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
 // The same member with FHCRC set and a valid CRC16 in its header.
+#[cfg(feature = "deflate")]
 const FHCRC: &[u8] = b"\x1f\x8b\x08\x02\x00\x00\x00\x00\x00\xff\x90\xc9\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
 
 type Constructor = fn(i32) -> Compression;
 type Coding = (Constructor, &'static str, &'static str, &'static [u8]);
-fn codings() -> [Coding; 2] {
-    [
-        (Compression::deflate, "deflate", ".zlib", ZLIB),
+// Node 24 zlib.brotliCompressSync(Buffer.from("hello")).
+#[cfg(feature = "brotli")]
+const BROTLI: &[u8] = b"\x0b\x02\x80hello\x03";
+
+fn codings() -> Vec<Coding> {
+    vec![
+        #[cfg(feature = "deflate")]
+        (Compression::deflate, "deflate", ".deflate", ZLIB),
+        #[cfg(feature = "deflate")]
         (Compression::gzip, "gzip", ".gz", GZIP),
+        #[cfg(feature = "brotli")]
+        (Compression::br, "br", ".br", BROTLI),
     ]
 }
 
@@ -68,15 +81,16 @@ fn stdlib_fixtures_use_logical_cids_and_preserve_existing_streams() {
             cid
         );
         assert_eq!(kv.get(key.as_bytes()).unwrap().unwrap(), fixture);
-        for other in [
-            Compression::identity(),
-            Compression::zstd(3),
-            if suffix == ".gz" {
-                Compression::deflate(3)
-            } else {
-                Compression::gzip(3)
-            },
-        ] {
+        let mut other_codings = vec![Compression::identity()];
+        #[cfg(feature = "zstd")]
+        other_codings.push(Compression::zstd(3));
+        other_codings.extend(
+            codings()
+                .into_iter()
+                .filter(|(_, _, other, _)| *other != suffix)
+                .map(|(constructor, _, _, _)| constructor(3)),
+        );
+        for other in other_codings {
             let other = KvCas::new(kv.clone()).with_compression(other).into_dyn();
             assert!(!other.has(&cid).unwrap());
             assert_eq!(other.get(&cid).unwrap(), None);
@@ -103,7 +117,12 @@ fn effective_levels_and_empty_blocks_round_trip() {
                     ("prefix", Value::String("test/".into())),
                     ("kv", kv.info().unwrap()),
                     ("compression", Value::String(name.into())),
-                    ("level", Value::Integer(requested.clamp(0, 9).into())),
+                    (
+                        "level",
+                        Value::Integer(
+                            requested.clamp(0, if name == "br" { 11 } else { 9 }).into()
+                        )
+                    ),
                 ])
             );
             for data in [Bytes::new(), Bytes::from(vec![b'x'; 100_000])] {
@@ -165,28 +184,35 @@ impl Kv for Chunked {
 fn every_truncated_prefix_and_trailing_bytes_are_rejected_across_chunks() {
     let cid: Cid = Blake3::of(b"hello").into();
     for (constructor, name, _, fixture) in codings() {
-        let mut bad_checksum = fixture.to_vec();
-        bad_checksum[fixture.len() - 5] ^= 1;
-        let mut bad_size = fixture.to_vec();
-        bad_size[fixture.len() - 1] ^= 1;
-        let mut invalid_flags = fixture.to_vec();
-        if name == "gzip" {
-            invalid_flags[3] |= 0x20;
-        } else {
-            invalid_flags[1] ^= 0x20;
-        }
-        let broken = (0..fixture.len())
+        let mut broken: Vec<_> = (0..fixture.len())
             .map(|len| fixture[..len].to_vec())
-            .chain([
-                [fixture, b"junk"].concat(),
-                [fixture, fixture].concat(),
+            .chain([[fixture, b"junk"].concat(), [fixture, fixture].concat()])
+            .collect();
+        if name == "br" {
+            let mut bad_padding = fixture.to_vec();
+            *bad_padding.last_mut().unwrap() |= 0x80;
+            broken.push(bad_padding);
+        }
+        if name != "br" {
+            let mut bad_checksum = fixture.to_vec();
+            bad_checksum[fixture.len() - 5] ^= 1;
+            let mut bad_size = fixture.to_vec();
+            bad_size[fixture.len() - 1] ^= 1;
+            let mut invalid_flags = fixture.to_vec();
+            if name == "gzip" {
+                invalid_flags[3] |= 0x20;
+            } else {
+                invalid_flags[1] ^= 0x20;
+            }
+            broken.extend([
                 bad_checksum,
                 bad_size,
                 invalid_flags,
-                // Raw DEFLATE and a zlib stream requesting a preset dictionary.
+                // Raw DEFLATE and zlib requiring a preset dictionary.
                 b"\xcb\x48\xcd\xc9\xc9\x07\x00".to_vec(),
                 b"\x78\xbb\x06\x2c\x02\x15\xcb\x00\x11\x00\x06\x2c\x02\x15".to_vec(),
             ]);
+        }
         for encoded in broken {
             for chunk in [1, 3, fixture.len()] {
                 let store = KvCas::new(
@@ -221,29 +247,32 @@ fn every_truncated_prefix_and_trailing_bytes_are_rejected_across_chunks() {
             assert_eq!(store.get(&cid).unwrap().unwrap(), "hello");
         }
     }
-    let mut bad_fhcrc = FHCRC.to_vec();
-    bad_fhcrc[10] ^= 1;
-    for chunk in [1, 3, FHCRC.len()] {
-        let store = KvCas::new(
-            Chunked {
-                encoded: FHCRC.into(),
-                chunk,
-            }
-            .into_dyn(),
-        )
-        .with_compression(Compression::gzip(3))
-        .into_dyn();
-        assert_eq!(store.get(&cid).unwrap().unwrap(), "hello");
-        let store = KvCas::new(
-            Chunked {
-                encoded: bad_fhcrc.clone().into(),
-                chunk,
-            }
-            .into_dyn(),
-        )
-        .with_compression(Compression::gzip(3))
-        .into_dyn();
-        assert!(store.get(&cid).is_err());
+    #[cfg(feature = "deflate")]
+    {
+        let mut bad_fhcrc = FHCRC.to_vec();
+        bad_fhcrc[10] ^= 1;
+        for chunk in [1, 3, FHCRC.len()] {
+            let store = KvCas::new(
+                Chunked {
+                    encoded: FHCRC.into(),
+                    chunk,
+                }
+                .into_dyn(),
+            )
+            .with_compression(Compression::gzip(3))
+            .into_dyn();
+            assert_eq!(store.get(&cid).unwrap().unwrap(), "hello");
+            let store = KvCas::new(
+                Chunked {
+                    encoded: bad_fhcrc.clone().into(),
+                    chunk,
+                }
+                .into_dyn(),
+            )
+            .with_compression(Compression::gzip(3))
+            .into_dyn();
+            assert!(store.get(&cid).is_err());
+        }
     }
 }
 
@@ -277,5 +306,101 @@ fn staged_writes_check_input_before_publishing() {
         assert_eq!(store.put_from(cid, &mut source, 5).unwrap(), cid.into());
         assert_eq!(source, b" tail");
         assert_eq!(store.get(&cid.into()).unwrap().unwrap(), "hello");
+    }
+}
+
+struct FailedSink(bool);
+impl Write for FailedSink {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        if self.0 {
+            Ok(0)
+        } else {
+            Err(io::Error::other("destination failed"))
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn destination_errors_and_zero_progress_remain_io_failures() {
+    let cid: Cid = Blake3::of(b"hello").into();
+    for (constructor, _, _, fixture) in codings() {
+        let store = KvCas::new(
+            Chunked {
+                encoded: fixture.into(),
+                chunk: 1,
+            }
+            .into_dyn(),
+        )
+        .with_compression(constructor(3))
+        .into_dyn();
+        for zero in [false, true] {
+            let Err(Error::Io { source }) = store.get_to(&cid, &mut FailedSink(zero)) else {
+                panic!("destination failure was not an I/O error");
+            };
+            if zero {
+                assert_eq!(source.kind(), io::ErrorKind::WriteZero);
+            } else {
+                assert_eq!(source.to_string(), "destination failed");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "brotli")]
+#[test]
+fn brotli_logical_corruption_is_checked_without_a_format_checksum() {
+    let cid: Cid = Blake3::of(b"hello").into();
+    let mut changed = BROTLI.to_vec();
+    changed[3] = b'j';
+    for chunk in [1, 3, BROTLI.len()] {
+        let store = KvCas::new(
+            Chunked {
+                encoded: changed.clone().into(),
+                chunk,
+            }
+            .into_dyn(),
+        )
+        .with_compression(Compression::br(3))
+        .into_dyn();
+        assert_eq!(store.get_unchecked(&cid).unwrap().unwrap(), "jello");
+        assert_eq!(store.size(&cid).unwrap(), Some(5));
+        assert!(matches!(store.get(&cid), Err(Error::Check { .. })));
+        assert!(matches!(
+            block_on(store.aget(&cid)),
+            Err(Error::Check { .. })
+        ));
+        assert!(matches!(
+            store.get_to(&cid, &mut io::sink()),
+            Err(Error::Check { .. })
+        ));
+    }
+}
+
+#[cfg(feature = "brotli")]
+#[test]
+fn brotli_rejects_the_large_window_extension() {
+    // Node 24 with BROTLI_PARAM_LARGE_WINDOW=1 and BROTLI_PARAM_LGWIN=25.
+    // Its decoder accepts this only with BROTLI_DECODER_PARAM_LARGE_WINDOW=1.
+    let encoded: &[u8] = b"\x11\x19\x08\x00\x02hello\x03";
+    let cid: Cid = Blake3::of(b"hello").into();
+    for chunk in [1, 3, encoded.len()] {
+        let store = KvCas::new(
+            Chunked {
+                encoded: encoded.into(),
+                chunk,
+            }
+            .into_dyn(),
+        )
+        .with_compression(Compression::br(3))
+        .into_dyn();
+        assert!(matches!(store.get_unchecked(&cid), Err(Error::Io { .. })));
+        assert!(matches!(
+            block_on(store.aget_unchecked(&cid)),
+            Err(Error::Io { .. })
+        ));
+        assert!(matches!(store.size(&cid), Err(Error::Io { .. })));
     }
 }

@@ -9,11 +9,18 @@
 //! addresses the uncompressed bytes of a block.
 //! [`Compression::identity`] is the default. [`Compression::zstd`] instead stores
 //! a Zstandard frame under `bytes.zst`; [`Compression::deflate`] stores a zlib
-//! stream under `bytes.zlib`, and [`Compression::gzip`] uses `bytes.gz`.
+//! stream under `bytes.deflate`, [`Compression::gzip`] uses `bytes.gz`, and
+//! [`Compression::br`] uses `bytes.br` for Brotli.
 //! All use the same digest of the uncompressed
 //! bytes; select a representation with [`KvCas::with_compression`].
 //! These format names do not implement HTTP negotiation. Stored Zstandard
-//! frames are not restricted to [HTTP's 8 MiB window](https://www.rfc-editor.org/rfc/rfc9659.html#section-3.1.1).
+//! frames are not restricted to [HTTP's 8 MiB window](https://www.rfc-editor.org/rfc/rfc9659.html#section-3).
+//!
+//! The default Cargo features enable all codecs: `zstd`, `deflate` (both
+//! DEFLATE and gzip), and `brotli`. Disable default features for identity-only
+//! storage, or select individual codec features. Constructors remain available
+//! with a codec disabled; operations on that store return [`Error::Unsupported`]
+//! without accessing its backend. Identity storage needs no codec dependencies.
 //!
 //! ```
 //! use covalence_cas_kv::KvCas;
@@ -32,8 +39,13 @@
 //! ```
 #![deny(missing_docs)]
 
+#[cfg(feature = "brotli")]
+mod brotli;
+#[cfg(feature = "deflate")]
+mod deflate;
+#[cfg(feature = "deflate")]
 mod gzip;
-mod zlib;
+#[cfg(feature = "zstd")]
 mod zstd;
 
 use std::{
@@ -42,7 +54,7 @@ use std::{
 };
 
 use covalence_cas_trait::{
-    AsyncGet, AsyncGetExt, AsyncPut, Cas, CasFuture, Error, Get, GetExt, Put, map,
+    AsyncGet, AsyncGetExt, AsyncPut, Cas, CasFuture, Error, Get, GetExt, Op, Put, map,
 };
 use covalence_kv_trait::Kv;
 use covalence_lib_cid::{Blake3, Cid};
@@ -60,8 +72,9 @@ pub struct Compression {
 #[derive(Clone, Debug)]
 enum Codec {
     Zstd { level: i32 },
-    Zlib { level: u32 },
+    Deflate { level: u32 },
     Gzip { level: u32 },
+    Brotli { level: u32 },
 }
 
 impl Compression {
@@ -77,21 +90,23 @@ impl Compression {
     ///
     /// Zero selects Zstandard's default level; other levels are clamped to
     /// its supported range. Compression does not change the block's CID.
+    /// Requires the `zstd` Cargo feature for storage operations.
     pub fn zstd(level: i32) -> Self {
         Self {
             codec: Some(Codec::Zstd { level }),
         }
     }
 
-    /// A zlib-wrapped DEFLATE stream, stored under `bytes.zlib`.
+    /// A zlib-wrapped DEFLATE stream, stored under `bytes.deflate`.
     ///
     /// Levels clamp to 0 through 9; zero stores uncompressed DEFLATE blocks.
     /// This is RFC 1950 zlib, as used by browser `CompressionStream("deflate")`,
     /// rather than raw DEFLATE or gzip. Reads require one complete stream with
     /// a valid checksum and no trailing bytes. Compression keeps the block's CID.
+    /// Requires the `deflate` Cargo feature for storage operations.
     pub fn deflate(level: i32) -> Self {
         Self {
-            codec: Some(Codec::Zlib {
+            codec: Some(Codec::Deflate {
                 level: level.clamp(0, 9) as u32,
             }),
         }
@@ -103,6 +118,7 @@ impl Compression {
     /// Reads follow browser `DecompressionStream("gzip")`: the header and
     /// checksum must be valid and trailing bytes, including another member,
     /// are rejected. Compression keeps the block's CID.
+    /// Requires the `deflate` Cargo feature for storage operations.
     pub fn gzip(level: i32) -> Self {
         Self {
             codec: Some(Codec::Gzip {
@@ -111,12 +127,42 @@ impl Compression {
         }
     }
 
+    /// A Brotli stream (HTTP `br`), stored under `bytes.br`.
+    ///
+    /// Quality levels clamp to 0 through 11. Reads require a complete RFC 7932
+    /// stream and reject the large-window extension and trailing bytes,
+    /// including concatenated streams. Compression
+    /// keeps the block's CID. Requires the `brotli` Cargo feature for storage
+    /// operations.
+    pub fn br(level: i32) -> Self {
+        Self {
+            codec: Some(Codec::Brotli {
+                level: level.clamp(0, 11) as u32,
+            }),
+        }
+    }
+
+    fn require(&self, op: Op) -> Result<(), Error> {
+        let enabled = match self.codec {
+            None => true,
+            Some(Codec::Zstd { .. }) => cfg!(feature = "zstd"),
+            Some(Codec::Deflate { .. } | Codec::Gzip { .. }) => cfg!(feature = "deflate"),
+            Some(Codec::Brotli { .. }) => cfg!(feature = "brotli"),
+        };
+        if enabled {
+            Ok(())
+        } else {
+            Err(op.unsupported())
+        }
+    }
+
     fn suffix(&self) -> &'static str {
         match self.codec {
             None => "",
             Some(Codec::Zstd { .. }) => ".zst",
-            Some(Codec::Zlib { .. }) => ".zlib",
+            Some(Codec::Deflate { .. }) => ".deflate",
             Some(Codec::Gzip { .. }) => ".gz",
+            Some(Codec::Brotli { .. }) => ".br",
         }
     }
 
@@ -127,13 +173,28 @@ impl Compression {
     fn encode(&self, bytes: Bytes) -> Result<Bytes, Error> {
         match self.codec {
             None => Ok(bytes),
+            #[cfg(feature = "zstd")]
             Some(Codec::Zstd { level }) => zstd::encode(bytes, level),
-            Some(Codec::Zlib { level }) => zlib::encode(bytes, level),
+            #[cfg(not(feature = "zstd"))]
+            Some(Codec::Zstd { .. }) => Err(Op::Put.unsupported()),
+            #[cfg(feature = "deflate")]
+            Some(Codec::Deflate { level }) => deflate::encode(bytes, level),
+            #[cfg(feature = "deflate")]
             Some(Codec::Gzip { level }) => gzip::encode(bytes, level),
+            #[cfg(not(feature = "deflate"))]
+            Some(Codec::Deflate { .. } | Codec::Gzip { .. }) => Err(Op::Put.unsupported()),
+            #[cfg(feature = "brotli")]
+            Some(Codec::Brotli { level }) => brotli::encode(bytes, level),
+            #[cfg(not(feature = "brotli"))]
+            Some(Codec::Brotli { .. }) => Err(Op::Put.unsupported()),
         }
     }
 
     /// Raw streams pass directly to the backend, without staging.
+    #[cfg_attr(
+        not(any(feature = "zstd", feature = "deflate", feature = "brotli")),
+        allow(unused_variables)
+    )]
     fn stage(
         &self,
         reader: &mut dyn Read,
@@ -142,9 +203,20 @@ impl Compression {
     ) -> Result<Option<std::fs::File>, Error> {
         match self.codec {
             None => Ok(None),
+            #[cfg(feature = "zstd")]
             Some(Codec::Zstd { level }) => zstd::stage(reader, len, cid, level).map(Some),
-            Some(Codec::Zlib { level }) => zlib::stage(reader, len, cid, level).map(Some),
+            #[cfg(not(feature = "zstd"))]
+            Some(Codec::Zstd { .. }) => Err(Op::Put.unsupported()),
+            #[cfg(feature = "deflate")]
+            Some(Codec::Deflate { level }) => deflate::stage(reader, len, cid, level).map(Some),
+            #[cfg(feature = "deflate")]
             Some(Codec::Gzip { level }) => gzip::stage(reader, len, cid, level).map(Some),
+            #[cfg(not(feature = "deflate"))]
+            Some(Codec::Deflate { .. } | Codec::Gzip { .. }) => Err(Op::Put.unsupported()),
+            #[cfg(feature = "brotli")]
+            Some(Codec::Brotli { level }) => brotli::stage(reader, len, cid, level).map(Some),
+            #[cfg(not(feature = "brotli"))]
+            Some(Codec::Brotli { .. }) => Err(Op::Put.unsupported()),
         }
     }
 
@@ -158,9 +230,20 @@ impl Compression {
                 let mut hashing = Hashing::new(writer);
                 Ok(read(&mut hashing)?.map(|len| (hashing.hasher, len)))
             }
+            #[cfg(feature = "zstd")]
             Some(Codec::Zstd { .. }) => zstd::decode_to(writer, read),
-            Some(Codec::Zlib { .. }) => zlib::decode_to(writer, read),
+            #[cfg(not(feature = "zstd"))]
+            Some(Codec::Zstd { .. }) => Err(Op::Get.unsupported()),
+            #[cfg(feature = "deflate")]
+            Some(Codec::Deflate { .. }) => deflate::decode_to(writer, read),
+            #[cfg(feature = "deflate")]
             Some(Codec::Gzip { .. }) => gzip::decode_to(writer, read),
+            #[cfg(not(feature = "deflate"))]
+            Some(Codec::Deflate { .. } | Codec::Gzip { .. }) => Err(Op::Get.unsupported()),
+            #[cfg(feature = "brotli")]
+            Some(Codec::Brotli { .. }) => brotli::decode_to(writer, read),
+            #[cfg(not(feature = "brotli"))]
+            Some(Codec::Brotli { .. }) => Err(Op::Get.unsupported()),
         }
     }
 }
@@ -278,7 +361,7 @@ impl KvCas {
     /// use covalence_kv_trait::Kv;
     /// use covalence_lib_cid::Cid;
     /// let store = KvCas::new(MemoryKv::default().into_dyn())
-    ///     .with_compression(Compression::zstd(3));
+    ///     .with_compression(Compression::identity());
     /// let cid: Cid = store.put("hello".into())?;
     /// assert_eq!(store.get(&cid)?.unwrap(), "hello");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -295,6 +378,7 @@ impl KvCas {
         writer: &mut dyn Write,
         check: bool,
     ) -> Result<Option<u64>, Error> {
+        self.compression.require(Op::Get)?;
         let key = self.key(cid);
         let result = self.compression.decode_to(writer, |decoding| {
             self.kv.get_to(key.as_bytes(), decoding).map_err(backend)
@@ -392,6 +476,9 @@ impl<'a> Hashing<'a> {
 impl Write for Hashing<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let written = self.writer.write(buf)?;
+        if written == 0 && !buf.is_empty() {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
         self.hasher.update(&buf[..written]);
         self.len += written as u64;
         Ok(written)
@@ -437,6 +524,7 @@ impl Write for Range {
 
 impl Get<Blake3> for KvCas {
     fn get_unchecked(&self, key: &Blake3) -> Result<Option<Bytes>, Error> {
+        self.compression.require(Op::Get)?;
         if !self.compression.is_identity() {
             let mut bytes = Vec::new();
             return Ok(self.read_to(key, &mut bytes, false)?.map(|_| bytes.into()));
@@ -445,6 +533,7 @@ impl Get<Blake3> for KvCas {
     }
 
     fn size_unchecked(&self, key: &Blake3) -> Result<Option<u64>, Error> {
+        self.compression.require(Op::Get)?;
         if !self.compression.is_identity() {
             return self.read_to(key, &mut io::sink(), false);
         }
@@ -457,6 +546,7 @@ impl Get<Blake3> for KvCas {
         start: u64,
         len: u64,
     ) -> Result<Option<Bytes>, Error> {
+        self.compression.require(Op::Get)?;
         if !self.compression.is_identity() {
             let mut range = Range::new(start, len);
             return Ok(self
@@ -476,16 +566,19 @@ impl Get<Blake3> for KvCas {
 
 impl Get for KvCas {
     fn get_unchecked(&self, key: &Cid) -> Result<Option<Bytes>, Error> {
+        self.compression.require(Op::Get)?;
         key.raw_blake3()
             .map_or(Ok(None), |key| self.get_unchecked(&key))
     }
 
     fn size_unchecked(&self, key: &Cid) -> Result<Option<u64>, Error> {
+        self.compression.require(Op::Get)?;
         key.raw_blake3()
             .map_or(Ok(None), |key| self.size_unchecked(&key))
     }
 
     fn get_range_unchecked(&self, key: &Cid, start: u64, len: u64) -> Result<Option<Bytes>, Error> {
+        self.compression.require(Op::Get)?;
         key.raw_blake3()
             .map_or(Ok(None), |key| self.get_range_unchecked(&key, start, len))
     }
@@ -499,6 +592,7 @@ impl Get for KvCas {
 impl AsyncGet for KvCas {
     fn asize_unchecked<'a>(&'a self, key: &'a Cid) -> CasFuture<'a, Option<u64>> {
         Box::pin(async move {
+            self.compression.require(Op::Get)?;
             let Some(key) = key.raw_blake3() else {
                 return Ok(None);
             };
@@ -526,6 +620,7 @@ impl AsyncGet for KvCas {
         len: u64,
     ) -> CasFuture<'a, Option<Bytes>> {
         Box::pin(async move {
+            self.compression.require(Op::Get)?;
             let Some(key) = key.raw_blake3() else {
                 return Ok(None);
             };
@@ -552,6 +647,7 @@ impl AsyncGet for KvCas {
 
     fn aget_unchecked<'a>(&'a self, key: &'a Cid) -> CasFuture<'a, Option<Bytes>> {
         Box::pin(async move {
+            self.compression.require(Op::Get)?;
             let Some(key) = key.raw_blake3() else {
                 return Ok(None);
             };
@@ -611,6 +707,7 @@ impl AsyncPut for KvCas {
 
 impl Cas for KvCas {
     fn has(&self, key: &Cid) -> Result<bool, Error> {
+        self.compression.require(Op::Get)?;
         key.raw_blake3().map_or(Ok(false), |key| {
             let key = self.key(&key);
             self.kv.exists(key.as_bytes()).map_err(backend)
@@ -619,6 +716,7 @@ impl Cas for KvCas {
 
     /// The name, key prefix, backend info, and any compression settings.
     fn info(&self) -> Result<Value, Error> {
+        self.compression.require(Op::Get)?;
         let name = Value::String("kv".into());
         let prefix = Value::String(self.prefix.as_str().into());
         let kv = self.kv.info().map_err(backend)?;
@@ -631,7 +729,7 @@ impl Cas for KvCas {
                 ("compression", Value::String("zstd".into())),
                 ("level", Value::Integer((*level).into())),
             ]),
-            Some(Codec::Zlib { level }) => map([
+            Some(Codec::Deflate { level }) => map([
                 ("name", name),
                 ("prefix", prefix),
                 ("kv", kv),
@@ -645,10 +743,18 @@ impl Cas for KvCas {
                 ("compression", Value::String("gzip".into())),
                 ("level", Value::Integer((*level).into())),
             ]),
+            Some(Codec::Brotli { level }) => map([
+                ("name", name),
+                ("prefix", prefix),
+                ("kv", kv),
+                ("compression", Value::String("br".into())),
+                ("level", Value::Integer((*level).into())),
+            ]),
         })
     }
 
     fn stats(&self) -> Result<Value, Error> {
+        self.compression.require(Op::Get)?;
         self.kv.stats().map_err(backend)
     }
 
@@ -684,6 +790,7 @@ impl Cas for KvCas {
     }
 
     fn get_to(&self, key: &Cid, writer: &mut dyn Write) -> Result<Option<u64>, Error> {
+        self.compression.require(Op::Get)?;
         let Some(cid) = key.raw_blake3() else {
             return Ok(None);
         };

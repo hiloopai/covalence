@@ -193,11 +193,20 @@ fn ci_builds_one_wheel_and_tests_an_isolated_install() {
     assert_eq!(
         calls.lines().collect::<Vec<_>>(),
         [
-            "cargo", "cargo", "python3", "cargo", "cargo", "cargo", "maturin", "cargo", "python3",
-            "python", "python"
+            "cargo", "cargo", "python3", "cargo", "cargo", "cargo", "maturin", "cargo", "cargo",
+            "cargo", "cargo", "cargo", "python3", "python", "python"
         ]
     );
     let args = fixture.args();
+    assert_eq!(
+        args.iter()
+            .filter(|arg| *arg == "--no-default-features")
+            .count(),
+        4
+    );
+    for codec in ["zstd", "deflate", "brotli"] {
+        assert!(args.windows(2).any(|pair| pair == ["--features", codec]));
+    }
     assert_eq!(args.iter().filter(|arg| *arg == "--isolated").count(), 1);
     assert_eq!(args.iter().filter(|arg| *arg == "-I").count(), 4);
     assert!(!args.iter().any(|arg| arg == "--clear"));
