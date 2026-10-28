@@ -41,7 +41,7 @@ in CI.
 | --- | --- |
 | `glu build [--release]` | Build all project artifacts |
 | `glu test` | Run all project tests |
-| `glu check` | Check formatting and run Clippy |
+| `glu check` | Check the changelog format, formatting and Clippy |
 | `glu fmt` | Format Rust sources |
 | `glu doc` | Build the Rust documentation, denying rustdoc warnings |
 | `glu package` | Package and verify the crates for crates.io, without uploading |
@@ -51,6 +51,13 @@ in CI.
 Cargo owns Rust compilation and caching. `bin/glu` compiles only the Rust
 dispatcher and its dependencies on launch. `glu build` builds the Rust workspace
 and the Python wheel.
+
+`glu check` (also run by `glu ci`) checks the changelog's
+[Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/) conventions:
+release headings, dates, order, change categories and release/comparison links.
+For a quick check, run `python3 -I -B tools/glu/check_changelog.py`.
+The check runs offline; human review still needs to verify release coverage,
+accuracy and the significance of each entry.
 
 ## Layout
 
