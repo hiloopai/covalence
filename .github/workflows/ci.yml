@@ -10,6 +10,8 @@ permissions:
   contents: read
 
 jobs:
+  lake:
+    uses: ./.github/workflows/ci-lake.yml
   check:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

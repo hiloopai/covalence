@@ -1,0 +1,36 @@
+name: Release Lake cache
+
+# Thomas owns this distribution job. Retire it with cov-lake-cache when Lake
+# supplies the recorded-build publication and bounded S3 transfers itself.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'hiloopai/covalence' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci-lake.yml
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lake-cache-linux
+          path: dist
+      - name: Publish the tested revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "lake-cache-$GITHUB_SHA" --target "$GITHUB_SHA" \
+            --title "Lake cache $GITHUB_SHA" --prerelease \
+            --notes 'Linux x86-64 binary, tested with Lean nightly-2026-10-30. Consumers must pin the revision and archive SHA-256.' \
+            dist/cov-lake-cache-x86_64-unknown-linux-gnu.tar.gz dist/SHA256SUMS

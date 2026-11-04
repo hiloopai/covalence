@@ -27,9 +27,11 @@
 //! ```
 #![deny(missing_docs)]
 
+mod list;
 mod read;
 mod write;
 
+pub use list::{ListPage, ObjectInfo};
 pub use write::UploadPlan;
 use write::Write;
 
@@ -69,6 +71,18 @@ use rusty_s3::{Bucket, BucketError, UrlStyle};
 #[snafu(crate_root(covalence_lib_error::snafu))]
 #[non_exhaustive]
 pub enum Error {
+    /// An object listing is not valid XML in the S3 listing schema.
+    #[snafu(display("invalid S3 object listing: {source}"))]
+    ListingXml {
+        /// The XML decoder's error.
+        source: instant_xml::Error,
+    },
+    /// An object listing violates its namespace, encoding or pagination contract.
+    #[snafu(display("invalid S3 object listing: {reason}"))]
+    Listing {
+        /// The violated contract.
+        reason: &'static str,
+    },
     /// An upload exceeds an S3 limit or the platform's allocation limit.
     #[snafu(display("invalid upload {field} {value}: expected {minimum}..={maximum}"))]
     UploadLimit {

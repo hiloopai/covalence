@@ -267,6 +267,74 @@ fn locations() {
 }
 
 #[test]
+fn listing_is_paginated_signed_and_relative() {
+    let root = tempfile::tempdir().unwrap();
+    let server = serve(root.path());
+    let store = kv(&server.endpoint, "s3://test/p", SECRET);
+    // Populate files directly so the test measures listing, not 1,001 PUTs.
+    fs::create_dir_all(root.path().join("test/p/a")).unwrap();
+    for i in 0..1001 {
+        fs::write(root.path().join(format!("test/p/a/{i:04}")), b"data").unwrap();
+    }
+    store
+        .put("a/snow ☃%+".as_bytes(), Bytes::from_static(b"unicode"))
+        .unwrap();
+    store
+        .put(b"other", Bytes::from_static(b"outside prefix"))
+        .unwrap();
+    let first = store.list("a/", None).unwrap();
+    assert_eq!(first.objects.len(), 1000);
+    let second = store.list("a/", first.next.as_deref()).unwrap();
+    assert!(second.next.is_none());
+    assert_eq!(second.objects.len(), 2);
+    let all = first
+        .objects
+        .into_iter()
+        .chain(second.objects)
+        .collect::<Vec<_>>();
+    assert!(all.iter().all(|o| o.key.starts_with("a/")));
+    assert!(all.iter().any(|o| o.key == "a/snow ☃%+" && o.size == 7));
+    assert!(
+        kv(&server.endpoint, "s3://test/p", "wrong")
+            .list("a/", None)
+            .is_err()
+    );
+    assert!(
+        server
+            .answered
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.contains("continuation-token"))
+    );
+}
+
+#[test]
+fn incomplete_or_wrong_namespace_listings_fail() {
+    for body in [
+        "<Prefix>p/a/</Prefix>",
+        "<Prefix>p/a/</Prefix><IsTruncated>true</IsTruncated>",
+        "<Prefix>p/a/</Prefix><IsTruncated>false</IsTruncated><NextContinuationToken>x</NextContinuationToken>",
+        "<Prefix>elsewhere</Prefix><IsTruncated>false</IsTruncated>",
+        "<Prefix>p/a/</Prefix><IsTruncated>false</IsTruncated><Contents><Key>p/b/escape</Key><Size>1</Size></Contents>",
+        "<Prefix>p/a/</Prefix><IsTruncated>false</IsTruncated><Contents><Key>p/a/key</Key><Size>-1</Size></Contents>",
+        "<Prefix>p/a/</Prefix><IsTruncated>true</IsTruncated><NextContinuationToken>old</NextContinuationToken>",
+    ] {
+        let xml = format!(
+            "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{body}</ListBucketResult>"
+        );
+        let (endpoint, server) = fake(vec![response("200 OK", &xml)]);
+        assert!(
+            kv(&endpoint, "s3://test/p", SECRET)
+                .list("a/", Some("old"))
+                .is_err(),
+            "accepted {body}"
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+}
+
+#[test]
 fn s3() {
     let root = tempfile::tempdir().unwrap();
     let server = serve(root.path());
