@@ -155,8 +155,95 @@ impl Fixture {
 fn oleans(root: &Path) -> Vec<Vec<u8>> {
     ["A", "B"]
         .into_iter()
-        .map(|name| fs::read(root.join(format!(".lake/build/lib/lean/Demo/{name}.olean"))).unwrap())
+        .flat_map(|name| {
+            ["olean", "olean.server", "olean.private"].map(|extension| {
+                fs::read(root.join(format!(".lake/build/lib/lean/Demo/{name}.{extension}")))
+                    .unwrap()
+            })
+        })
         .collect()
+}
+
+#[test]
+fn embedded_nul_strings_survive_publication_and_native_restore() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("Demo/A.lean"),
+        "module\npublic def withNul : String := \"a\\x00b\"\n",
+    )
+    .unwrap();
+    fixture.commit();
+    fixture.build();
+    let expected = oleans(&fixture.root);
+    fixture.publish();
+    fixture.reset_local();
+    checked(&mut fixture.cli("get"));
+    checked(fixture.lake().args(["build", "--wfail", "Demo"]));
+    assert_eq!(oleans(&fixture.root), expected);
+    fs::write(
+        fixture.root.join("Check.lean"),
+        "import Demo.A\n#eval withNul.toList.map Char.toNat\n",
+    )
+    .unwrap();
+    let result = checked(fixture.lake().args(["env", "lean", "Check.lean"]));
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap().trim(),
+        "[97, 0, 98]"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn changing_the_archive_tool_invalidates_receipts_and_remote_scope() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    fixture.build();
+    fixture.publish();
+    let prefix = checked(fixture.lake().args(["env", "lean", "--print-prefix"]));
+    let prefix = PathBuf::from(String::from_utf8(prefix.stdout).unwrap().trim());
+    let overlay = fixture.temporary.path().join("toolchain");
+    fs::create_dir_all(overlay.join("bin")).unwrap();
+    for entry in fs::read_dir(&prefix).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() != "bin" {
+            symlink(entry.path(), overlay.join(entry.file_name())).unwrap();
+        }
+    }
+    for entry in fs::read_dir(prefix.join("bin")).unwrap() {
+        let entry = entry.unwrap();
+        let destination = overlay.join("bin").join(entry.file_name());
+        if entry.file_name() == "leantar" {
+            fs::copy(entry.path(), &destination).unwrap();
+            // ELF permits trailing data: change identity without changing behavior.
+            let mut bytes = fs::read(&destination).unwrap();
+            bytes.extend_from_slice(b"archive-tool-identity-test");
+            fs::write(destination, bytes).unwrap();
+        } else if matches!(entry.file_name().to_str(), Some("lean" | "lake")) {
+            // Lake prefers the toolchain beside its resolved executable.
+            fs::copy(entry.path(), destination).unwrap();
+        } else {
+            symlink(entry.path(), destination).unwrap();
+        }
+    }
+    let writes = fixture.server.writes.lock().unwrap().len();
+    let result = fixture
+        .cli("put")
+        .env("LAKE", overlay.join("bin/lake"))
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("receipt does not match"));
+    assert_eq!(fixture.server.writes.lock().unwrap().len(), writes);
+    fixture.reset_local();
+    let result = checked(fixture.cli("get").env("LAKE", overlay.join("bin/lake")));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("no published build"));
+    assert!(
+        !fixture
+            .root
+            .join(".lake/build/lib/lean/Demo/A.olean")
+            .exists()
+    );
 }
 
 #[test]

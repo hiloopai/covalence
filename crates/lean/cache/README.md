@@ -38,7 +38,7 @@ profiles or machine roles). Do not pass credentials on the command line.
 GitHub publication requires a main push or manual main run in the named
 repository. Bucket permissions remain the actual write authorization boundary.
 
-Scopes separate repositories, packages, platform, toolchain, wire format and dependency
+Scopes separate repositories, packages, platform, toolchain, archive executable, wire format and dependency
 pins. Lake hashes are 64-bit artifact IDs, not Covalence CIDs. Objects therefore
 use the raw key-value store. Size inventories detect missing and truncated
 objects; they are not remote content audits. Readers check content hashes.
@@ -71,6 +71,19 @@ Ubuntu 24.04 or newer. Source installs can use
 GitHub workflows can use the `.github/actions/lake-cache` composite action
 pinned to a full public commit, with `revision` and `sha256` inputs. It verifies
 the archive even when restored from disk and puts `cov-lake-cache` on `PATH`.
+It also installs the bundled `leantar` in the selected Lean toolchain, which
+must already be installed and writable. The archive records the upstream
+commit in `LEANTAR-REVISION` and includes its license notices. The pinned codec
+supports embedded NUL strings and scalar arrays that older Lean distributions
+cannot safely archive. It changes no Lean sources or kernel checks.
+
+The cache scope hashes the actual `leantar` executable: readers with a different
+archive tool get a cache miss, and replacing the tool invalidates old publication
+receipts. Existing snapshots remain in their old scopes. Source installations
+must supply a compatible archiver themselves. Thomas owns the bundled upstream
+pin; remove it once the supported Lean distribution includes
+[leangz#12](https://github.com/digama0/leangz/pull/12) and
+[leangz#15](https://github.com/digama0/leangz/pull/15).
 
 Run `cargo test -p covalence-lean-cache --features lake-tests` with the pinned
 Lean release on `PATH` for the signed S3 server and real Lake integration

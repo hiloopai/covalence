@@ -155,6 +155,20 @@ impl Project {
             )?
             .as_bytes(),
         );
+        let sysroot = output(
+            "Lean",
+            self.lake()
+                .arg("--dir")
+                .arg(empty.path())
+                .args(["env", "lean", "--print-prefix"]),
+        )?;
+        // Archive opcodes can change independently of Lean's version string.
+        hash.update(b"leantar\0");
+        hash.update(digest(
+            &Path::new(&sysroot)
+                .join("bin/leantar")
+                .with_extension(env::consts::EXE_EXTENSION),
+        )?);
         let revision = self.git(&["rev-parse", "HEAD"])?;
         if !mapping::hex(&revision, 40) {
             return Err(invalid("expected a 40-digit Git revision"));

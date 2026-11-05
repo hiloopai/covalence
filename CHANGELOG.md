@@ -17,12 +17,22 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Fixed
 
+- Lake cache releases include an upstream archive codec that supports embedded
+  NUL strings and scalar arrays.
+
 - Multipart uploads work on Cloudflare R2 as well as AWS S3. Part requests
   sign their SHA-256 payload hash without requiring optional S3 composite
   checksum support.
 
 - S3 part concurrency no longer shrinks the shared idle connection pool.
   `S3Kv::max_idle_connections` configures connection reuse independently.
+
+### Changed
+
+- **Breaking:** Lake cache scopes now include the archive executable's SHA-256.
+  Readers with different archive tools cannot select the same published mappings.
+  Publish a fresh snapshot after upgrading; existing snapshots remain in their
+  old scopes.
 
 ### Added
 

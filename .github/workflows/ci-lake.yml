@@ -26,6 +26,20 @@ jobs:
           mkdir lean
           tar --zstd -xf lean.tar.zst --strip-components=1 -C lean
           echo "$RUNNER_TEMP/lean/bin" >> "$GITHUB_PATH"
+      # Thomas owns this pin until the tested Lean distribution includes
+      # leangz#12 and #15 (scalar arrays and embedded NUL strings).
+      - name: Read the upstream archive codec
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: digama0/leangz
+          ref: 33570f263222fe8aa4e071f4a30b1b69bfc0f4e3
+          path: .lake-archiver
+          persist-credentials: false
+      - name: Build and test the pinned archive codec
+        run: |
+          cargo test --locked --manifest-path .lake-archiver/Cargo.toml
+          cargo build --locked --release --manifest-path .lake-archiver/Cargo.toml --bin leantar
+          install -m 755 .lake-archiver/target/release/leantar "$RUNNER_TEMP/lean/bin/leantar"
       - name: Check and test the native Lake protocol
         run: |
           cargo clippy --locked -p covalence-lean-cache --all-targets --features lake-tests -- -D warnings
@@ -41,10 +55,17 @@ jobs:
           cargo about generate --locked --manifest-path crates/lean/cache/Cargo.toml \
             -c crates/python/about.toml -o dist/THIRD-PARTY-LICENSES.md \
             crates/lean/cache/licenses.md.hbs
+          cargo about generate --locked --manifest-path .lake-archiver/Cargo.toml \
+            -c crates/python/about.toml -o dist/LEANTAR-THIRD-PARTY-LICENSES.md \
+            crates/lean/cache/licenses.md.hbs
           cp target/release/cov-lake-cache LICENSE-* dist/
-          strip dist/cov-lake-cache
+          cp .lake-archiver/target/release/leantar dist/
+          cp .lake-archiver/LICENSE dist/LEANTAR-LICENSE
+          git -C .lake-archiver rev-parse HEAD > dist/LEANTAR-REVISION
+          strip dist/cov-lake-cache dist/leantar
           cd dist
-          tar -czf cov-lake-cache-x86_64-unknown-linux-gnu.tar.gz cov-lake-cache LICENSE-* THIRD-PARTY-LICENSES.md
+          tar -czf cov-lake-cache-x86_64-unknown-linux-gnu.tar.gz cov-lake-cache leantar \
+            LICENSE-* THIRD-PARTY-LICENSES.md LEANTAR-*
           sha256sum cov-lake-cache-x86_64-unknown-linux-gnu.tar.gz > SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
