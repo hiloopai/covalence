@@ -4,7 +4,7 @@ use std::{
     net::TcpListener,
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc, Barrier, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -65,6 +65,8 @@ fn kv(endpoint: &str, location: &str, secret: &str) -> S3Kv {
 /// An S3 server on its own thread, stopped and joined when dropped.
 struct Server {
     endpoint: String,
+    /// TCP connections accepted (reused requests do not increase this).
+    accepted: Arc<AtomicUsize>,
     stop: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
     /// Each request as `METHOD URI RANGE`, in the order they were answered.
@@ -107,6 +109,8 @@ fn serve_with(root: &Path, hook: impl Fn(&str) -> Act + Send + Sync + 'static) -
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
     let (stop, stopped) = oneshot::channel();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
     let answered = Arc::new(Mutex::new(Vec::<String>::new()));
     let peak = Arc::new(AtomicUsize::new(0));
     let live = Arc::new(AtomicUsize::new(0));
@@ -163,6 +167,7 @@ fn serve_with(root: &Path, hook: impl Fn(&str) -> Act + Send + Sync + 'static) -
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, Ordering::Relaxed);
                 let service = hyper::service::service_fn(handle.clone());
                 tokio::spawn(async move {
                     let _ = Builder::new(TokioExecutor::new())
@@ -175,6 +180,7 @@ fn serve_with(root: &Path, hook: impl Fn(&str) -> Act + Send + Sync + 'static) -
     });
     Server {
         endpoint,
+        accepted,
         stop: Some(stop),
         thread: Some(thread),
         answered,
@@ -1480,4 +1486,30 @@ fn failed_part_aborts_after_parts_in_flight() {
     assert!(abort > last_part, "{answered:#?}");
     drop(answered);
     kv.put(b"after-failure", "x".into()).unwrap();
+}
+
+#[test]
+fn part_parallelism_does_not_shrink_a_shared_connection_pool() {
+    let root = tempfile::tempdir().unwrap();
+    let server = serve(root.path());
+    let store = kv(&server.endpoint, "s3://test", SECRET).concurrency(2);
+    store.put(b"data", Bytes::from_static(b"value")).unwrap();
+    let barrier = Barrier::new(8);
+    thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                for _ in 0..20 {
+                    barrier.wait();
+                    assert_eq!(store.get(b"data").unwrap().unwrap(), "value");
+                    // All responses are consumed before the next wave starts.
+                    barrier.wait();
+                }
+            });
+        }
+    });
+    let accepted = server.accepted.load(Ordering::Relaxed);
+    assert!(
+        accepted <= 8,
+        "opened {accepted} connections for eight shared readers"
+    );
 }

@@ -603,9 +603,21 @@ impl S3Kv {
 
     /// Move up to `parts` parts or ranges of a value at once, holding about
     /// that many parts in memory. 1 moves them one at a time, in order.
+    ///
+    /// This does not change the shared connection pool. Configure that with
+    /// [`Self::max_idle_connections`] when many values use this store at once.
     pub fn concurrency(mut self, parts: usize) -> Self {
         self.concurrency = parts.max(1);
-        self.agent = agent(self.concurrency);
+        self
+    }
+
+    /// Retain up to `connections` idle HTTP connections to the endpoint.
+    ///
+    /// The default is 16, independently of per-value part concurrency. Zero
+    /// disables idle reuse. This does not limit active requests or reserve
+    /// upload buffers. Calling it replaces any existing pool.
+    pub fn max_idle_connections(mut self, connections: usize) -> Self {
+        self.agent = agent(connections);
         self
     }
 
@@ -816,7 +828,7 @@ impl S3Kv {
     }
 }
 
-/// An agent keeping a connection for each of `concurrency` requests.
+/// An agent keeping up to `concurrency` idle connections across shared calls.
 fn agent(concurrency: usize) -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)

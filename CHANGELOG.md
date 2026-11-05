@@ -15,6 +15,11 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+### Fixed
+
+- S3 part concurrency no longer shrinks the shared idle connection pool.
+  `S3Kv::max_idle_connections` configures connection reuse independently.
+
 ### Added
 
 - `cov-lake-cache`, a Rust command to record successful Lake builds and share
