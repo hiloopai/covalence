@@ -153,7 +153,16 @@ fn serve_with(root: &Path, hook: impl Fn(&str) -> Act + Send + Sync + 'static) -
                     .unwrap()
                     .parse()
                     .unwrap();
-                *request.body_mut() = vec![0; len].into();
+                // Drain the socket before replacing the body so the client receives
+                // the checksum error, not a race with a closed upload connection.
+                let mut bytes = request
+                    .body_mut()
+                    .store_all_limited(len)
+                    .await
+                    .unwrap()
+                    .to_vec();
+                bytes[0] ^= 1;
+                *request.body_mut() = bytes.into();
             }
             let mut response = service.call(request).await;
             live.fetch_sub(1, Ordering::SeqCst);
