@@ -419,6 +419,100 @@ fn unsuccessful_or_stale_receipts_cannot_publish() {
 }
 
 #[test]
+fn package_selection_records_only_the_dependency_closure_of_the_build_targets() {
+    let fixture = Fixture::new();
+    let dependency = fixture.root.join("Dep");
+    fs::create_dir(&dependency).unwrap();
+    fs::write(
+        dependency.join("lakefile.toml"),
+        "name = \"dep\"\ndefaultTargets = [\"Unused\"]\n[[lean_lib]]\nname = \"Good\"\n[[lean_lib]]\nname = \"Unused\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dependency.join("Good.lean"),
+        "module\npublic theorem good : True := trivial\n",
+    )
+    .unwrap();
+    fs::write(
+        dependency.join("Unused.lean"),
+        "module\npublic theorem impossible : False := by trivial\n",
+    )
+    .unwrap();
+    let config = fixture.root.join("lakefile.toml");
+    fs::write(
+        &config,
+        format!(
+            "{}\n[[require]]\nname = \"dep\"\npath = \"Dep\"\n",
+            fs::read_to_string(&config).unwrap()
+        ),
+    )
+    .unwrap();
+    checked(fixture.lake().arg("update"));
+    fixture.commit();
+
+    // No import needs this package yet; an empty snapshot proves nothing.
+    checked(fixture.cli("build").args(["--package", "dep"]));
+    checked(fixture.cli("put").args(["--package", "dep"]));
+    let manifest = fixture.root.join("build/lake-cache/dep/artifacts.json");
+    let empty: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(empty["artifacts"], serde_json::json!({}));
+    assert!(
+        fixture
+            .server
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|key| !key.contains("/a/"))
+    );
+    checked(fixture.cli("get").args(["--package", "dep"]));
+
+    fs::write(
+        fixture.root.join("Demo/A.lean"),
+        "module\npublic import Good\npublic theorem fromDependency : True := good\n",
+    )
+    .unwrap();
+    fixture.commit();
+    checked(fixture.cli("build").args(["--package", "dep"]));
+    checked(fixture.cli("put").args(["--package", "dep"]));
+    let used: Value = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+    assert!(!used["artifacts"].as_object().unwrap().is_empty());
+    assert!(
+        !dependency
+            .join(".lake/build/lib/lean/Unused.olean")
+            .exists()
+    );
+
+    // Importing the invalid proof must fail even after a successful snapshot.
+    let writes = fixture.server.writes.lock().unwrap().len();
+    fs::write(
+        fixture.root.join("Demo/A.lean"),
+        "module\npublic import Unused\n",
+    )
+    .unwrap();
+    fixture.commit();
+    assert!(
+        !fixture
+            .cli("build")
+            .args(["--package", "dep"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        !fixture
+            .cli("put")
+            .args(["--package", "dep"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(fixture.server.writes.lock().unwrap().len(), writes);
+}
+
+#[test]
 fn transfer_or_inventory_failure_never_publishes_a_pointer() {
     let fixture = Fixture::new();
     fixture.build();

@@ -59,7 +59,11 @@ the next successful preparation replaces them. `preparation.json` reports their
 byte count and compression time separately from `publication.json`.
 
 `--root`, `--package` and `--record` select a project, dependency package and
-record directory. `LAKE` selects the Lake executable. Installation should use
+record directory. `--package` changes which outputs are recorded, preserving
+Lake's default build targets unless targets follow `--`. To build a dependency's
+own defaults, pass `-- @dependency` explicitly. Packages outside the selected
+targets' dependency closure produce an empty snapshot: they have no cached checks.
+`LAKE` selects the Lake executable. Installation should use
 a pinned prebuilt binary; compiling the storage SDK in every proof CI run
 would defeat the setup-time goal.
 
