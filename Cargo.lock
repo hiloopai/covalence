@@ -909,6 +909,8 @@ dependencies = [
  "data-encoding",
  "hyper",
  "hyper-util",
+ "instant-xml",
+ "percent-encoding",
  "pollster",
  "rusty-s3",
  "s3s",
@@ -927,6 +929,28 @@ dependencies = [
  "covalence-lib-dasl",
  "covalence-lib-data",
  "covalence-lib-error",
+]
+
+[[package]]
+name = "covalence-lean-cache"
+version = "0.1.0-dev.7"
+dependencies = [
+ "covalence-kv-s3",
+ "covalence-kv-trait",
+ "covalence-lib-cli",
+ "covalence-lib-data",
+ "covalence-lib-error",
+ "covalence-lib-serde",
+ "data-encoding",
+ "hyper",
+ "hyper-util",
+ "s3s",
+ "s3s-fs",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "zstd",
 ]
 
 [[package]]

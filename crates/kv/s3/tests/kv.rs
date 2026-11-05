@@ -4,7 +4,7 @@ use std::{
     net::TcpListener,
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc, Barrier, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -65,6 +65,8 @@ fn kv(endpoint: &str, location: &str, secret: &str) -> S3Kv {
 /// An S3 server on its own thread, stopped and joined when dropped.
 struct Server {
     endpoint: String,
+    /// TCP connections accepted (reused requests do not increase this).
+    accepted: Arc<AtomicUsize>,
     stop: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
     /// Each request as `METHOD URI RANGE`, in the order they were answered.
@@ -107,6 +109,8 @@ fn serve_with(root: &Path, hook: impl Fn(&str) -> Act + Send + Sync + 'static) -
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
     let (stop, stopped) = oneshot::channel();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
     let answered = Arc::new(Mutex::new(Vec::<String>::new()));
     let peak = Arc::new(AtomicUsize::new(0));
     let live = Arc::new(AtomicUsize::new(0));
@@ -163,6 +167,7 @@ fn serve_with(root: &Path, hook: impl Fn(&str) -> Act + Send + Sync + 'static) -
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, Ordering::Relaxed);
                 let service = hyper::service::service_fn(handle.clone());
                 tokio::spawn(async move {
                     let _ = Builder::new(TokioExecutor::new())
@@ -175,6 +180,7 @@ fn serve_with(root: &Path, hook: impl Fn(&str) -> Act + Send + Sync + 'static) -
     });
     Server {
         endpoint,
+        accepted,
         stop: Some(stop),
         thread: Some(thread),
         answered,
@@ -263,6 +269,74 @@ fn locations() {
     ] {
         let error = s.parse::<S3Location>().unwrap_err();
         assert!(matches!(error, Error::Location { .. }), "{s}: {error}");
+    }
+}
+
+#[test]
+fn listing_is_paginated_signed_and_relative() {
+    let root = tempfile::tempdir().unwrap();
+    let server = serve(root.path());
+    let store = kv(&server.endpoint, "s3://test/p", SECRET);
+    // Populate files directly so the test measures listing, not 1,001 PUTs.
+    fs::create_dir_all(root.path().join("test/p/a")).unwrap();
+    for i in 0..1001 {
+        fs::write(root.path().join(format!("test/p/a/{i:04}")), b"data").unwrap();
+    }
+    store
+        .put("a/snow ☃%+".as_bytes(), Bytes::from_static(b"unicode"))
+        .unwrap();
+    store
+        .put(b"other", Bytes::from_static(b"outside prefix"))
+        .unwrap();
+    let first = store.list("a/", None).unwrap();
+    assert_eq!(first.objects.len(), 1000);
+    let second = store.list("a/", first.next.as_deref()).unwrap();
+    assert!(second.next.is_none());
+    assert_eq!(second.objects.len(), 2);
+    let all = first
+        .objects
+        .into_iter()
+        .chain(second.objects)
+        .collect::<Vec<_>>();
+    assert!(all.iter().all(|o| o.key.starts_with("a/")));
+    assert!(all.iter().any(|o| o.key == "a/snow ☃%+" && o.size == 7));
+    assert!(
+        kv(&server.endpoint, "s3://test/p", "wrong")
+            .list("a/", None)
+            .is_err()
+    );
+    assert!(
+        server
+            .answered
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.contains("continuation-token"))
+    );
+}
+
+#[test]
+fn incomplete_or_wrong_namespace_listings_fail() {
+    for body in [
+        "<Prefix>p/a/</Prefix>",
+        "<Prefix>p/a/</Prefix><IsTruncated>true</IsTruncated>",
+        "<Prefix>p/a/</Prefix><IsTruncated>false</IsTruncated><NextContinuationToken>x</NextContinuationToken>",
+        "<Prefix>elsewhere</Prefix><IsTruncated>false</IsTruncated>",
+        "<Prefix>p/a/</Prefix><IsTruncated>false</IsTruncated><Contents><Key>p/b/escape</Key><Size>1</Size></Contents>",
+        "<Prefix>p/a/</Prefix><IsTruncated>false</IsTruncated><Contents><Key>p/a/key</Key><Size>-1</Size></Contents>",
+        "<Prefix>p/a/</Prefix><IsTruncated>true</IsTruncated><NextContinuationToken>old</NextContinuationToken>",
+    ] {
+        let xml = format!(
+            "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{body}</ListBucketResult>"
+        );
+        let (endpoint, server) = fake(vec![response("200 OK", &xml)]);
+        assert!(
+            kv(&endpoint, "s3://test/p", SECRET)
+                .list("a/", Some("old"))
+                .is_err(),
+            "accepted {body}"
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 }
 
@@ -1412,4 +1486,30 @@ fn failed_part_aborts_after_parts_in_flight() {
     assert!(abort > last_part, "{answered:#?}");
     drop(answered);
     kv.put(b"after-failure", "x".into()).unwrap();
+}
+
+#[test]
+fn part_parallelism_does_not_shrink_a_shared_connection_pool() {
+    let root = tempfile::tempdir().unwrap();
+    let server = serve(root.path());
+    let store = kv(&server.endpoint, "s3://test", SECRET).concurrency(2);
+    store.put(b"data", Bytes::from_static(b"value")).unwrap();
+    let barrier = Barrier::new(8);
+    thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                for _ in 0..20 {
+                    barrier.wait();
+                    assert_eq!(store.get(b"data").unwrap().unwrap(), "value");
+                    // All responses are consumed before the next wave starts.
+                    barrier.wait();
+                }
+            });
+        }
+    });
+    let accepted = server.accepted.load(Ordering::Relaxed);
+    assert!(
+        accepted <= 8,
+        "opened {accepted} connections for eight shared readers"
+    );
 }

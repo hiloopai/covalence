@@ -10,9 +10,15 @@ permissions:
   contents: read
 
 jobs:
+  lake:
+    uses: ./.github/workflows/ci-lake.yml
   check:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      # Codec matrices share dependencies; full debug types exhaust runner disk.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: cachix/install-nix-action@b85815f71a6de0ddee80b8a80a98d43f4bcc66c7 # v31

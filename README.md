@@ -100,6 +100,8 @@ Internal facades, which re-export other crates for the workspace's own use:
 
 Tools:
 
+- [`crates/lean/cache`](crates/lean/cache/README.md): record successful Lake
+  builds and share artifacts through S3, preserving Lake's hash validation.
 - `tools/glu`: Rust development command dispatcher.
 - `.context/`: local design notes, ignored by Git.
 

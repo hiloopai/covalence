@@ -19,6 +19,8 @@ covalence-kv-trait.workspace = true
 covalence-lib-data.workspace = true
 covalence-lib-error.workspace = true
 data-encoding = "2.11.1"
+instant-xml = "0.7.6"
+percent-encoding = "2"
 rusty-s3 = "0.10"
 sha2.workspace = true
 tokio = { version = "1", features = ["rt"] }

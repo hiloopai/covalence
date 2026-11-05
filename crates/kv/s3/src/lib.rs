@@ -27,9 +27,11 @@
 //! ```
 #![deny(missing_docs)]
 
+mod list;
 mod read;
 mod write;
 
+pub use list::{ListPage, ObjectInfo};
 pub use write::UploadPlan;
 use write::Write;
 
@@ -69,6 +71,18 @@ use rusty_s3::{Bucket, BucketError, UrlStyle};
 #[snafu(crate_root(covalence_lib_error::snafu))]
 #[non_exhaustive]
 pub enum Error {
+    /// An object listing is not valid XML in the S3 listing schema.
+    #[snafu(display("invalid S3 object listing: {source}"))]
+    ListingXml {
+        /// The XML decoder's error.
+        source: instant_xml::Error,
+    },
+    /// An object listing violates its namespace, encoding or pagination contract.
+    #[snafu(display("invalid S3 object listing: {reason}"))]
+    Listing {
+        /// The violated contract.
+        reason: &'static str,
+    },
     /// An upload exceeds an S3 limit or the platform's allocation limit.
     #[snafu(display("invalid upload {field} {value}: expected {minimum}..={maximum}"))]
     UploadLimit {
@@ -589,9 +603,21 @@ impl S3Kv {
 
     /// Move up to `parts` parts or ranges of a value at once, holding about
     /// that many parts in memory. 1 moves them one at a time, in order.
+    ///
+    /// This does not change the shared connection pool. Configure that with
+    /// [`Self::max_idle_connections`] when many values use this store at once.
     pub fn concurrency(mut self, parts: usize) -> Self {
         self.concurrency = parts.max(1);
-        self.agent = agent(self.concurrency);
+        self
+    }
+
+    /// Retain up to `connections` idle HTTP connections to the endpoint.
+    ///
+    /// The default is 16, independently of per-value part concurrency. Zero
+    /// disables idle reuse. This does not limit active requests or reserve
+    /// upload buffers. Calling it replaces any existing pool.
+    pub fn max_idle_connections(mut self, connections: usize) -> Self {
+        self.agent = agent(connections);
         self
     }
 
@@ -802,7 +828,7 @@ impl S3Kv {
     }
 }
 
-/// An agent keeping a connection for each of `concurrency` requests.
+/// An agent keeping up to `concurrency` idle connections across shared calls.
 fn agent(concurrency: usize) -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)

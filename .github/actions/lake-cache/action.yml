@@ -1,0 +1,43 @@
+name: Install the Lake cache command
+description: Install a pinned public Covalence binary without compiling Rust in proof CI.
+
+inputs:
+  revision:
+    description: Full public Covalence commit used by the lake-cache release.
+    required: true
+  sha256:
+    description: SHA-256 of the Linux x86-64 release archive.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install the verified binary
+      shell: bash
+      env:
+        CACHE_REVISION: ${{ inputs.revision }}
+        CACHE_SHA256: ${{ inputs.sha256 }}
+      run: |
+        set -euo pipefail
+        [[ "$CACHE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+        [[ "$CACHE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+        [[ "$(uname -s)-$(uname -m)" == Linux-x86_64 ]]
+        directory="$GITHUB_WORKSPACE/.lake/ci-tools/$CACHE_REVISION"
+        archive="$directory/cov-lake-cache.tar.gz"
+        mkdir -p "$directory"
+        if [ ! -f "$archive" ]; then
+          temporary=$(mktemp "$directory/.download-XXXXXXXX")
+          trap 'rm -f "$temporary"' EXIT
+          curl --fail --location --silent --show-error --proto '=https' \
+            --connect-timeout 10 --max-time 60 \
+            "https://github.com/hiloopai/covalence/releases/download/lake-cache-$CACHE_REVISION/cov-lake-cache-x86_64-unknown-linux-gnu.tar.gz" \
+            --output "$temporary"
+          echo "$CACHE_SHA256  $temporary" | sha256sum --check
+          mv "$temporary" "$archive"
+          trap - EXIT
+        fi
+        echo "$CACHE_SHA256  $archive" | sha256sum --check
+        # Validate the saved archive each time; a cached executable is not authority.
+        install_dir=$(mktemp -d "$RUNNER_TEMP/cov-lake-cache-XXXXXXXX")
+        tar -xzf "$archive" -C "$install_dir"
+        echo "$install_dir" >> "$GITHUB_PATH"

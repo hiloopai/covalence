@@ -15,8 +15,18 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+### Fixed
+
+- S3 part concurrency no longer shrinks the shared idle connection pool.
+  `S3Kv::max_idle_connections` configures connection reuse independently.
+
 ### Added
 
+- `cov-lake-cache`, a Rust command to record successful Lake builds and share
+  their artifacts through the S3 transport. Publication uploads only missing
+  or wrong-size objects and does not rebuild. Lake verifies restored hashes.
+- Paginated `S3Kv::list` inventories with bounded responses and validation of
+  object namespaces and continuation tokens.
 - Release notes and automated changelog format checks in `glu check` and CI.
 - Opt-in Zstandard, gzip, Brotli and HTTP `deflate` storage for Rust `KvCas`
   through `with_compression(Compression::zstd(level))`,
