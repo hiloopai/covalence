@@ -29,17 +29,16 @@ jobs:
       # Thomas owns this pin until the tested Lean distribution includes
       # leangz#12 and #15 (scalar arrays and embedded NUL strings).
       - name: Read the upstream archive codec
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          repository: digama0/leangz
-          ref: 33570f263222fe8aa4e071f4a30b1b69bfc0f4e3
-          path: .lake-archiver
-          persist-credentials: false
+        run: |
+          git init "$RUNNER_TEMP/lake-archiver"
+          git -C "$RUNNER_TEMP/lake-archiver" fetch --depth 1 \
+            https://github.com/digama0/leangz.git 33570f263222fe8aa4e071f4a30b1b69bfc0f4e3
+          git -C "$RUNNER_TEMP/lake-archiver" checkout --detach FETCH_HEAD
       - name: Build and test the pinned archive codec
         run: |
-          cargo test --locked --manifest-path .lake-archiver/Cargo.toml
-          cargo build --locked --release --manifest-path .lake-archiver/Cargo.toml --bin leantar
-          install -m 755 .lake-archiver/target/release/leantar "$RUNNER_TEMP/lean/bin/leantar"
+          cargo test --locked --manifest-path "$RUNNER_TEMP/lake-archiver/Cargo.toml"
+          cargo build --locked --release --manifest-path "$RUNNER_TEMP/lake-archiver/Cargo.toml" --bin leantar
+          install -m 755 "$RUNNER_TEMP/lake-archiver/target/release/leantar" "$RUNNER_TEMP/lean/bin/leantar"
       - name: Check and test the native Lake protocol
         run: |
           cargo clippy --locked -p covalence-lean-cache --all-targets --features lake-tests -- -D warnings
@@ -55,13 +54,13 @@ jobs:
           cargo about generate --locked --manifest-path crates/lean/cache/Cargo.toml \
             -c crates/python/about.toml -o dist/THIRD-PARTY-LICENSES.md \
             crates/lean/cache/licenses.md.hbs
-          cargo about generate --locked --manifest-path .lake-archiver/Cargo.toml \
+          cargo about generate --locked --manifest-path "$RUNNER_TEMP/lake-archiver/Cargo.toml" \
             -c crates/python/about.toml -o dist/LEANTAR-THIRD-PARTY-LICENSES.md \
             crates/lean/cache/licenses.md.hbs
           cp target/release/cov-lake-cache LICENSE-* dist/
-          cp .lake-archiver/target/release/leantar dist/
-          cp .lake-archiver/LICENSE dist/LEANTAR-LICENSE
-          git -C .lake-archiver rev-parse HEAD > dist/LEANTAR-REVISION
+          cp "$RUNNER_TEMP/lake-archiver/target/release/leantar" dist/
+          cp "$RUNNER_TEMP/lake-archiver/LICENSE" dist/LEANTAR-LICENSE
+          git -C "$RUNNER_TEMP/lake-archiver" rev-parse HEAD > dist/LEANTAR-REVISION
           strip dist/cov-lake-cache dist/leantar
           cd dist
           tar -czf cov-lake-cache-x86_64-unknown-linux-gnu.tar.gz cov-lake-cache leantar \
