@@ -902,6 +902,7 @@ version = "0.1.0-dev.7"
 dependencies = [
  "aws-config",
  "aws-credential-types",
+ "aws-sigv4",
  "aws-smithy-http-client",
  "covalence-kv-trait",
  "covalence-lib-data",

@@ -64,12 +64,6 @@ pub(crate) enum Write {
     New,
 }
 
-/// An uploaded part: its ETag and base64 SHA-256.
-struct Part {
-    etag: String,
-    checksum: String,
-}
-
 /// Whether a write answered with `status` stored: 200 did, and 412 to a new
 /// value means the key already holds one.
 fn stored(status: u16, body: &[u8], write: Write) -> Result<bool, Error> {
@@ -78,11 +72,6 @@ fn stored(status: u16, body: &[u8], write: Write) -> Result<bool, Error> {
         412 if write == Write::New => Ok(false),
         status => status_error(status, body),
     }
-}
-
-/// `text` escaped for an XML element.
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;").replace('<', "&lt;")
 }
 
 impl S3Kv {
@@ -245,18 +234,15 @@ impl S3Kv {
         stored(status, &body, write)
     }
 
-    /// Start a multipart upload of `object` with SHA-256 part checksums, and
-    /// return its ID.
+    /// Start a multipart upload of `object` and return its ID.
     fn create(&self, object: &str) -> Result<String, Error> {
-        const ALGORITHM: &str = "x-amz-checksum-algorithm";
         let credentials = self.credentials()?;
         let (status, body) = self.send(|| {
-            let mut action = self
+            let action = self
                 .bucket
                 .create_multipart_upload(Some(&credentials), object);
-            action.headers_mut().insert(ALGORITHM, "SHA256");
             let url = action.sign(EXPIRY);
-            let request = self.agent.post(url.as_str()).header(ALGORITHM, "SHA256");
+            let request = self.agent.post(url.as_str());
             body(request.send_empty()?, MAX_ERROR, Vec::new())
         })?;
         if status != 200 {
@@ -276,18 +262,21 @@ impl S3Kv {
         upload_id: &str,
         number: u16,
         bytes: &[u8],
-    ) -> Result<Part, Error> {
-        let checksum = BASE64.encode(&Sha256::digest(bytes));
+    ) -> Result<String, Error> {
+        let payload_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
         let credentials = self.credentials()?;
+        let url = self
+            .bucket
+            .upload_part(None, object, number, upload_id)
+            .sign(EXPIRY);
+        let signature = self.payload_signature(&url, &payload_hash, &credentials)?;
         let (status, (body, etag)) = self.send(|| {
-            let mut action = self
-                .bucket
-                .upload_part(Some(&credentials), object, number, upload_id);
-            action.headers_mut().insert(CHECKSUM, &checksum);
-            let url = action.sign(EXPIRY);
             let request = self.agent.put(url.as_str()).config();
             let request = request.timeout_global(Some(timeout(bytes.len() as u64)));
-            let request = request.build().header(CHECKSUM, &checksum);
+            let mut request = request.build();
+            for (name, value) in signature.headers() {
+                request = request.header(name, value);
+            }
             let response = request.send(bytes)?;
             let etag = response
                 .headers()
@@ -300,8 +289,7 @@ impl S3Kv {
         if status != 200 {
             return status_error(status, &body);
         }
-        let etag = etag.context(MissingFieldSnafu { field: "ETag" })?;
-        Ok(Part { etag, checksum })
+        etag.context(MissingFieldSnafu { field: "ETag" })
     }
 
     /// Complete upload `upload_id` from `parts`, as `write` says; whether it
@@ -311,27 +299,16 @@ impl S3Kv {
         &self,
         object: &str,
         upload_id: &str,
-        parts: &[Part],
+        parts: &[String],
         write: Write,
     ) -> Result<bool, Error> {
-        let mut xml = String::from("<CompleteMultipartUpload>");
-        for (number, part) in (1..).zip(parts) {
-            xml += &format!(
-                "<Part><ETag>{}</ETag><ChecksumSHA256>{}</ChecksumSHA256>\
-                 <PartNumber>{number}</PartNumber></Part>",
-                escape(&part.etag),
-                escape(&part.checksum),
-            );
-        }
-        xml += "</CompleteMultipartUpload>";
         let credentials = self.credentials()?;
         let (status, body) = self.send(|| {
-            // rusty-s3 writes a body without checksums, so only sign with it.
             let mut action = self.bucket.complete_multipart_upload(
                 Some(&credentials),
                 object,
                 upload_id,
-                std::iter::empty::<&str>(),
+                parts.iter().map(String::as_str),
             );
             if write == Write::New {
                 action.headers_mut().insert(IF_NONE_MATCH, "*");
@@ -344,7 +321,7 @@ impl S3Kv {
             if write == Write::New {
                 request = request.header(IF_NONE_MATCH, "*");
             }
-            body(request.send(&xml)?, MAX_ERROR, Vec::new())
+            body(request.send(action.body())?, MAX_ERROR, Vec::new())
         })?;
         if status == 200 && body.windows(7).any(|window| window == b"<Error>") {
             return match status_error(status, &body) {

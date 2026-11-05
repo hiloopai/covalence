@@ -84,6 +84,8 @@ enum Act {
     After(&'static str),
     /// Serve it, then answer 403 instead.
     Deny,
+    /// Replace the body after signing, preserving its length.
+    Corrupt,
 }
 
 impl Drop for Server {
@@ -144,7 +146,25 @@ fn serve_with(root: &Path, hook: impl Fn(&str) -> Act + Send + Sync + 'static) -
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             }
-            let mut response = service.call(request.map(s3s::Body::from)).await;
+            let mut request = request.map(s3s::Body::from);
+            if let Act::Corrupt = act {
+                let len = request.headers()["content-length"]
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                // Drain the socket before replacing the body so the client receives
+                // the checksum error, not a race with a closed upload connection.
+                let mut bytes = request
+                    .body_mut()
+                    .store_all_limited(len)
+                    .await
+                    .unwrap()
+                    .to_vec();
+                bytes[0] ^= 1;
+                *request.body_mut() = bytes.into();
+            }
+            let mut response = service.call(request).await;
             live.fetch_sub(1, Ordering::SeqCst);
             if let (Act::Deny, Ok(response)) = (act, &mut response) {
                 let denied = "<Error><Code>AccessDenied</Code></Error>".to_owned();
@@ -1053,7 +1073,11 @@ fn multipart() {
     assert_eq!(kv.size(b"v").unwrap(), Some(value.len() as u64));
     let mut other: Vec<u8> = data(10 * MIB + 1);
     other.reverse();
-    for (key, len) in [(&b"w"[..], other.len()), (b"x", 5 * MIB), (b"e", 0)] {
+    for (key, len) in [
+        (&b"space +%/utf8-\xc3\xa9"[..], other.len()),
+        (b"x", 5 * MIB),
+        (b"e", 0),
+    ] {
         // The reader has more; only `len` bytes are stored.
         kv.put_from(key, &mut &other[..], len as u64).unwrap();
         let mut out = Vec::new();
@@ -1069,6 +1093,29 @@ fn multipart() {
         "{error}"
     );
     assert_eq!(uploads(root.path()), Vec::<String>::new());
+}
+
+/// A changed part body must fail even when its signature and length are intact.
+#[test]
+fn multipart_rejects_corrupted_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let server = serve_with(root.path(), |line| {
+        if line.contains("partNumber=1&") {
+            Act::Corrupt
+        } else {
+            Act::Serve
+        }
+    });
+    let kv = kv(&server.endpoint, "s3://test", SECRET)
+        .part_size(5 << 20)
+        .concurrency(1);
+    let error = s3_error(kv.put(b"damaged", data(5 * MIB + 1).into()).unwrap_err());
+    assert!(
+        matches!(&error, Error::Status { status: 400, code: Some(code) } if code == "BadDigest"),
+        "{error}"
+    );
+    assert_eq!(kv.get(b"damaged").unwrap(), None);
+    assert!(uploads(root.path()).is_empty());
 }
 
 /// A multipart upload whose reader fails or ends early is aborted, storing
@@ -1235,14 +1282,14 @@ fn created() -> String {
     )
 }
 
-/// The base64 SHA-256 of `bytes`.
+/// The hexadecimal SHA-256 of `bytes`.
 fn sha256(bytes: &[u8]) -> String {
     use sha2::Digest;
-    data_encoding::BASE64.encode(&sha2::Sha256::digest(bytes))
+    data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(bytes))
 }
 
-/// A multipart upload declares SHA-256 checksums, sends one with each part
-/// and lists them on completion; S3 failing it with a 200 aborts it.
+/// Multipart parts bind their payload hash into SigV4 without requiring
+/// optional composite checksums; S3 failing completion with a 200 aborts it.
 #[test]
 fn multipart_requests() {
     let failed = response("200 OK", "<Error><Code>InternalError</Code></Error>");
@@ -1255,10 +1302,16 @@ fn multipart_requests() {
         response("204 No Content", ""),
     ]);
     // The fake server answers requests in turn, so send them one at a time.
-    let kv = kv(&endpoint, "s3://test", SECRET)
-        .part_size(5 << 20)
-        .concurrency(1)
-        .upload_buffer_bytes(5 << 20);
+    let kv = S3Kv::new(
+        &endpoint,
+        "us-east-1",
+        location("s3://test"),
+        Credentials::new_with_token(KEY, SECRET, "session-token"),
+    )
+    .unwrap()
+    .part_size(5 << 20)
+    .concurrency(1)
+    .upload_buffer_bytes(5 << 20);
     let error = s3_error(kv.put(b"a", multipart_ascii().into()).unwrap_err());
     assert!(
         matches!(&error, Error::Status { status: 200, code: Some(code) } if code == "InternalError"),
@@ -1268,7 +1321,7 @@ fn multipart_requests() {
     assert_eq!(requests.len(), 6);
     assert!(requests[0].starts_with("POST /test/a?"), "{}", requests[0]);
     assert!(requests[0].contains("&uploads="), "{}", requests[0]);
-    assert!(requests[0].contains("x-amz-checksum-algorithm: SHA256"));
+    assert!(!requests[0].contains("x-amz-checksum-algorithm"));
     let mut complete = String::from("<CompleteMultipartUpload>");
     let value = multipart_ascii();
     for (offset, part) in value.as_bytes().chunks(5 * MIB).enumerate() {
@@ -1280,10 +1333,18 @@ fn multipart_requests() {
             "{request}"
         );
         let checksum = sha256(part);
-        assert!(request.contains(&format!("x-amz-checksum-sha256: {checksum}")));
+        assert!(request.contains(&format!("x-amz-content-sha256: {checksum}")));
+        assert!(!request.contains("x-amz-checksum-sha256"));
+        assert!(request.contains("x-amz-security-token: session-token"));
+        assert!(request.contains("authorization: AWS4-HMAC-SHA256"));
+        assert!(
+            request.contains(
+                "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
+            )
+        );
         assert_eq!(request.split_once("\r\n\r\n").unwrap().1.as_bytes(), part);
         complete += &format!(
-            "<Part><ETag>\"e{number}\"</ETag><ChecksumSHA256>{checksum}</ChecksumSHA256>\
+            "<Part><ETag>&quot;e{number}&quot;</ETag>\
              <PartNumber>{number}</PartNumber></Part>"
         );
     }

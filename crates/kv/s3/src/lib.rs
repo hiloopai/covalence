@@ -29,6 +29,7 @@
 
 mod list;
 mod read;
+mod sign;
 mod write;
 
 pub use list::{ListPage, ObjectInfo};
@@ -71,6 +72,18 @@ use rusty_s3::{Bucket, BucketError, UrlStyle};
 #[snafu(crate_root(covalence_lib_error::snafu))]
 #[non_exhaustive]
 pub enum Error {
+    /// The SDK could not construct parameters for a payload signature.
+    #[snafu(display("invalid S3 payload signing parameters: {source}"))]
+    SigningParameters {
+        /// The SDK parameter error.
+        source: aws_sigv4::sign::v4::signing_params::BuildError,
+    },
+    /// The SDK could not sign the request's payload hash.
+    #[snafu(display("could not sign S3 payload: {source}"))]
+    Signing {
+        /// The SDK signing error.
+        source: aws_sigv4::http_request::SigningError,
+    },
     /// An object listing is not valid XML in the S3 listing schema.
     #[snafu(display("invalid S3 object listing: {source}"))]
     ListingXml {
@@ -457,8 +470,9 @@ impl Cached {
 /// - [`S3Kv::upload_plan`] checks S3 and allocation limits before any
 ///   upload request or source read. [`S3Kv::upload_buffer_bytes`] can bound
 ///   the aggregate upload payload held by calls sharing this store.
-/// - Each PUT or part sends the SHA-256 of its body as
-///   `x-amz-checksum-sha256`, which S3 checks against the bytes it receives.
+/// - Single PUTs send a signed `x-amz-checksum-sha256` header. Multipart
+///   parts bind their SHA-256 body hash into the request signature with
+///   `x-amz-content-sha256`. Both detect payload corruption on AWS S3 and R2.
 /// - A failed multipart upload is aborted once its parts in flight finish.
 ///   If aborting fails too, the error is [`Error::Abort`].
 /// - [`Kv::put_new`] and [`Kv::put_new_from`] send `If-None-Match: *` with
