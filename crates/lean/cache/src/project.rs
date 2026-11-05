@@ -10,6 +10,7 @@ use covalence_lib_serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    artifact,
     error::{Error, IoResult, Result, encode, invalid, json},
     mapping,
 };
@@ -27,6 +28,7 @@ pub(crate) struct Identity {
 pub(crate) struct Receipt {
     pub identity: Identity,
     pub mapping_sha256: String,
+    pub artifacts_sha256: String,
     pub artifacts: PathBuf,
 }
 
@@ -164,7 +166,7 @@ impl Project {
         };
         Ok(Identity {
             scope: format!(
-                "{}/{os}-{arch}/{}/{package}",
+                "{}/{os}-{arch}/{}/{package}/zstd-v1",
                 self.repository,
                 data_encoding::HEXLOWER.encode(&hash.finalize())
             ),
@@ -209,10 +211,12 @@ impl Project {
             .join("artifacts")
             .canonicalize()
             .operation("locate Lake artifacts")?;
-        mapping::artifacts(&mapping, &artifacts)?;
+        let files = mapping::artifacts(&mapping, &artifacts)?;
+        artifact::prepare(&files, &self.record)?;
         let record = Receipt {
             identity,
             mapping_sha256: digest(&mapping)?,
+            artifacts_sha256: digest(&self.record.join(artifact::MANIFEST))?,
             artifacts,
         };
         fs::write(receipt, encode(&record)?).operation("save successful build receipt")
@@ -231,6 +235,11 @@ impl Project {
         }
         if receipt.mapping_sha256 != digest(&self.record.join("outputs.jsonl"))? {
             return Err(invalid("cache mapping changed after successful build"));
+        }
+        if receipt.artifacts_sha256 != digest(&self.record.join(artifact::MANIFEST))? {
+            return Err(invalid(
+                "compressed artifact manifest changed after successful build",
+            ));
         }
         Ok(receipt)
     }

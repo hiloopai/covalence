@@ -950,6 +950,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "zstd",
 ]
 
 [[package]]

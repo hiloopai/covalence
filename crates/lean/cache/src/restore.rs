@@ -14,6 +14,7 @@ use covalence_kv_trait::Kv;
 use serde_json::json;
 
 use crate::{
+    artifact::{self, Manifest},
     error::{Error, IoResult, Result, encode, invalid, json},
     mapping,
     project::{Project, output, run},
@@ -48,6 +49,23 @@ pub(crate) fn restore(project: &Project, store: &S3Kv) -> Result<()> {
         return Err(invalid("invalid cache revision pointer"));
     }
     let temporary = tempfile::tempdir().operation("create Lake cache configuration")?;
+    let mut manifest = Limited {
+        bytes: Vec::new(),
+        limit: 64 * 1024 * 1024,
+    };
+    let manifest_key = format!("r/{}/{revision}.artifacts.json", identity.scope);
+    let found = store
+        .get_to(manifest_key.as_bytes(), &mut manifest)
+        .map_err(|source| Error::Store {
+            operation: "download artifact manifest".into(),
+            source,
+        })?;
+    if found.is_none() {
+        return Err(invalid("published revision has no artifact manifest"));
+    }
+    Manifest::parse(&manifest.bytes)?;
+    let manifest_path = temporary.path().join(artifact::MANIFEST);
+    fs::write(&manifest_path, &manifest.bytes).operation("save artifact manifest")?;
     let config = temporary.path().join("config.toml");
     fs::write(&config, format!("[[cache.service]]\nname = \"{SERVICE}\"\nkind = \"s3\"\nartifactEndpoint = \"{BASE}/a\"\nrevisionEndpoint = \"{BASE}/r\"\n")).operation("write Lake cache configuration")?;
     let directory = output(
@@ -69,6 +87,7 @@ pub(crate) fn restore(project: &Project, store: &S3Kv) -> Result<()> {
         )
         .env("COVALENCE_LAKE_SCOPE", &identity.scope)
         .env("COVALENCE_LAKE_ARTIFACTS", artifact_dir)
+        .env("COVALENCE_LAKE_MANIFEST", manifest_path)
         .args([
             "cache",
             "get",
@@ -216,14 +235,33 @@ pub(crate) fn download(args: &[String]) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
     let store = storage::store()?;
-    storage::parallel(&transfers, |index, (object, path)| {
-        let mut file = File::create_new(path).operation("create temporary Lake artifact")?;
-        let found = store
-            .get_to(object.as_bytes(), &mut file)
-            .map_err(|source| Error::Store {
-                operation: format!("download {object}"),
-                source,
+    let manifest = env::var_os("COVALENCE_LAKE_MANIFEST")
+        .ok_or_else(|| invalid("missing artifact manifest"))?;
+    let manifest = Manifest::parse(&fs::read(manifest).operation("read artifact manifest")?)?;
+    // Validate every requested artifact before starting any downloads.
+    let transfers = transfers
+        .iter()
+        .map(|(object, path)| {
+            let name = object
+                .rsplit('/')
+                .next()
+                .ok_or_else(|| invalid("artifact key has no name"))?;
+            let info = manifest.artifacts.get(name).ok_or_else(|| {
+                invalid("requested artifact is absent from the published manifest")
             })?;
+            Ok((object, path, info))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    storage::parallel(&transfers, |index, (object, path, info)| {
+        let mut file = File::create_new(path).operation("create temporary Lake artifact")?;
+        let found = artifact::decode_to(info, &mut file, |decoding| {
+            store
+                .get_to(format!("{object}.zst").as_bytes(), decoding)
+                .map_err(|source| Error::Store {
+                    operation: format!("download {object}"),
+                    source,
+                })
+        })?;
         file.flush().operation("flush Lake artifact")?;
         report(index, found)
     })?;

@@ -19,11 +19,14 @@ cov-lake-cache put --repository example/proofs
 - `dependencies` fetches the Mathlib/CSLib snapshot used by a project with
   those dependencies. Targets select mappings first, then a strict Lake build.
 - `build` runs `lake build --wfail` once, records outputs, and saves a success
-  receipt. A failed build removes the previous receipt. Recording requires a
-  clean checkout; put generated output under an ignored directory.
+  receipt. It streams each artifact through Zstandard level one into the record
+  directory, so publication does not repeat compression. A failed build removes
+  the previous receipt. Recording requires a clean checkout; put generated output
+  under an ignored directory.
 - `put` requires that receipt from the same revision, pins, platform and CI
   run. It never builds. It lists the scope, streams missing or wrong-size
-  artifacts, then publishes the full mapping and latest revision pointer.
+  compressed artifacts, then publishes their length manifest, the full Lake
+  mapping and latest revision pointer.
 - `get` downloads through Lake, which validates each artifact's content hash.
   A missing pointer is a cache miss. Other failures are errors; callers may
   explicitly report a failed optional restore and run the full check instead.
@@ -35,7 +38,7 @@ profiles or machine roles). Do not pass credentials on the command line.
 GitHub publication requires a main push or manual main run in the named
 repository. Bucket permissions remain the actual write authorization boundary.
 
-Scopes separate repositories, packages, platform, toolchain and dependency
+Scopes separate repositories, packages, platform, toolchain, wire format and dependency
 pins. Lake hashes are 64-bit artifact IDs, not Covalence CIDs. Objects therefore
 use the raw key-value store. Size inventories detect missing and truncated
 objects; they are not remote content audits. Readers check content hashes.
@@ -46,6 +49,14 @@ Sixteen file transfers run at once, with at most two 8 MiB parts each. Upload
 payload buffers are limited to 256 MiB. Native Lake can use additional memory
 while validating and unpacking. Inventories retain only referenced filenames,
 and publication reports bytes, object counts and phase times as JSON.
+
+Compression uses the workspace's existing Zstandard dependency. Downloads stream
+directly into temporary Lake artifacts; each decoder has an 8 MiB window limit
+and enforces the manifest's exact decoded length. Lake checks the decoded content
+hash before installing it. The `zstd-v1` scope separates this representation from
+raw artifacts. Prepared bodies occupy extra disk space in the record directory;
+the next successful preparation replaces them. `preparation.json` reports their
+byte count and compression time separately from `publication.json`.
 
 `--root`, `--package` and `--record` select a project, dependency package and
 record directory. `LAKE` selects the Lake executable. Installation should use

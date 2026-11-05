@@ -11,7 +11,8 @@ use serde_json::Value;
 use support::Server;
 
 const TOOLCHAIN: &str = "leanprover/lean4:nightly-2026-10-30";
-const REPOSITORY: &str = "example/proofs";
+// s3s-fs base64-encodes the entire key in one metadata filename (NAME_MAX=255).
+const REPOSITORY: &str = "t/p";
 
 fn checked(command: &mut Command) -> Output {
     let output = command.output().unwrap();
@@ -169,7 +170,7 @@ fn incremental_publish_repairs_missing_objects_and_native_restore_reuses_proofs(
     assert_eq!(warm["uploaded"], 0);
     assert_eq!(warm["artifact_bytes"], 0);
     let writes = fixture.server.writes.lock().unwrap();
-    assert_eq!(writes.len() - before, 2);
+    assert_eq!(writes.len() - before, 3);
     assert!(writes[before..].iter().all(|s| s.contains("/r/")));
     drop(writes);
     let path = fixture.root.join("Demo/A.lean");
@@ -211,7 +212,31 @@ fn incremental_publish_repairs_missing_objects_and_native_restore_reuses_proofs(
     assert_eq!(oleans(&fixture.root), expected);
     // The same native path must reject corrupted bytes, including same-size data.
     let bytes = fs::read(&object).unwrap();
-    fs::write(&object, vec![b'x'; bytes.len()]).unwrap();
+    let mut decoded = zstd::stream::decode_all(bytes.as_slice()).unwrap();
+    decoded[0] ^= 1;
+    let corrupt = zstd::stream::encode_all(decoded.as_slice(), 1).unwrap();
+    fs::write(&object, &corrupt).unwrap();
+    let revision = checked(
+        Command::new("git")
+            .current_dir(&fixture.root)
+            .args(["rev-parse", "HEAD"]),
+    );
+    let revision = String::from_utf8(revision.stdout).unwrap();
+    let manifest_path = fixture
+        .bucket()
+        .join("r")
+        .join(fixture.scope())
+        .join(format!("{}.artifacts.json", revision.trim()));
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let name = object
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .strip_suffix(".zst")
+        .unwrap();
+    manifest["artifacts"][name]["encoded_bytes"] = corrupt.len().into();
+    fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     fixture.reset_local();
     let corrupt = fixture.cli("get").output().unwrap();
     assert!(!corrupt.status.success());
@@ -239,6 +264,11 @@ fn unsuccessful_or_stale_receipts_cannot_publish() {
     .unwrap();
     assert!(!fixture.cli("put").status().unwrap().success());
     fs::write(&mapping, original).unwrap();
+    let manifest = fixture.record("artifacts.json");
+    let original = fs::read(&manifest).unwrap();
+    fs::write(&manifest, [original.as_slice(), b"\n"].concat()).unwrap();
+    assert!(!fixture.cli("put").status().unwrap().success());
+    fs::write(&manifest, original).unwrap();
     assert!(fixture.server.writes.lock().unwrap().is_empty());
     fs::write(
         fixture.root.join("Demo/A.lean"),

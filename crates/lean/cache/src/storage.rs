@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::BTreeSet,
     env,
     fs::{self, File},
@@ -14,6 +15,7 @@ use covalence_lib_data::Bytes;
 use covalence_lib_serde::Serialize;
 
 use crate::{
+    artifact::{self, Manifest},
     error::{Error, IoResult, Result, encode, invalid},
     mapping,
     project::Project,
@@ -30,6 +32,7 @@ pub(crate) fn store() -> Result<S3Kv> {
     S3Kv::from_aws(location, &AwsOptions::default())
         .map(|s| {
             s.concurrency(2)
+                .max_idle_connections(WORKERS * 2)
                 .part_size(8 * 1024 * 1024)
                 .upload_buffer_bytes(256 * 1024 * 1024)
         })
@@ -112,6 +115,26 @@ pub(crate) fn publish(project: &Project, store: &S3Kv) -> Result<()> {
     let receipt = project.receipt()?;
     let mapping = project.record.join("outputs.jsonl");
     let files = mapping::artifacts(&mapping, &receipt.artifacts)?;
+    let manifest_path = project.record.join(artifact::MANIFEST);
+    let manifest =
+        Manifest::parse(&fs::read(&manifest_path).operation("read prepared artifact manifest")?)?;
+    if !files.keys().eq(manifest.artifacts.keys()) {
+        return Err(invalid("prepared artifacts do not match the Lake mapping"));
+    }
+    let mut prepared = std::collections::BTreeMap::new();
+    for (name, info) in &manifest.artifacts {
+        let name_on_wire = artifact::filename(name);
+        let path = project.record.join(artifact::DIRECTORY).join(&name_on_wire);
+        if path
+            .metadata()
+            .operation("read prepared artifact length")?
+            .len()
+            != info.encoded_bytes
+        {
+            return Err(invalid("prepared artifact length changed after checking"));
+        }
+        prepared.insert(name_on_wire, (path, info.encoded_bytes));
+    }
     let prefix = format!("a/{}/", receipt.identity.scope);
     let inventory_started = Instant::now();
     let mut present = BTreeSet::new();
@@ -126,8 +149,8 @@ pub(crate) fn publish(project: &Project, store: &S3Kv) -> Result<()> {
                 .key
                 .strip_prefix(&prefix)
                 .ok_or_else(|| invalid("inventory escaped artifact scope"))?;
-            if let Some(path) = files.get(name)
-                && path.metadata().operation("read local artifact size")?.len() == object.size
+            if let Some((_, bytes)) = prepared.get(name)
+                && *bytes == object.size
                 && !present.insert(name.to_owned())
             {
                 return Err(invalid("inventory repeated an artifact"));
@@ -142,26 +165,37 @@ pub(crate) fn publish(project: &Project, store: &S3Kv) -> Result<()> {
         continuation = Some(next);
     }
     let inventory_seconds = inventory_started.elapsed().as_secs_f64();
-    let missing = files
+    let mut missing = prepared
         .iter()
         .filter(|(key, _)| !present.contains(*key))
         .collect::<Vec<_>>();
+    // Start large multipart bodies before small files can leave them at the tail.
+    missing.sort_unstable_by_key(|(_, (_, bytes))| Reverse(*bytes));
     let transfer_started = Instant::now();
-    let artifact_bytes = parallel(&missing, |_, (key, path)| {
+    let artifact_bytes = parallel(&missing, |_, (key, (path, _))| {
         put_file(store, &format!("{prefix}{key}"), path)
     })?
     .into_iter()
     .sum();
     let transfer_seconds = transfer_started.elapsed().as_secs_f64();
     // The mapping and pointer become visible only after every body succeeds.
-    let metadata_bytes = put_file(
+    let manifest_bytes = put_file(
         store,
         &format!(
-            "r/{}/{}.jsonl",
+            "r/{}/{}.artifacts.json",
             receipt.identity.scope, receipt.identity.revision
         ),
-        &mapping,
+        &manifest_path,
     )?;
+    let metadata_bytes = manifest_bytes
+        + put_file(
+            store,
+            &format!(
+                "r/{}/{}.jsonl",
+                receipt.identity.scope, receipt.identity.revision
+            ),
+            &mapping,
+        )?;
     let pointer = format!("{}\n", receipt.identity.revision);
     let key = format!("r/{}/main-latest", receipt.identity.scope);
     store
