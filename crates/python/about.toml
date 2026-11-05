@@ -18,6 +18,14 @@ ignore-dev-dependencies = true
 # The platforms the wheels are built for.
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
+# The upstream archive codec omits Cargo license metadata.
+[leangz.clarify]
+license = "Apache-2.0"
+[[leangz.clarify.files]]
+path = "LICENSE"
+license = "Apache-2.0"
+checksum = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+
 # The crate's own licenses, not the MIT license of its test fixtures.
 [covalence-lib-dasl.clarify]
 license = "CC0-1.0 OR MIT OR Apache-2.0"
