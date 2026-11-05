@@ -17,6 +17,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Fixed
 
+- Multipart uploads work on Cloudflare R2 as well as AWS S3. Part requests
+  sign their SHA-256 payload hash without requiring optional S3 composite
+  checksum support.
+
 - S3 part concurrency no longer shrinks the shared idle connection pool.
   `S3Kv::max_idle_connections` configures connection reuse independently.
 
