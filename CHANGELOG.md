@@ -18,7 +18,7 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 ### Fixed
 
 - Lake cache releases include an upstream archive codec that supports embedded
-  NUL strings and scalar arrays.
+  NUL strings, scalar arrays, and deeply nested data.
 
 - Multipart uploads work on Cloudflare R2 as well as AWS S3. Part requests
   sign their SHA-256 payload hash without requiring optional S3 composite

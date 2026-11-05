@@ -247,6 +247,55 @@ fn changing_the_archive_tool_invalidates_receipts_and_remote_scope() {
 }
 
 #[test]
+fn deep_extension_data_survives_publication_and_native_restore() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("Demo/A.lean"),
+        r#"import Lean
+open Lean
+initialize listExt : SimplePersistentEnvExtension (List Nat) (Array (List Nat)) ←
+  registerSimplePersistentEnvExtension {
+    addEntryFn := Array.push
+    addImportedFn := Array.flatten
+  }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        fixture.root.join("Demo/B.lean"),
+        "import Demo.A\nopen Lean\nrun_cmd modifyEnv (listExt.addEntry · (List.range 50000))\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("Demo.lean"), "import Demo.B\n").unwrap();
+    fixture.commit();
+    fixture.build();
+    let path = fixture.root.join(".lake/build/lib/lean/Demo/B.olean");
+    let expected = fs::read(&path).unwrap();
+    fixture.publish();
+    fixture.reset_local();
+    checked(&mut fixture.cli("get"));
+    let result = checked(fixture.lake().args(["build", "--wfail", "Demo"]));
+    for log in [&result.stdout, &result.stderr] {
+        let log = String::from_utf8_lossy(log);
+        assert!(
+            !log.contains("Built Demo"),
+            "recompiled restored data: {log}"
+        );
+    }
+    assert_eq!(fs::read(path).unwrap(), expected);
+    fs::write(
+        fixture.root.join("Check.lean"),
+        r#"import Demo.B
+open Lean
+run_cmd unless listExt.getState (← getEnv) == #[List.range 50000] do
+  throwError "restored extension data differs"
+"#,
+    )
+    .unwrap();
+    checked(fixture.lake().args(["env", "lean", "Check.lean"]));
+}
+
+#[test]
 fn incremental_publish_repairs_missing_objects_and_native_restore_reuses_proofs() {
     let fixture = Fixture::new();
     fixture.build();

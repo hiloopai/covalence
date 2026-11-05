@@ -73,17 +73,20 @@ pinned to a full public commit, with `revision` and `sha256` inputs. It verifies
 the archive even when restored from disk and puts `cov-lake-cache` on `PATH`.
 It also installs the bundled `leantar` in the selected Lean toolchain, which
 must already be installed and writable. The archive records the upstream
-commit in `LEANTAR-REVISION` and includes its license notices. The pinned codec
-supports embedded NUL strings and scalar arrays that older Lean distributions
-cannot safely archive. It changes no Lean sources or kernel checks.
+commits in `LEANTAR-REVISIONS`, their combined source tree in `LEANTAR-TREE`,
+and all license notices. It combines upstream master with the pinned, unmerged
+[explicit-stack fix](https://github.com/digama0/leangz/pull/22). The codec supports
+embedded NUL strings, scalar arrays, and deeply nested data that older Lean
+distributions cannot safely archive. It changes no Lean sources or kernel checks.
 
 The cache scope hashes the actual `leantar` executable: readers with a different
 archive tool get a cache miss, and replacing the tool invalidates old publication
 receipts. Existing snapshots remain in their old scopes. Source installations
 must supply a compatible archiver themselves. Thomas owns the bundled upstream
 pin; remove it once the supported Lean distribution includes
-[leangz#12](https://github.com/digama0/leangz/pull/12) and
-[leangz#15](https://github.com/digama0/leangz/pull/15).
+[leangz#12](https://github.com/digama0/leangz/pull/12),
+[leangz#15](https://github.com/digama0/leangz/pull/15), and
+[leangz#22](https://github.com/digama0/leangz/pull/22).
 
 Run `cargo test -p covalence-lean-cache --features lake-tests` with the pinned
 Lean release on `PATH` for the signed S3 server and real Lake integration
