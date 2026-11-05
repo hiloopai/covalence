@@ -29,6 +29,11 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Changed
 
+- **Breaking:** `cov-lake-cache build --package` selects recorded outputs while
+  preserving Lake's normal build targets. Use `-- @dependency` to build a
+  dependency's default targets explicitly. An unused package produces a valid
+  empty snapshot; importing new code still requires its normal Lean checks.
+
 - **Breaking:** Lake cache scopes now include the archive executable's SHA-256.
   Readers with different archive tools cannot select the same published mappings.
   Publish a fresh snapshot after upgrading; existing snapshots remain in their

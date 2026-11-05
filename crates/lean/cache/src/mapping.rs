@@ -90,9 +90,6 @@ pub(crate) fn artifacts(mapping: &Path, directory: &Path) -> Result<BTreeMap<Str
         }
         collect(&output, &mut files)?;
     }
-    if inputs.is_empty() {
-        return Err(invalid("Lake produced no input mappings"));
-    }
     files
         .into_iter()
         .map(|(key, name)| {

@@ -37,6 +37,7 @@ struct Cli {
     root: PathBuf,
     #[arg(long)]
     repository: Option<String>,
+    /// Record this package's outputs; build targets retain Lake's defaults.
     #[arg(long, default_value = "")]
     package: String,
     #[arg(long)]

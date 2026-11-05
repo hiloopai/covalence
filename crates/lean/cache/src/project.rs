@@ -208,10 +208,6 @@ impl Project {
         if !self.package.is_empty() {
             command.args(["--package", &self.package]);
         }
-        // --package selects recorded mappings, not Lake's build targets.
-        if targets.is_empty() && !self.package.is_empty() {
-            command.arg(format!("@{}", self.package));
-        }
         run("Lake build", command.args(targets))?;
         self.clean()?;
         if self.identity()? != identity {
