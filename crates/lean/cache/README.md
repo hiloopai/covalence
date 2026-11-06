@@ -11,6 +11,8 @@ to Lake's download protocol fail explicitly and need compatibility tests.
 ```sh
 cov-lake-cache dependencies -- Some.Required.Target
 cov-lake-cache get --repository example/proofs
+# Or fetch only what one target needs:
+cov-lake-cache get --repository example/proofs -- MyLibrary.Module
 cov-lake-cache build --repository example/proofs -- MyLibrary
 # Run the repository's remaining correctness checks, then on trusted main CI:
 cov-lake-cache put --repository example/proofs
@@ -30,6 +32,12 @@ cov-lake-cache put --repository example/proofs
 - `get` downloads through Lake, which validates each artifact's content hash.
   A missing pointer is a cache miss. Other failures are errors; callers may
   explicitly report a failed optional restore and run the full check instead.
+- `get -- <targets>` fetches only mappings, from this cache and, when the
+  project uses Mathlib, from the dependency snapshot. It then runs
+  `lake build --wfail` on the targets. Lake takes each artifact from its local
+  cache, else downloads it the first time the build needs it, else builds the
+  module. Without a published snapshot it still restores the dependencies and
+  builds the targets. Later builds use the local cache with no remote requests.
 
 Set `LAKE_CI_BUCKET` and optionally `LAKE_CI_PREFIX`. Credentials, region and
 endpoint follow the AWS credential chain (`AWS_REGION`, `AWS_ENDPOINT_URL`,
@@ -44,6 +52,11 @@ use the raw key-value store. Size inventories detect missing and truncated
 objects; they are not remote content audits. Readers check content hashes.
 Use one writer per scope; concurrent listing is not a consistent snapshot.
 Only trusted writers may publish mappings and artifacts.
+
+While Lake runs under `get`, this command stands in for `curl`. It serves
+its own cache URLs and passes requests for other services, such as Mathlib's
+cache, to `curl` unchanged. A target build therefore also uses the dependency
+services named in Mathlib's Lake configuration.
 
 Sixteen file transfers run at once, with at most two 8 MiB parts each. Upload
 payload buffers are limited to 256 MiB. Native Lake can use additional memory

@@ -147,8 +147,14 @@ impl Fixture {
         self.temporary.path().join("s3/bucket/proofs")
     }
     fn reset_local(&self) {
-        fs::remove_dir_all(self.root.join(".lake/build")).unwrap();
-        fs::remove_dir_all(self.temporary.path().join("cache")).unwrap();
+        for directory in [
+            self.root.join(".lake/build"),
+            self.temporary.path().join("cache"),
+        ] {
+            if directory.exists() {
+                fs::remove_dir_all(directory).unwrap();
+            }
+        }
     }
 }
 
@@ -554,9 +560,9 @@ fn untrusted_writers_and_download_urls_are_rejected_before_network_io() {
         assert!(String::from_utf8_lossy(&result.stderr).contains("trusted main"));
     }
     for url in [
-        "https://evil.invalid/r/test/0000000000000000000000000000000000000000.jsonl",
         "https://covalence-lake.invalid/r/test/../other",
         "https://covalence-lake.invalid/r/test/%2e%2e/escape",
+        "https://covalence-lake.invalid/a/test/0000000000000000.art.tmp",
     ] {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_cov-lake-cache"));
         fixture.env(&mut cmd);
@@ -569,6 +575,92 @@ fn untrusted_writers_and_download_urls_are_rejected_before_network_io() {
         assert!(!String::from_utf8_lossy(&output.stderr).contains("test-secret"));
     }
     assert!(fixture.server.writes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn other_services_reach_curl_without_cache_credentials() {
+    let fixture = Fixture::new();
+    let bin = fixture.temporary.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let seen = fixture.temporary.path().join("curl-call");
+    let curl = bin.join("curl");
+    fs::write(
+        &curl,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nenv >> '{}'\nexit 7\n",
+            seen.display(),
+            seen.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&curl, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let url = "https://dependency.example/a0/scope/0000000000000001.art";
+    let args = ["-s", "-S", "-f", "-o", "/tmp/unused.olean", "-L", url];
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cov-lake-cache"));
+    fixture.env(&mut cmd);
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let output = cmd
+        .env("PATH", path)
+        .env("COVALENCE_LAKE_SCOPE", "test")
+        .args(args)
+        .output()
+        .unwrap();
+    // curl's own status reaches Lake, which then falls back to building.
+    assert_eq!(output.status.code(), Some(7));
+    let call = fs::read_to_string(&seen).unwrap();
+    assert!(call.starts_with(&format!("{}\n", args.join("\n"))));
+    assert!(!call.contains("test-secret"));
+    assert!(fixture.server.reads.lock().unwrap().is_empty());
+}
+
+#[test]
+fn target_restore_fetches_only_the_target_closure_and_then_builds_locally() {
+    let fixture = Fixture::new();
+    fixture.build();
+    fixture.publish();
+    let artifacts = |from: usize| {
+        fixture.server.reads.lock().unwrap()[from..]
+            .iter()
+            .filter(|path| path.contains("/a/"))
+            .count()
+    };
+    let log = |output: Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+    fixture.reset_local();
+    let start = fixture.server.reads.lock().unwrap().len();
+    checked(&mut fixture.cli("get"));
+    let everything = artifacts(start);
+    fixture.reset_local();
+    let start = fixture.server.reads.lock().unwrap().len();
+    let restored = log(checked(fixture.cli("get").args(["--", "Demo.A"])));
+    assert!(!restored.contains("Built Demo.A"), "rebuilt: {restored}");
+    let fetched = artifacts(start);
+    assert!(
+        0 < fetched && fetched < everything,
+        "{fetched} of {everything}"
+    );
+    let built = fixture.root.join(".lake/build/lib/lean/Demo");
+    assert!(built.join("A.olean").exists());
+    assert!(!built.join("B.olean").exists());
+    // Once local, a build needs no remote requests.
+    let start = fixture.server.reads.lock().unwrap().len();
+    let warm = log(checked(fixture.lake().args(["build", "--wfail", "Demo.A"])));
+    assert!(!warm.contains("Built Demo.A"), "rebuilt: {warm}");
+    assert_eq!(fixture.server.reads.lock().unwrap().len(), start);
+    let path = fixture.root.join("Demo/A.lean");
+    fs::write(
+        &path,
+        "module\npublic theorem a (n : Nat) : n + 0 = n := Nat.add_zero n\n",
+    )
+    .unwrap();
+    let edited = log(checked(fixture.lake().args(["build", "--wfail", "Demo.A"])));
+    assert!(edited.contains("Built Demo.A"), "{edited}");
+    assert_eq!(fixture.server.reads.lock().unwrap().len(), start);
 }
 
 #[test]

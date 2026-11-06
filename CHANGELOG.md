@@ -41,6 +41,9 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Added
 
+- `cov-lake-cache get -- <targets>` restores only what those targets need.
+  It fetches mappings, then builds the targets: Lake takes each artifact from
+  its local cache, else downloads it, else builds the module.
 - `cov-lake-cache`, a Rust command to record successful Lake builds and share
   their artifacts through the S3 transport. Publication uploads only missing
   or wrong-size objects and does not rebuild. Lake verifies restored hashes.
