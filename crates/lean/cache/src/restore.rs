@@ -1,12 +1,14 @@
-//! Adapt Lake's two read-only curl protocols to the S3 transport.
+//! Adapt Lake's three read-only curl protocols to the S3 transport.
 //!
 //! Lake, not this adapter, verifies artifact hashes and installs mappings.
+//! Requests for other cache services go to `curl` unchanged.
 
 use std::{
     env,
     fs::{self, File},
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::{Command, ExitCode},
 };
 
 use covalence_kv_s3::S3Kv;
@@ -15,6 +17,7 @@ use serde_json::json;
 
 use crate::{
     artifact::{self, Manifest},
+    dependencies,
     error::{Error, IoResult, Result, encode, invalid, json},
     mapping,
     project::{Project, output, run},
@@ -25,9 +28,98 @@ const BASE: &str = "https://covalence-lake.invalid";
 const SERVICE: &str = "covalence";
 const FORMAT: &str = "%{stderr}%{json}\n";
 
-pub(crate) fn restore(project: &Project, store: &S3Kv) -> Result<()> {
+/// Restores the latest published snapshot; with targets, only what they need.
+pub(crate) fn restore(project: &Project, store: &S3Kv, targets: &[String]) -> Result<()> {
     let identity = project.identity()?;
-    let key = format!("r/{}/main-latest", identity.scope);
+    let revision = latest(store, &identity.scope)?;
+    if revision.is_none() {
+        println!("Lake cache: no published build for these pins and platform");
+        if targets.is_empty() {
+            return Ok(());
+        }
+    }
+    // This also materializes the workspace's packages, including Mathlib.
+    let directory = output(
+        "Lake",
+        project.lake().args(["env", "printenv", "LAKE_CACHE_DIR"]),
+    )?;
+    fs::create_dir_all(PathBuf::from(&directory).join("artifacts"))
+        .operation("create Lake artifact directory")?;
+    let artifact_dir = PathBuf::from(directory)
+        .join("artifacts")
+        .canonicalize()
+        .operation("locate artifact directory")?;
+    let temporary = tempfile::tempdir().operation("create Lake cache configuration")?;
+    let mut settings = String::new();
+    if !targets.is_empty() && dependencies::config(project).exists() {
+        // The target build downloads dependency artifacts through the
+        // services that Mathlib's configuration names.
+        dependencies::mappings(project, true)?;
+        settings = fs::read_to_string(dependencies::config(project))
+            .operation("read dependency cache configuration")?
+            + "\n";
+    }
+    settings.push_str(&format!("[[cache.service]]\nname = \"{SERVICE}\"\nkind = \"s3\"\nartifactEndpoint = \"{BASE}/a\"\nrevisionEndpoint = \"{BASE}/r\"\n"));
+    let config = temporary.path().join("config.toml");
+    fs::write(&config, settings).operation("write Lake cache configuration")?;
+    let manifest_path = temporary.path().join(artifact::MANIFEST);
+    let curl = env::current_exe().operation("locate cache executable")?;
+    let lake = || {
+        let mut command = project.lake();
+        command
+            .env("LAKE_CONFIG", &config)
+            .env("CURL", &curl)
+            .env("COVALENCE_LAKE_SCOPE", &identity.scope)
+            .env("COVALENCE_LAKE_ARTIFACTS", &artifact_dir)
+            .env("COVALENCE_LAKE_MANIFEST", &manifest_path);
+        command
+    };
+    if let Some(revision) = &revision {
+        let mut manifest = Limited {
+            bytes: Vec::new(),
+            limit: 64 * 1024 * 1024,
+        };
+        let manifest_key = format!("r/{}/{revision}.artifacts.json", identity.scope);
+        let found = store
+            .get_to(manifest_key.as_bytes(), &mut manifest)
+            .map_err(|source| Error::Store {
+                operation: "download artifact manifest".into(),
+                source,
+            })?;
+        if found.is_none() {
+            return Err(invalid("published revision has no artifact manifest"));
+        }
+        Manifest::parse(&manifest.bytes)?;
+        fs::write(&manifest_path, &manifest.bytes).operation("save artifact manifest")?;
+        let mut command = lake();
+        command.args([
+            "cache",
+            "get",
+            "--service",
+            SERVICE,
+            "--scope",
+            &identity.scope,
+            "--rev",
+            revision,
+        ]);
+        if !project.package.is_empty() {
+            command.args(["--package", &project.package]);
+        }
+        if targets.is_empty() {
+            return run("Lake restore", &mut command);
+        }
+        run("Lake restore", command.arg("--mappings-only"))?;
+    }
+    // Lake takes each artifact from its local cache, else downloads it the
+    // first time the build needs it, else builds the module.
+    run(
+        "Lake target restore",
+        lake().args(["build", "--wfail"]).args(targets),
+    )
+}
+
+fn latest(store: &S3Kv, scope: &str) -> Result<Option<String>> {
+    let key = format!("r/{scope}/main-latest");
     let mut bytes = Limited {
         bytes: Vec::new(),
         limit: 128,
@@ -39,8 +131,7 @@ pub(crate) fn restore(project: &Project, store: &S3Kv) -> Result<()> {
             source,
         })?;
     if found.is_none() {
-        println!("Lake cache: no published build for these pins and platform");
-        return Ok(());
+        return Ok(None);
     }
     let revision = str::from_utf8(&bytes.bytes)
         .map_err(|_| invalid("invalid revision pointer"))?
@@ -48,60 +139,7 @@ pub(crate) fn restore(project: &Project, store: &S3Kv) -> Result<()> {
     if !mapping::hex(revision, 40) {
         return Err(invalid("invalid cache revision pointer"));
     }
-    let temporary = tempfile::tempdir().operation("create Lake cache configuration")?;
-    let mut manifest = Limited {
-        bytes: Vec::new(),
-        limit: 64 * 1024 * 1024,
-    };
-    let manifest_key = format!("r/{}/{revision}.artifacts.json", identity.scope);
-    let found = store
-        .get_to(manifest_key.as_bytes(), &mut manifest)
-        .map_err(|source| Error::Store {
-            operation: "download artifact manifest".into(),
-            source,
-        })?;
-    if found.is_none() {
-        return Err(invalid("published revision has no artifact manifest"));
-    }
-    Manifest::parse(&manifest.bytes)?;
-    let manifest_path = temporary.path().join(artifact::MANIFEST);
-    fs::write(&manifest_path, &manifest.bytes).operation("save artifact manifest")?;
-    let config = temporary.path().join("config.toml");
-    fs::write(&config, format!("[[cache.service]]\nname = \"{SERVICE}\"\nkind = \"s3\"\nartifactEndpoint = \"{BASE}/a\"\nrevisionEndpoint = \"{BASE}/r\"\n")).operation("write Lake cache configuration")?;
-    let directory = output(
-        "Lake",
-        project.lake().args(["env", "printenv", "LAKE_CACHE_DIR"]),
-    )?;
-    fs::create_dir_all(PathBuf::from(&directory).join("artifacts"))
-        .operation("create Lake artifact directory")?;
-    let artifact_dir = PathBuf::from(directory)
-        .join("artifacts")
-        .canonicalize()
-        .operation("locate artifact directory")?;
-    let mut command = project.lake();
-    command
-        .env("LAKE_CONFIG", config)
-        .env(
-            "CURL",
-            env::current_exe().operation("locate cache executable")?,
-        )
-        .env("COVALENCE_LAKE_SCOPE", &identity.scope)
-        .env("COVALENCE_LAKE_ARTIFACTS", artifact_dir)
-        .env("COVALENCE_LAKE_MANIFEST", manifest_path)
-        .args([
-            "cache",
-            "get",
-            "--service",
-            SERVICE,
-            "--scope",
-            &identity.scope,
-            "--rev",
-            revision,
-        ]);
-    if !project.package.is_empty() {
-        command.args(["--package", &project.package]);
-    }
-    run("Lake restore", &mut command)
+    Ok(Some(revision.to_owned()))
 }
 
 struct Limited {
@@ -153,14 +191,100 @@ fn report(index: usize, found: Option<u64>) -> Result<()> {
         .operation("write Lake transfer status")
 }
 
-pub(crate) fn download(args: &[String]) -> Result<()> {
+fn artifact_directory() -> Result<PathBuf> {
+    PathBuf::from(
+        env::var_os("COVALENCE_LAKE_ARTIFACTS")
+            .ok_or_else(|| invalid("missing Lake artifact directory"))?,
+    )
+    .canonicalize()
+    .operation("locate artifact directory")
+}
+
+fn published_manifest() -> Result<Manifest> {
+    let manifest = env::var_os("COVALENCE_LAKE_MANIFEST")
+        .ok_or_else(|| invalid("missing artifact manifest"))?;
+    Manifest::parse(&fs::read(manifest).operation("read artifact manifest")?)
+}
+
+/// Serves one artifact a build finds missing; a miss makes Lake build it.
+fn download_file(scope: &str, url: &str, path: &Path) -> Result<ExitCode> {
+    let object = key(url, scope, "a")?;
+    let name = &object[object.len() - 20..];
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("output has no parent"))?
+        .canonicalize()
+        .operation("locate download parent")?;
+    if parent != artifact_directory()?
+        || !path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix(&name[..16]))
+            .is_some_and(|extension| extension.starts_with('.') && !extension.ends_with(".tmp"))
+    {
+        return Err(invalid("unsafe artifact destination"));
+    }
+    let Some(info) = published_manifest()?.artifacts.remove(name) else {
+        eprintln!("{name} is not in the published snapshot");
+        // curl's exit status for an HTTP error under `--fail`.
+        return Ok(ExitCode::from(22));
+    };
+    let store = storage::store()?;
+    let mut file = File::create_new(path).operation("create Lake artifact")?;
+    let found = artifact::decode_to(&info, &mut file, |decoding| {
+        store
+            .get_to(format!("{object}.zst").as_bytes(), decoding)
+            .map_err(|source| Error::Store {
+                operation: format!("download {object}"),
+                source,
+            })
+    })
+    .and_then(|found| {
+        file.flush().operation("flush Lake artifact")?;
+        Ok(found)
+    });
+    match found {
+        Ok(Some(_)) => Ok(ExitCode::SUCCESS),
+        Ok(None) => {
+            fs::remove_file(path).operation("remove missing artifact")?;
+            eprintln!("{object} is missing from the cache bucket");
+            Ok(ExitCode::from(22))
+        }
+        Err(error) => {
+            fs::remove_file(path).operation("remove incomplete artifact")?;
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn download(args: &[String]) -> Result<ExitCode> {
     let scope =
         env::var("COVALENCE_LAKE_SCOPE").map_err(|_| invalid("missing Lake transfer scope"))?;
     mapping::segment_path(&scope)?;
     let single = ["-s", "-L", "-w", FORMAT, "--retry", "3"];
+    let file = ["-s", "-S", "-f", "-o"];
     let bulk = [
         "-Z", "-X", "GET", "-L", "--retry", "3", "-s", "-w", FORMAT, "--config",
     ];
+    let url = args.last().map(String::as_str).unwrap_or_default();
+    if !(args.starts_with(&bulk.map(String::from)) || url.starts_with(&format!("{BASE}/"))) {
+        // Another service's request, such as a dependency artifact. Curl gets
+        // Lake's arguments but none of the cache's AWS credentials.
+        let status = Command::new("curl")
+            .args(args)
+            .env_remove("AWS_ACCESS_KEY_ID")
+            .env_remove("AWS_SECRET_ACCESS_KEY")
+            .env_remove("AWS_SESSION_TOKEN")
+            .status()
+            .operation("start curl")?;
+        return Ok(status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .map_or(ExitCode::FAILURE, ExitCode::from));
+    }
+    if args.len() == file.len() + 3 && args[..file.len()] == file && args[file.len() + 1] == "-L" {
+        return download_file(&scope, url, Path::new(&args[file.len()]));
+    }
     if args.len() == single.len() + 1 && args[..single.len()] == single {
         let object = key(&args[single.len()], &scope, "r")?;
         let store = storage::store()?;
@@ -178,19 +302,15 @@ pub(crate) fn download(args: &[String]) -> Result<()> {
             .lock()
             .write_all(&body.bytes)
             .operation("write Lake mappings")?;
-        return report(0, found);
+        report(0, found)?;
+        return Ok(ExitCode::SUCCESS);
     }
     if args.len() != bulk.len() + 1 || args[..bulk.len()] != bulk {
         return Err(invalid("unsupported Lake download protocol"));
     }
     let config =
         fs::read_to_string(&args[bulk.len()]).operation("read Lake transfer configuration")?;
-    let directory = PathBuf::from(
-        env::var_os("COVALENCE_LAKE_ARTIFACTS")
-            .ok_or_else(|| invalid("missing Lake artifact directory"))?,
-    )
-    .canonicalize()
-    .operation("locate artifact directory")?;
+    let directory = artifact_directory()?;
     let lines = config.lines().collect::<Vec<_>>();
     if lines.is_empty() || !lines.len().is_multiple_of(2) {
         return Err(invalid("incomplete Lake transfer configuration"));
@@ -235,9 +355,7 @@ pub(crate) fn download(args: &[String]) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
     let store = storage::store()?;
-    let manifest = env::var_os("COVALENCE_LAKE_MANIFEST")
-        .ok_or_else(|| invalid("missing artifact manifest"))?;
-    let manifest = Manifest::parse(&fs::read(manifest).operation("read artifact manifest")?)?;
+    let manifest = published_manifest()?;
     // Validate every requested artifact before starting any downloads.
     let transfers = transfers
         .iter()
@@ -265,5 +383,5 @@ pub(crate) fn download(args: &[String]) -> Result<()> {
         file.flush().operation("flush Lake artifact")?;
         report(index, found)
     })?;
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }

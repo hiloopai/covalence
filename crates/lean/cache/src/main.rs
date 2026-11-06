@@ -69,8 +69,10 @@ fn execute(cli: Cli) -> Result<()> {
         Action::Dependencies => dependencies::fetch(&project, &cli.targets),
         Action::Build => project.build(&cli.targets),
         Action::Put | Action::Get => {
-            if !cli.targets.is_empty() {
-                return Err(invalid("only build and dependencies accept targets"));
+            if matches!(cli.action, Action::Put) && !cli.targets.is_empty() {
+                return Err(invalid(
+                    "put publishes a recorded build and accepts no targets",
+                ));
             }
             if matches!(cli.action, Action::Put)
                 && !(env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
@@ -86,7 +88,7 @@ fn execute(cli: Cli) -> Result<()> {
             let store = storage::store()?;
             match cli.action {
                 Action::Put => storage::publish(&project, &store),
-                _ => restore::restore(&project, &store),
+                _ => restore::restore(&project, &store, &cli.targets),
             }
         }
     }
@@ -96,10 +98,10 @@ fn main() -> ExitCode {
     let result = if env::var_os("COVALENCE_LAKE_SCOPE").is_some() {
         restore::download(&env::args().skip(1).collect::<Vec<_>>())
     } else {
-        execute(Cli::parse())
+        execute(Cli::parse()).map(|()| ExitCode::SUCCESS)
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("{:?}", miette::Report::new(error));
             ExitCode::FAILURE

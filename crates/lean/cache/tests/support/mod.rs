@@ -20,6 +20,7 @@ use tokio::sync::oneshot;
 pub struct Server {
     pub endpoint: String,
     pub writes: Arc<Mutex<Vec<String>>>,
+    pub reads: Arc<Mutex<Vec<String>>>,
     pub deny: Arc<AtomicBool>,
     pub incomplete: Arc<AtomicBool>,
     stop: Option<oneshot::Sender<()>>,
@@ -36,16 +37,32 @@ impl Server {
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let writes = Arc::new(Mutex::new(Vec::new()));
+        let reads = Arc::new(Mutex::new(Vec::new()));
         let deny = Arc::new(AtomicBool::new(false));
         let incomplete = Arc::new(AtomicBool::new(false));
-        let (log, fail, broken) = (writes.clone(), deny.clone(), incomplete.clone());
+        let (log, read_log, fail, broken) = (
+            writes.clone(),
+            reads.clone(),
+            deny.clone(),
+            incomplete.clone(),
+        );
         let handle = move |request: hyper::Request<hyper::body::Incoming>| {
-            let (service, log, fail, broken) =
-                (service.clone(), log.clone(), fail.clone(), broken.clone());
+            let (service, log, read_log, fail, broken) = (
+                service.clone(),
+                log.clone(),
+                read_log.clone(),
+                fail.clone(),
+                broken.clone(),
+            );
             async move {
                 let write = request.method() == "PUT";
                 if write {
                     log.lock().unwrap().push(request.uri().path().to_owned());
+                } else if request.method() == "GET" {
+                    read_log
+                        .lock()
+                        .unwrap()
+                        .push(request.uri().path().to_owned());
                 }
                 if write && fail.load(Ordering::SeqCst) {
                     return Ok(hyper::Response::builder()
@@ -91,6 +108,7 @@ impl Server {
         Self {
             endpoint,
             writes,
+            reads,
             deny,
             incomplete,
             stop: Some(stop),
