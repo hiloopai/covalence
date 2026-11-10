@@ -1,8 +1,12 @@
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc};
+
+use covalence_kv_trait::Kv;
 
 use crate::{
     error::{IoResult, Result},
-    project::{Project, run},
+    project::{Project, Source, run},
+    restore::Session,
+    storage,
 };
 
 /// Mathlib's Lake configuration naming the cache services of its snapshot.
@@ -15,25 +19,49 @@ pub(crate) fn config(project: &Project) -> PathBuf {
         .join(".lake/packages/mathlib/.meta/lake-config.toml")
 }
 
-pub(crate) fn fetch(project: &Project, targets: &[String]) -> Result<()> {
+/// Restores each Git dependency's published build of its pin; with targets,
+/// only mappings, then a build of what the targets need.
+pub(crate) fn fetch(project: &Project, kv: &Arc<dyn Kv>, targets: &[String]) -> Result<()> {
     run("Lake", project.lake().args(["env", "true"]))?;
-    mappings(project, !targets.is_empty())?;
+    let scope = project.identity()?.scope;
+    let mut session = Session::new(project, kv, &scope)?;
+    install(project, kv, &mut session, !targets.is_empty())?;
     if !targets.is_empty() {
-        run(
-            "Lake dependency build",
-            project
-                .lake()
-                .env("LAKE_CONFIG", config(project))
-                .args(["build", "--wfail"])
-                .args(targets),
-        )?;
+        session.build(project, targets)?;
     }
     Ok(())
 }
 
-/// Fetches the Mathlib/CSLib snapshot's mappings, and unless `mappings_only`,
-/// all of its artifacts.
-pub(crate) fn mappings(project: &Project, mappings_only: bool) -> Result<()> {
+/// Install each Git dependency's map from the pool, and the Mathlib/CSLib
+/// snapshot from upstream for packages the pool has no build of.
+pub(crate) fn install(
+    project: &Project,
+    kv: &Arc<dyn Kv>,
+    session: &mut Session,
+    lazy: bool,
+) -> Result<()> {
+    let mut missing = BTreeSet::new();
+    for package in project.packages()? {
+        let Source::Git { commit, .. } = &package.source else {
+            continue;
+        };
+        let key = project.revision_key(session.scope(), &package, commit)?;
+        match storage::pointer(&**kv, &key)? {
+            Some(root) => session.install(project, &package, false, root, lazy)?,
+            None => {
+                missing.insert(package.name);
+            }
+        }
+    }
+    if config(project).exists() {
+        mappings(project, lazy, &missing)?;
+    }
+    Ok(())
+}
+
+/// Fetches the Mathlib/CSLib snapshot's mappings for `packages`, and unless
+/// `mappings_only`, all of their artifacts.
+fn mappings(project: &Project, mappings_only: bool, packages: &BTreeSet<String>) -> Result<()> {
     let snapshot = project.git(&["-C", ".lake/packages/mathlib", "rev-parse", "HEAD"])?;
     let toolchain =
         fs::read_to_string(project.root.join("lean-toolchain")).operation("read Lean toolchain")?;
@@ -50,6 +78,9 @@ pub(crate) fn mappings(project: &Project, mappings_only: bool) -> Result<()> {
         ("importGraph", "import-graph"),
         ("Cli", "lean4-cli"),
     ] {
+        if !packages.contains(name) {
+            continue;
+        }
         let revision = if name == "cslib" {
             project.git(&["-C", ".lake/packages/cslib", "rev-parse", "HEAD"])?
         } else {

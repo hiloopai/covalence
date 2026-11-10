@@ -22,7 +22,6 @@ pub struct Server {
     pub writes: Arc<Mutex<Vec<String>>>,
     pub reads: Arc<Mutex<Vec<String>>>,
     pub deny: Arc<AtomicBool>,
-    pub incomplete: Arc<AtomicBool>,
     stop: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -39,21 +38,10 @@ impl Server {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let reads = Arc::new(Mutex::new(Vec::new()));
         let deny = Arc::new(AtomicBool::new(false));
-        let incomplete = Arc::new(AtomicBool::new(false));
-        let (log, read_log, fail, broken) = (
-            writes.clone(),
-            reads.clone(),
-            deny.clone(),
-            incomplete.clone(),
-        );
+        let (log, read_log, fail) = (writes.clone(), reads.clone(), deny.clone());
         let handle = move |request: hyper::Request<hyper::body::Incoming>| {
-            let (service, log, read_log, fail, broken) = (
-                service.clone(),
-                log.clone(),
-                read_log.clone(),
-                fail.clone(),
-                broken.clone(),
-            );
+            let (service, log, read_log, fail) =
+                (service.clone(), log.clone(), read_log.clone(), fail.clone());
             async move {
                 let write = request.method() == "PUT";
                 if write {
@@ -68,18 +56,6 @@ impl Server {
                     return Ok(hyper::Response::builder()
                         .status(403)
                         .body("<Error><Code>AccessDenied</Code></Error>".to_owned().into())
-                        .unwrap());
-                }
-                if request
-                    .uri()
-                    .query()
-                    .is_some_and(|q| q.contains("list-type"))
-                    && broken.load(Ordering::SeqCst)
-                {
-                    let xml = "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Prefix>wrong</Prefix><IsTruncated>true</IsTruncated></ListBucketResult>";
-                    return Ok(hyper::Response::builder()
-                        .status(200)
-                        .body(xml.to_owned().into())
                         .unwrap());
                 }
                 service.call(request.map(s3s::Body::from)).await
@@ -110,7 +86,6 @@ impl Server {
             writes,
             reads,
             deny,
-            incomplete,
             stop: Some(stop),
             thread: Some(thread),
         }

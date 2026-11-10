@@ -950,9 +950,18 @@ dependencies = [
 name = "covalence-lean-cache"
 version = "0.1.0-dev.7"
 dependencies = [
+ "blake3",
+ "covalence-cas-kv",
+ "covalence-cas-memory",
+ "covalence-cas-prolly",
+ "covalence-cas-sqlite",
+ "covalence-cas-trait",
+ "covalence-kv-memory",
  "covalence-kv-s3",
  "covalence-kv-trait",
+ "covalence-lib-cid",
  "covalence-lib-cli",
+ "covalence-lib-dasl",
  "covalence-lib-data",
  "covalence-lib-error",
  "covalence-lib-serde",

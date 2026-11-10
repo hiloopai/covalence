@@ -32,6 +32,17 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Changed
 
+- **Breaking:** `cov-lake-cache` publishes to one pool per platform and
+  toolchain, shared by every repository, under `lake/` in the bucket.
+  Artifacts are stored under CIDs in the key-value CAS, and each published
+  package revision is a Prolly map from Lake input hash to outputs. `build`
+  records every package, `put` uploads only what differs from the nearest
+  published ancestor, `get` restores the nearest published first-parent
+  ancestor, and `dependencies` reads the pool before upstream caches.
+  `--package`, `LAKE_CI_PREFIX` and the `main-latest` pointer are removed.
+  Upgrade by repinning and running `build` and `put` once on main; old
+  snapshots are not read.
+
 - **Breaking:** `cov-lake-cache build --package` selects recorded outputs while
   preserving Lake's normal build targets. Use `-- @dependency` to build a
   dependency's default targets explicitly. An unused package produces a valid
