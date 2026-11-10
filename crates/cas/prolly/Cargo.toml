@@ -1,0 +1,22 @@
+[package]
+name = "covalence-cas-prolly"
+description = "Prolly maps on a CAS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+covalence-cas-trait = { path = "../trait" }
+covalence-lib-cid = { path = "../../lib/cid" }
+covalence-lib-dasl = { path = "../../lib/dasl" }
+covalence-lib-data = { path = "../../lib/data" }
+covalence-lib-error.workspace = true
+hashlink = "0.12.2"
+
+[dev-dependencies]
+covalence-cas-memory = { path = "../memory" }
+proptest = "1.11.0"
+
+[lints]
+workspace = true

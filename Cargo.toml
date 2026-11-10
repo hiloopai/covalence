@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lib/error", "crates/lib/cli", "tools/glu", "crates/lib/serde", "crates/lib/config", "crates/lib/data", "crates/lib/python", "crates/python", "crates/lib/cid", "crates/lib/sqlite", "crates/lib/dasl", "crates/cas/trait", "crates/cas/memory", "crates/lib/rand", "crates/cas/sqlite", "crates/kv/trait", "crates/kv/memory", "crates/kv/s3", "crates/cas/kv", "crates/blob/trait", "crates/lean/cache"]
+members = ["crates/lib/error", "crates/lib/cli", "tools/glu", "crates/lib/serde", "crates/lib/config", "crates/lib/data", "crates/lib/python", "crates/python", "crates/lib/cid", "crates/lib/sqlite", "crates/lib/dasl", "crates/cas/trait", "crates/cas/memory", "crates/lib/rand", "crates/cas/sqlite", "crates/cas/prolly", "crates/kv/trait", "crates/kv/memory", "crates/kv/s3", "crates/cas/kv", "crates/blob/trait", "crates/lean/cache"]
 resolver = "3"
 
 [workspace.package]
