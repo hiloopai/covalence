@@ -17,14 +17,14 @@ use std::{
 
 use covalence_cas_kv::KvCas;
 use covalence_cas_prolly::Map;
-use covalence_cas_trait::Cas;
 use covalence_kv_trait::Kv;
-use covalence_lib_cid::{Bdasl, Blake3, Cid};
+use covalence_lib_cid::{Bdasl, Cid, Sha256};
 use serde_json::json;
 
 use crate::{
+    blobs::Blobs,
     dependencies,
-    error::{Error, IoResult, Result, encode, invalid, json},
+    error::{IoResult, Result, encode, invalid, json},
     local::{Installed, Local},
     mapping, pool,
     project::{Package, Project, Source, run},
@@ -42,6 +42,7 @@ pub(crate) struct Session {
     scope: String,
     local: Local,
     remote: KvCas,
+    blobs: Blobs,
     index: BTreeMap<String, String>,
 }
 
@@ -65,6 +66,7 @@ impl Session {
             scope: scope.to_owned(),
             local,
             remote: pool::store(kv.clone(), scope)?,
+            blobs: pool::blobs(kv.clone(), scope)?,
             index: BTreeMap::new(),
         };
         session.save_index()?;
@@ -187,7 +189,7 @@ impl Session {
     }
 
     /// Download `artifacts` that Lake's cache lacks into it, in parallel.
-    fn prefetch(&self, artifacts: &BTreeMap<String, Blake3>) -> Result<()> {
+    fn prefetch(&self, artifacts: &BTreeMap<String, Sha256>) -> Result<()> {
         let directory = self.local.directory().join("artifacts");
         let missing = artifacts
             .iter()
@@ -198,7 +200,7 @@ impl Session {
             if staged.exists() {
                 fs::remove_file(&staged).operation("remove stale prefetch")?;
             }
-            match fetch(&self.remote, &(**cid).into(), &staged)? {
+            match fetch(&self.blobs, cid, &staged)? {
                 // The store checked the bytes against the CID the map names.
                 Some(_) => fs::rename(&staged, directory.join(name))
                     .operation("install prefetched artifact"),
@@ -299,7 +301,7 @@ fn artifact_directory() -> Result<PathBuf> {
 }
 
 /// The CIDs of the artifacts this session may serve, by Lake hash.
-fn index() -> Result<BTreeMap<String, Cid>> {
+fn index() -> Result<BTreeMap<String, Sha256>> {
     let path =
         env::var_os("COVALENCE_LAKE_INDEX").ok_or_else(|| invalid("missing artifact index"))?;
     let index: BTreeMap<String, String> = json(&fs::read(path).operation("read artifact index")?)?;
@@ -316,18 +318,12 @@ fn index() -> Result<BTreeMap<String, Cid>> {
 }
 
 /// Stream one artifact from the pool into a new file at `path`.
-fn fetch(store: &dyn Cas, cid: &Cid, path: &Path) -> Result<Option<u64>> {
+fn fetch(store: &Blobs, cid: &Sha256, path: &Path) -> Result<Option<u64>> {
     let mut file = File::create_new(path).operation("create Lake artifact")?;
-    let found = store
-        .get_to(cid, &mut file)
-        .map_err(|source| Error::Cas {
-            operation: format!("download {cid}"),
-            source,
-        })
-        .and_then(|found| {
-            file.flush().operation("flush Lake artifact")?;
-            Ok(found)
-        });
+    let found = store.get_to(cid, &mut file).and_then(|found| {
+        file.flush().operation("flush Lake artifact")?;
+        Ok(found)
+    });
     match found {
         Ok(Some(bytes)) => Ok(Some(bytes)),
         Ok(None) => {
@@ -342,8 +338,8 @@ fn fetch(store: &dyn Cas, cid: &Cid, path: &Path) -> Result<Option<u64>> {
     }
 }
 
-fn pool_store(scope: &str) -> Result<covalence_cas_kv::KvCas> {
-    pool::store(storage::store()?, scope)
+fn pool_store(scope: &str) -> Result<Blobs> {
+    pool::blobs(storage::store()?, scope)
 }
 
 /// Serves one artifact a build finds missing; a miss makes Lake build it.

@@ -151,15 +151,16 @@ impl Fixture {
     }
     /// The pool object holding the bytes of a local file.
     fn pool_object(&self, path: &Path) -> PathBuf {
-        let digest = blake3::hash(&fs::read(path).unwrap());
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(fs::read(path).unwrap());
         let digest = data_encoding::BASE32_NOPAD
-            .encode(digest.as_bytes())
+            .encode(&digest)
             .to_ascii_lowercase();
         self.temporary
             .path()
             .join("s3/bucket/lake")
             .join(self.scope())
-            .join("cas/blake3")
+            .join("cas/sha2-256")
             .join(digest)
             .join("bytes.zst")
     }

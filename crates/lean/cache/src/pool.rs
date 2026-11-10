@@ -3,8 +3,10 @@
 //!
 //! Keys under the bucket, for a scope `<os>-<arch>/<toolchain>`:
 //!
-//! - `lake/<scope>/cas/blake3/<digest>/bytes.zst`: artifact bytes and map
-//!   nodes, as a [`KvCas`] with Zstandard. A CID names the raw bytes.
+//! - `lake/<scope>/cas/sha2-256/<digest>/bytes.zst`: artifact bytes under
+//!   the SHA-256 CID of the raw bytes, as a Zstandard frame.
+//! - `lake/<scope>/cas/blake3/<digest>/bytes.zst`: map nodes, in a [`KvCas`]
+//!   with Zstandard; Prolly names its nodes by BLAKE3.
 //! - `lake/<scope>/rev/<owner>/<repo>/<commit>/<package>`: the root CID of
 //!   that package's [`Map`] at that commit, as text.
 //!
@@ -22,11 +24,12 @@ use covalence_cas_kv::{Compression, KvCas};
 use covalence_cas_prolly::Map;
 use covalence_cas_trait::{Cas, GetExt};
 use covalence_kv_trait::Kv;
-use covalence_lib_cid::{Bdasl, Blake3, Cid, Codec, Packed32, storage};
+use covalence_lib_cid::{Bdasl, Cid, Codec, Packed32, Sha256, storage};
 use covalence_lib_dasl::Value;
 use covalence_lib_data::Bytes;
 
 use crate::{
+    blobs::Blobs,
     error::{Error, Result, invalid},
     mapping,
     storage::parallel,
@@ -35,12 +38,18 @@ use crate::{
 /// The version of this layout, mixed into every toolchain scope.
 pub const FORMAT: &str = "cov-lake/v1";
 
-/// The content-addressed store of a scope's artifacts and map nodes.
+/// The content-addressed store of a scope's map nodes.
 pub fn store(kv: Arc<dyn Kv>, scope: &str) -> Result<KvCas> {
     mapping::segment_path(scope)?;
     KvCas::with_prefix(kv, &format!("lake/{scope}/cas"))
         .map(|cas| cas.with_compression(Compression::zstd(1)))
         .map_err(|_| invalid("invalid pool scope"))
+}
+
+/// The store of a scope's artifacts.
+pub(crate) fn blobs(kv: Arc<dyn Kv>, scope: &str) -> Result<Blobs> {
+    mapping::segment_path(scope)?;
+    Ok(Blobs::new(kv, &format!("lake/{scope}/cas")))
 }
 
 /// The key of a package's revision pointer.
@@ -60,7 +69,7 @@ pub struct Entry {
     /// Lake's output descriptor, exactly as its mapping files write it.
     pub output: String,
     /// Each artifact the descriptor names, by Lake file name, with its CID.
-    pub artifacts: BTreeMap<String, Blake3>,
+    pub artifacts: BTreeMap<String, Sha256>,
 }
 
 fn cid_error(operation: &'static str) -> impl FnOnce(covalence_lib_cid::Error) -> Error {
@@ -118,7 +127,7 @@ impl Entry {
             .into_iter()
             .map(|(name, link)| match link {
                 Value::Link(cid) if mapping::artifact_name(&name) => cid
-                    .cast::<storage::Blake3>()
+                    .cast::<storage::Sha256>()
                     .map(|cid| (name, cid))
                     .map_err(|_| malformed()),
                 _ => Err(malformed()),
@@ -167,7 +176,7 @@ pub struct Transfer {
     pub entries: BTreeMap<String, Entry>,
     /// Artifacts those entries name that the entries they replace did not,
     /// by Lake file name.
-    pub artifacts: BTreeMap<String, Blake3>,
+    pub artifacts: BTreeMap<String, Sha256>,
 }
 
 /// The minimal transfer from the map at `from`, if any, to `to`: Prolly's
@@ -264,7 +273,7 @@ mod tests {
     fn entry(output: &str, artifact: &[u8]) -> Entry {
         Entry {
             output: format!("\"{output}\""),
-            artifacts: BTreeMap::from([(output.to_owned(), Blake3::of(artifact))]),
+            artifacts: BTreeMap::from([(output.to_owned(), Sha256::of(artifact))]),
         }
     }
 
@@ -331,8 +340,6 @@ mod tests {
         let total = copy_nodes(&*remote, &*fresh, new.root()).unwrap();
         assert!(total >= first);
         assert_eq!(entries(&Map::open(fresh, new.root())).unwrap(), all);
-        let artifact: Cid = Blake3::of(b"edited").into();
-        assert!(!remote.has(&artifact).unwrap());
     }
 
     #[test]

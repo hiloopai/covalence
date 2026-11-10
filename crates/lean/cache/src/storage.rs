@@ -1,8 +1,7 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
-    env,
-    fs::{self, File},
+    env, fs,
     path::Path,
     sync::{
         Arc,
@@ -16,11 +15,12 @@ use covalence_cas_prolly::Map;
 use covalence_cas_trait::Cas;
 use covalence_kv_s3::{AwsOptions, S3Kv, S3Location};
 use covalence_kv_trait::Kv;
-use covalence_lib_cid::{Bdasl, Blake3, Cid, Format};
+use covalence_lib_cid::{Bdasl, Cid, Sha256};
 use covalence_lib_data::Bytes;
 use covalence_lib_serde::Serialize;
 
 use crate::{
+    blobs::{self, Blobs},
     error::{Error, IoResult, Result, encode, invalid},
     local::Local,
     mapping,
@@ -107,13 +107,6 @@ fn store_error(operation: impl Into<String>) -> impl FnOnce(covalence_kv_trait::
     }
 }
 
-fn cas_error(operation: impl Into<String>) -> impl FnOnce(covalence_cas_trait::Error) -> Error {
-    move |source| Error::Cas {
-        operation: operation.into(),
-        source,
-    }
-}
-
 /// The root a revision pointer names, or `None` if it is unpublished.
 pub(crate) fn pointer(kv: &dyn Kv, key: &str) -> Result<Option<Cid<Bdasl>>> {
     let Some(bytes) = kv
@@ -149,23 +142,11 @@ pub(crate) fn nearest(
 }
 
 /// The CID of each file, hashed in parallel.
-fn hash_files(files: &[(String, std::path::PathBuf)]) -> Result<BTreeMap<String, (Blake3, u64)>> {
+fn hash_files(files: &[(String, std::path::PathBuf)]) -> Result<BTreeMap<String, (Sha256, u64)>> {
     Ok(files
         .iter()
         .map(|(name, _)| name.clone())
-        .zip(parallel(files, |_, (_, path)| {
-            let mut file = File::open(path).operation(format!("open {}", path.display()))?;
-            let mut hash = blake3::Hasher::new();
-            let bytes = std::io::copy(&mut file, &mut hash).operation("hash Lake artifact")?;
-            let cid =
-                Blake3::new(Format::BLAKE3, hash.finalize().as_bytes()).map_err(|source| {
-                    Error::Cid {
-                        operation: "address Lake artifact".into(),
-                        source,
-                    }
-                })?;
-            Ok((cid, bytes))
-        })?)
+        .zip(parallel(files, |_, (_, path)| blobs::hash_file(path))?)
         .collect())
 }
 
@@ -223,6 +204,7 @@ struct Publisher<'a> {
     project: &'a Project,
     kv: &'a dyn Kv,
     remote: &'a dyn Cas,
+    blobs: &'a Blobs,
     local: &'a Local,
     scope: &'a str,
     /// Every commit the manifest pins.
@@ -236,6 +218,7 @@ fn publish_package(publisher: &Publisher, package: &Package) -> Result<Option<Pu
         project,
         kv,
         remote,
+        blobs,
         local,
         scope,
         ref pins,
@@ -295,11 +278,7 @@ fn publish_package(publisher: &Publisher, package: &Package) -> Result<Option<Pu
         .iter()
         .map(|(name, cid)| (name.clone(), *cid))
         .collect::<Vec<_>>();
-    let present = parallel(&wanted, |_, (_, cid)| {
-        remote
-            .has(&(*cid).into())
-            .map_err(cas_error("inspect pool artifact"))
-    })?;
+    let present = parallel(&wanted, |_, (_, cid)| blobs.has(cid))?;
     let mut missing = wanted
         .into_iter()
         .zip(present)
@@ -313,10 +292,7 @@ fn publish_package(publisher: &Publisher, package: &Package) -> Result<Option<Pu
     // Start large bodies before small files can leave them at the tail.
     missing.sort_unstable_by_key(|(_, _, bytes)| Reverse(*bytes));
     let artifact_bytes = parallel(&missing, |_, (path, cid, bytes)| {
-        let mut file = File::open(path).operation(format!("open {}", path.display()))?;
-        remote
-            .put_from(*cid, &mut file, *bytes)
-            .map_err(cas_error(format!("upload {}", path.display())))?;
+        blobs.put_file(cid, path)?;
         Ok(*bytes)
     })?
     .into_iter()
@@ -362,6 +338,7 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>) -> Result<()> {
         project,
         kv: &**kv,
         remote: &remote,
+        blobs: &pool::blobs(kv.clone(), scope)?,
         local: &local,
         scope,
         pins,

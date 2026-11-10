@@ -26,9 +26,11 @@ is `<os>-<arch>/<toolchain>`, where `<toolchain>` is the SHA-256 of this
 layout's version (`cov-lake/v1`), `lean --version` and the toolchain's
 `leantar` executable. Under `lake/<scope>/`:
 
-- `cas/blake3/<digest>/bytes.zst` holds artifacts and map nodes in
-  Covalence's key-value CAS with Zstandard. Each CID names the raw bytes, and
-  every read checks them.
+- `cas/sha2-256/<digest>/bytes.zst` holds each artifact as a Zstandard frame,
+  under the SHA-256 CID of its raw bytes, the hash of Covalence receipts and of
+  Lake's planned content hashes. Every read checks it.
+- `cas/blake3/<digest>/bytes.zst` holds map nodes in Covalence's key-value CAS
+  with Zstandard; Prolly names its nodes by BLAKE3.
 - `rev/<owner>/<repo>/<commit>/<package>` holds, as text, the root CID of a
   Prolly map from Lake input hash to that input's output descriptor and the
   CID of each artifact it names. That map is the only place Lake artifact IDs
