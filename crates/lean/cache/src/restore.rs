@@ -209,7 +209,14 @@ impl Session {
             }
             run("Lake restore", command.arg(file))
         };
-        storage::parallel(&files, |_, file| restore(file))?;
+        // Loading a workspace reconfigures any package whose configuration is
+        // stale, such as one just checked out, under an exclusive lock that a
+        // concurrent load fails on rather than waits for. The first Lake run
+        // loads the workspace alone; the rest then only read it.
+        if let Some((first, rest)) = files.split_first() {
+            restore(first)?;
+            storage::parallel(rest, |_, file| restore(file))?;
+        }
         let levels: &[Installed] = if lazy {
             &[Installed::Mappings]
         } else {

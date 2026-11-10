@@ -17,6 +17,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Fixed
 
+- `cov-lake-cache get` no longer fails with "could not acquire an exclusive
+  configuration lock" on a workspace Lake has not configured: the first
+  mapping install loads the workspace alone, then the rest run at once.
+
 - A Lake workspace below its repository's root keeps its own revision maps,
   module indexes and seed slots under `<owner>/<repo>/<folder>`, so
   publishing it no longer overwrites the root workspace's map of a shared

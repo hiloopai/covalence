@@ -1158,3 +1158,56 @@ fn recording_after_a_seeded_restore_reuses_the_pools_archives() {
         published
     );
 }
+
+#[test]
+fn restores_into_a_workspace_lake_has_not_configured_install_without_lock_failures() {
+    // Several packages' mappings install at once; on a fresh checkout each
+    // Lake run would otherwise reconfigure the workspace concurrently.
+    let fixture = Fixture::new();
+    let mut config = fs::read_to_string(fixture.root.join("lakefile.toml")).unwrap();
+    for name in ["DepA", "DepB", "DepC"] {
+        let dependency = fixture.root.join(name);
+        fs::create_dir(&dependency).unwrap();
+        fs::write(
+            dependency.join("lakefile.toml"),
+            format!(
+                "name = \"{}\"\n[[lean_lib]]\nname = \"{name}\"\n",
+                name.to_lowercase()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dependency.join(format!("{name}.lean")),
+            format!(
+                "module\npublic theorem {} : True := trivial\n",
+                name.to_lowercase()
+            ),
+        )
+        .unwrap();
+        config.push_str(&format!(
+            "\n[[require]]\nname = \"{}\"\npath = \"{name}\"\n",
+            name.to_lowercase()
+        ));
+    }
+    fs::write(fixture.root.join("lakefile.toml"), config).unwrap();
+    fs::write(
+        fixture.root.join("Demo/A.lean"),
+        "module\npublic import DepA\npublic import DepB\npublic import DepC\npublic theorem a (n : Nat) : n + 0 = n := by simp\n",
+    )
+    .unwrap();
+    checked(fixture.lake().arg("update"));
+    fixture.commit();
+    fixture.build();
+    checked(&mut fixture.cli("put"));
+    for _ in 0..3 {
+        fixture.reset_local();
+        // Drop every package's configuration, as on a fresh checkout.
+        for dir in [".lake", "DepA/.lake", "DepB/.lake", "DepC/.lake"] {
+            let path = fixture.root.join(dir);
+            if path.exists() {
+                fs::remove_dir_all(path).unwrap();
+            }
+        }
+        checked(fixture.cli("get").args(["--", "Demo"]));
+    }
+}
