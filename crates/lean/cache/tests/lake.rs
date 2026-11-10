@@ -227,7 +227,7 @@ fn embedded_nul_strings_survive_publication_and_native_restore() {
     fixture.publish();
     fixture.reset_local();
     let restored = log(&checked(&mut fixture.cli("get")));
-    assert!(restored.contains("unpacked"), "{restored}");
+    assert!(restored.contains("placed 3 archives"), "{restored}");
     // The restore decoded every archive, so Lake runs no archiver.
     // `lake env lean` below reads `.lake/build`, which a cache hit fills only
     // when all artifacts are restored.
