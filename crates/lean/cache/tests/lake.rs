@@ -1096,3 +1096,45 @@ fn an_older_checkout_seeds_from_a_later_commit_and_takes_the_rest_from_the_pool(
     assert!(restored.contains("Lake cache: seeded"), "{restored}");
     assert!(!restored.contains("Built Demo"), "rebuilt: {restored}");
 }
+
+#[test]
+fn module_traces_name_the_recorded_inputs_and_targeted_restores_prefetch_them() {
+    let fixture = Fixture::new();
+    fixture.build();
+    // The input hash in each module's trace is the one Lake's `-o` records,
+    // which the module index relies on.
+    let recorded = fs::read_to_string(fixture.record("packages/demo.jsonl")).unwrap();
+    let trace: Value = serde_json::from_slice(
+        &fs::read(fixture.root.join(".lake/build/lib/lean/Demo/A.trace")).unwrap(),
+    )
+    .unwrap();
+    let input = trace["depHash"].as_str().unwrap();
+    assert!(
+        recorded.contains(&format!("[\"{input}\",")),
+        "{input} not in {recorded}"
+    );
+    let index: Value =
+        serde_json::from_slice(&fs::read(fixture.record("modules/demo.json")).unwrap()).unwrap();
+    assert_eq!(index["modules"]["Demo.A"], input);
+    checked(&mut fixture.cli("put"));
+    assert!(
+        fixture
+            .server
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|key| key.contains("/modules/") && key.ends_with("/demo"))
+    );
+    fixture.reset_local();
+    let restored = log(&checked(fixture.cli("get").args(["--", "Demo.A"])));
+    assert!(
+        restored.contains("prefetching 1 of the 1 workspace modules"),
+        "{restored}"
+    );
+    assert!(!restored.contains("Built Demo.A"), "rebuilt: {restored}");
+    assert!(
+        !restored.contains("Unpacked Demo.A"),
+        "unpacked: {restored}"
+    );
+}

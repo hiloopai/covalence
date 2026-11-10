@@ -9,6 +9,7 @@ pub mod error;
 mod gc;
 mod local;
 mod mapping;
+mod modules;
 pub mod pool;
 mod project;
 mod restore;

@@ -25,6 +25,7 @@ use crate::{
     error::{Error, IoResult, Result, encode, invalid},
     local::Local,
     mapping,
+    modules::Index,
     pool::{self, Entry},
     project::{Package, Project, Source},
     seed, sources_tree,
@@ -346,6 +347,7 @@ fn publish_package(publisher: &Publisher, package: &Package) -> Result<Option<Pu
         return Ok(None);
     }
     let map = pool::build(local.nodes(), &entries)?;
+    publish_modules(publisher, package, &commit, &entries)?;
     if parent.as_ref().is_some_and(|(_, root)| *root == map.root())
         && package.source != Source::Repository
     {
@@ -404,6 +406,40 @@ fn publish_package(publisher: &Publisher, package: &Package) -> Result<Option<Pu
         nodes,
         seconds: started.elapsed().as_secs_f64(),
     }))
+}
+
+/// Publish the module index `build` recorded for `package` at `commit`,
+/// keeping only modules whose input `entries` maps. A Git dependency's index
+/// is the union of every publisher's, this one's winning, like its map. It
+/// goes before the revision pointer; a reader that finds it first only
+/// prefetches less.
+fn publish_modules(
+    publisher: &Publisher,
+    package: &Package,
+    commit: &str,
+    entries: &BTreeMap<String, Entry>,
+) -> Result<()> {
+    let Some(mut recorded) = Index::load(&publisher.project.modules(&package.name))? else {
+        return Ok(());
+    };
+    let key = publisher
+        .project
+        .modules_key(publisher.scope, package, commit)?;
+    let existing = Index::get(publisher.kv, &key)?;
+    let mut index = match (&package.source, &existing) {
+        (Source::Git { .. }, Some(existing)) => Index {
+            modules: existing.modules.clone(),
+        },
+        _ => Index::default(),
+    };
+    index.modules.append(&mut recorded.modules);
+    index.modules.retain(|_, input| entries.contains_key(input));
+    if index.modules.is_empty()
+        || existing.is_some_and(|existing| existing.modules == index.modules)
+    {
+        return Ok(());
+    }
+    index.put(publisher.kv, &key)
 }
 
 pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>) -> Result<()> {

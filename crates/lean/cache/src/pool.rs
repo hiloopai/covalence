@@ -63,6 +63,14 @@ pub fn revision_key(scope: &str, repository: &str, commit: &str, package: &str) 
     Ok(format!("lake/{scope}/rev/{repository}/{commit}/{package}"))
 }
 
+/// The key of a package revision's module index (see `modules`).
+pub fn modules_key(scope: &str, repository: &str, commit: &str, package: &str) -> Result<String> {
+    revision_key(scope, repository, commit, package)?;
+    Ok(format!(
+        "lake/{scope}/modules/{repository}/{commit}/{package}"
+    ))
+}
+
 /// What one Lake input produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {

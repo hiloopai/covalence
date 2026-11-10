@@ -40,7 +40,13 @@ pub(crate) fn fetch(project: &Project, kv: &Arc<dyn Kv>, targets: &[String]) -> 
     let mut session = Session::new(project, kv, &scope, Local::open(project)?)?;
     upstream(project, session.local(), lazy, &BTreeSet::new())?;
     let installs = pins(project, kv, &session)?;
-    session.install(project, &installs, lazy, &Seeded::new())?;
+    session.install(
+        project,
+        &installs,
+        lazy,
+        &Seeded::new(),
+        &Default::default(),
+    )?;
     if lazy {
         session.build(project, targets)?;
     }

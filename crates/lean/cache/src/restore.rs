@@ -29,7 +29,7 @@ use crate::{
     dependencies,
     error::{IoResult, Result, encode, invalid, json},
     local::{Installed, Local},
-    mapping, pool,
+    mapping, modules, pool,
     project::{Package, Project, Source, run},
     seed::{self, Seeded},
     sources, storage,
@@ -129,6 +129,7 @@ impl Session {
         installs: &[(Package, bool, Cid<Bdasl>)],
         lazy: bool,
         seeded: &Seeded,
+        prefetch: &BTreeMap<String, BTreeSet<String>>,
     ) -> Result<()> {
         let level = if lazy {
             Installed::Mappings
@@ -171,17 +172,25 @@ impl Session {
                     .directory
                     .path()
                     .join(format!("{}.jsonl", package.name));
+                let artifacts = self.local.directory().join("artifacts");
                 let outputs = if lazy {
-                    entries
-                        .iter()
-                        .map(|(input, entry)| (input.clone(), entry.output.clone()))
-                        .collect()
+                    // A guess at what the build will need, placed as an
+                    // eager restore places it; Lake fetches the rest.
+                    let (placed, mapped): (BTreeMap<_, _>, BTreeMap<_, _>) =
+                        entries.into_iter().partition(|(input, _)| {
+                            prefetch
+                                .get(&package.name)
+                                .is_some_and(|inputs| inputs.contains(input))
+                        });
+                    let mut outputs = archives::install(&self.blobs, &artifacts, &placed)?;
+                    outputs.extend(
+                        mapped
+                            .into_iter()
+                            .map(|(input, entry)| (input, entry.output)),
+                    );
+                    outputs
                 } else {
-                    archives::install(
-                        &self.blobs,
-                        &self.local.directory().join("artifacts"),
-                        &entries,
-                    )?
+                    archives::install(&self.blobs, &artifacts, &entries)?
                 };
                 mapping::write(&file, &outputs)?;
                 files.push((package, *root_package, file));
@@ -334,7 +343,13 @@ pub(crate) fn restore(
             }
         }
         let phase = Instant::now();
-        session.install(project, &installs, lazy, &seeded)?;
+        let prefetch = if lazy {
+            let commit = nearest.as_ref().map(|(commit, _)| commit.as_str());
+            modules::prefetch(project, &**kv, scope, &packages, commit, targets)?
+        } else {
+            BTreeMap::new()
+        };
+        session.install(project, &installs, lazy, &seeded, &prefetch)?;
         println!(
             "Lake cache: installed {} pool maps in {:.1} s",
             installs.len(),

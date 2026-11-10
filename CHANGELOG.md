@@ -123,6 +123,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
   `SqliteCas` writes them in one transaction, not one per value; other
   stores put them one at a time. Python: `Cas.put_many`.
 
+- `cov-lake-cache put` publishes a module index per package revision under
+  `lake/<scope>/modules/`, and a targeted `get` prefetches the outputs of the
+  targets' import closure, read from the sources, in bulk before Lake runs.
+
 - `AwsOptions::accelerate` sends `S3Kv` requests to the bucket's Transfer
   Acceleration endpoint. **Breaking:** construct `AwsOptions` with
   `..AwsOptions::default()` to pick up the new field.

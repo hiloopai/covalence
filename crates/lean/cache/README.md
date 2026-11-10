@@ -39,6 +39,12 @@ layout's version (`cov-lake/v1`), `lean --version` and the toolchain's
   meet CIDs. The root and path packages use this repository and commit; a Git
   dependency uses its own pinned repository and commit.
 
+- `modules/<owner>/<repo>/<commit>/<package>` holds, as Zstandard JSON
+  `{"modules": {<module>: <input>}}`, the Lake input each module of that
+  package revision had in the recorded build, read from the module traces
+  Lake left in the build folder. It is written before the revision pointer.
+  A targeted `get` uses it to prefetch (below); nothing else reads it.
+
 Lake artifact IDs are 64-bit hashes over outputs, so artifacts from different
 repositories coincide when their bytes do. Input hashes include no checkout
 path. A revision map, not the pool, says which output an input has: two
@@ -88,7 +94,13 @@ the scope.
 - `gc` frees the host's cache of toolchain scopes it stopped using (below).
 - With targets, `get` and `dependencies` install only mappings (`get` also
   those of the dependencies). `get` then runs `lake build --wfail` on the
-  targets, which fetches only the artifacts they need. Lake takes each artifact from its local
+  targets, which fetches only the artifacts they need. Before the build, `get`
+  reads the targets' import closure from the sources (the `import` lines of
+  each file, resolved in the packages' source folders and the root
+  `lakefile.toml`'s libraries and executables), looks each module up in the
+  restored revision's module index and places those entries' files as an
+  eager restore does. A module whose input changed since misses, and Lake
+  fetches or builds it as before. Lake takes each artifact from its local
   cache, else downloads it the first time the build needs it, else builds the
   module.
 

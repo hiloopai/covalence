@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     error::{Error, IoResult, Result, encode, invalid, json},
-    gc, mapping, pool,
+    gc, mapping,
+    modules::Index,
+    pool,
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -249,6 +251,22 @@ impl Project {
         }
     }
 
+    /// The pool key of `package`'s module index at `commit` of this
+    /// repository, or at its own pin.
+    pub fn modules_key(&self, scope: &str, package: &Package, commit: &str) -> Result<String> {
+        match &package.source {
+            Source::Repository => pool::modules_key(scope, &self.repository, commit, &package.name),
+            Source::Git { repository, commit } => {
+                pool::modules_key(scope, repository, commit, &package.name)
+            }
+        }
+    }
+
+    /// Where `build` records `package`'s module index.
+    pub fn modules(&self, package: &str) -> PathBuf {
+        self.record.join("modules").join(format!("{package}.json"))
+    }
+
     /// Lake's cache directory, which every worktree on this host shares
     /// unless `LAKE_CACHE_DIR` says otherwise.
     pub fn cache_dir(&self) -> Result<PathBuf> {
@@ -378,8 +396,10 @@ impl Project {
         let receipt = self.record.join("success.json");
         remove(&receipt)?;
         let packages_dir = self.record.join("packages");
-        if packages_dir.exists() {
-            fs::remove_dir_all(&packages_dir).operation("remove prior build records")?;
+        for directory in [&packages_dir, &self.record.join("modules")] {
+            if directory.exists() {
+                fs::remove_dir_all(directory).operation("remove prior build records")?;
+            }
         }
         fs::create_dir_all(&packages_dir).operation("create build record directory")?;
         self.clean()?;
@@ -399,11 +419,9 @@ impl Project {
                 command.args(["--package", &package.name]);
             }
             run("Lake build", command.args(targets))?;
-            add_traced_outputs(
-                &mapping,
-                &self.root.join(&package.dir).join(".lake/build"),
-                &self.cache_dir()?.join("artifacts"),
-            )?;
+            let build = self.root.join(&package.dir).join(".lake/build");
+            add_traced_outputs(&mapping, &build, &self.cache_dir()?.join("artifacts"))?;
+            Index::record(&build, &mapping)?.save(&self.modules(&package.name))?;
             recorded.insert(package.name.clone(), digest(&mapping)?);
         }
         self.clean()?;
@@ -458,7 +476,7 @@ fn add_traced_outputs(mapping: &Path, build: &Path, artifacts: &Path) -> Result<
         .map(|(input, (output, _))| (input, output))
         .collect::<BTreeMap<_, _>>();
     let mut added = 0;
-    for trace in traces(build)? {
+    for trace in files(build, "trace")? {
         let bytes = fs::read(&trace).operation(format!("read {}", trace.display()))?;
         // Old trace stubs and outputs of several files carry no single artifact.
         let Ok(trace) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -484,8 +502,8 @@ fn add_traced_outputs(mapping: &Path, build: &Path, artifacts: &Path) -> Result<
     Ok(added)
 }
 
-/// The `.trace` files under `directory`, if it exists.
-fn traces(directory: &Path) -> Result<Vec<PathBuf>> {
+/// The files with `extension` under `directory`, if it exists.
+pub(crate) fn files(directory: &Path, extension: &str) -> Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let mut pending = vec![directory.to_owned()];
     while let Some(directory) = pending.pop() {
@@ -508,10 +526,7 @@ fn traces(directory: &Path) -> Result<Vec<PathBuf>> {
                 .is_dir()
             {
                 pending.push(path);
-            } else if path
-                .extension()
-                .is_some_and(|extension| extension == "trace")
-            {
+            } else if path.extension().is_some_and(|found| found == extension) {
                 found.push(path);
             }
         }
