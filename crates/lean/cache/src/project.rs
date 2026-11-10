@@ -53,6 +53,14 @@ pub(crate) struct Project {
     pub record: PathBuf,
 }
 
+/// A manifest package name as Lake's `--package` and cache directories spell
+/// it: without the `«»` quotes Lean puts around names that are not identifiers.
+pub(crate) fn package_name(name: &str) -> &str {
+    name.strip_prefix('«')
+        .and_then(|name| name.strip_suffix('»'))
+        .unwrap_or(name)
+}
+
 /// The repository path of a Git URL: `owner/name` on GitHub, else the host
 /// followed by the path.
 pub(crate) fn repository_of(url: &str) -> Result<String> {
@@ -154,9 +162,11 @@ impl Project {
         let manifest: serde_json::Value =
             json(&fs::read(self.root.join("lake-manifest.json")).operation("read Lake manifest")?)?;
         let name = |value: &serde_json::Value| {
-            let name = value["name"]
-                .as_str()
-                .ok_or_else(|| invalid("Lake manifest package has no name"))?;
+            let name = package_name(
+                value["name"]
+                    .as_str()
+                    .ok_or_else(|| invalid("Lake manifest package has no name"))?,
+            );
             mapping::segment_path(name)?;
             Ok(name.to_owned())
         };
@@ -377,3 +387,45 @@ impl Project {
 
 /// How many first-parent commits a restore searches for a published build.
 const ANCESTORS: usize = 64;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quoted_manifest_names_match_lake_package_names() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("lake-manifest.json"),
+            r#"{"version": "1.1.0", "name": "«moria-lean»", "packagesDir": ".lake/packages",
+            "packages": [
+              {"type": "path", "scope": "", "name": "«riscv-zkvm»", "manifestFile": "lake-manifest.json",
+               "inherited": false, "dir": "vendor/riscv-zkvm", "configFile": "lakefile.toml"},
+              {"type": "git", "scope": "", "name": "«lean-ctrees»", "url": "https://github.com/o/lean-ctrees.git",
+               "rev": "0123456789abcdef0123456789abcdef01234567", "inputRev": "main",
+               "inherited": true, "manifestFile": "lake-manifest.json", "configFile": "lakefile.lean"},
+              {"type": "git", "scope": "", "name": "mathlib", "url": "https://github.com/o/m",
+               "rev": "89abcdef0123456789abcdef0123456789abcdef", "inputRev": "main",
+               "inherited": false, "manifestFile": "lake-manifest.json", "configFile": "lakefile.lean"}
+            ]}"#,
+        )
+        .unwrap();
+        let project = Project {
+            root: root.path().to_owned(),
+            repository: "o/moria-lean".into(),
+            record: root.path().join("record"),
+        };
+        let names = project
+            .packages()
+            .unwrap()
+            .into_iter()
+            .map(|package| package.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["moria-lean", "riscv-zkvm", "lean-ctrees", "mathlib"]
+        );
+        assert_eq!(package_name("«a»"), "a");
+        assert_eq!(package_name("«a"), "«a");
+    }
+}

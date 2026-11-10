@@ -481,12 +481,13 @@ fn unsuccessful_or_stale_receipts_cannot_publish() {
 
 #[test]
 fn dependencies_are_recorded_for_the_build_targets_closure_only() {
+    // A hyphenated name, which Lake quotes as `«path-dep»` in its manifest.
     let fixture = Fixture::new();
     let dependency = fixture.root.join("Dep");
     fs::create_dir(&dependency).unwrap();
     fs::write(
         dependency.join("lakefile.toml"),
-        "name = \"dep\"\ndefaultTargets = [\"Unused\"]\n[[lean_lib]]\nname = \"Good\"\n[[lean_lib]]\nname = \"Unused\"\n",
+        "name = \"path-dep\"\ndefaultTargets = [\"Unused\"]\n[[lean_lib]]\nname = \"Good\"\n[[lean_lib]]\nname = \"Unused\"\n",
     )
     .unwrap();
     fs::write(
@@ -503,7 +504,7 @@ fn dependencies_are_recorded_for_the_build_targets_closure_only() {
     fs::write(
         &config,
         format!(
-            "{}\n[[require]]\nname = \"dep\"\npath = \"Dep\"\n",
+            "{}\n[[require]]\nname = \"path-dep\"\npath = \"Dep\"\n",
             fs::read_to_string(&config).unwrap()
         ),
     )
@@ -525,7 +526,7 @@ fn dependencies_are_recorded_for_the_build_targets_closure_only() {
             .cloned()
             .collect::<Vec<_>>()
     };
-    assert!(pointers().iter().all(|key| !key.ends_with("/dep")));
+    assert!(pointers().iter().all(|key| !key.ends_with("/path-dep")));
 
     fs::write(
         fixture.root.join("Demo/A.lean"),
@@ -535,7 +536,7 @@ fn dependencies_are_recorded_for_the_build_targets_closure_only() {
     fixture.commit();
     fixture.build();
     checked(&mut fixture.cli("put"));
-    assert!(pointers().iter().any(|key| key.ends_with("/dep")));
+    assert!(pointers().iter().any(|key| key.ends_with("/path-dep")));
     assert!(
         !dependency
             .join(".lake/build/lib/lean/Unused.olean")
@@ -718,12 +719,13 @@ fn toolchain_identity_is_checked_and_missing_pointers_are_misses() {
 
 #[test]
 fn one_targeted_get_serves_every_package_of_the_workspace() {
+    // A hyphenated name, which Lake quotes as `«git-dep»` in its manifest.
     let fixture = Fixture::new();
     let dependency = fixture.temporary.path().join("dep");
     fs::create_dir(&dependency).unwrap();
     fs::write(
         dependency.join("lakefile.toml"),
-        "name = \"dep\"\ndefaultTargets = [\"Good\"]\n[[lean_lib]]\nname = \"Good\"\n",
+        "name = \"git-dep\"\ndefaultTargets = [\"Good\"]\n[[lean_lib]]\nname = \"Good\"\n",
     )
     .unwrap();
     fs::write(
@@ -755,7 +757,7 @@ fn one_targeted_get_serves_every_package_of_the_workspace() {
     fs::write(
         &config,
         format!(
-            "{}\n[[require]]\nname = \"dep\"\ngit = \"{}\"\nrev = \"HEAD\"\n",
+            "{}\n[[require]]\nname = \"git-dep\"\ngit = \"{}\"\nrev = \"HEAD\"\n",
             fs::read_to_string(&config).unwrap(),
             dependency.display()
         ),
@@ -777,15 +779,15 @@ fn one_targeted_get_serves_every_package_of_the_workspace() {
             .lock()
             .unwrap()
             .iter()
-            .any(|key| key.contains("/rev/") && key.ends_with("/dep"))
+            .any(|key| key.contains("/rev/") && key.ends_with("/git-dep"))
     );
     fixture.reset_local();
-    let packaged = fixture.root.join(".lake/packages/dep/.lake/build");
+    let packaged = fixture.root.join(".lake/packages/git-dep/.lake/build");
     if packaged.exists() {
         fs::remove_dir_all(&packaged).unwrap();
     }
     let restored = log(&checked(fixture.cli("get").args(["--", "Demo"])));
-    assert!(restored.contains("Lake cache: dep: "), "{restored}");
+    assert!(restored.contains("Lake cache: git-dep: "), "{restored}");
     assert!(
         !restored.contains("Built Good"),
         "rebuilt the dependency: {restored}"
