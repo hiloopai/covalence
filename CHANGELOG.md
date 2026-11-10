@@ -55,6 +55,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Added
 
+- `cov-kernel-checker` replays built Lean modules in the kernel and shares
+  their receipts over S3. Releases are Linux x86-64 archives with a SHA-256,
+  installed by the `kernel-checker` action.
+
 - `cov-lake-cache get -- <targets>` restores only what those targets need.
   It fetches mappings, then builds the targets: Lake takes each artifact from
   its local cache, else downloads it, else builds the module.

@@ -12,6 +12,8 @@ permissions:
 jobs:
   lake:
     uses: ./.github/workflows/ci-lake.yml
+  kernel-checker:
+    uses: ./.github/workflows/ci-kernel-checker.yml
   check:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

@@ -1,0 +1,42 @@
+name: Kernel checker
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Test the release build
+        run: cargo test --locked --release -p covalence-lean-kernel-checker
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-about@0.9.0
+      - name: Package the tested binary and licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          cargo about generate --locked --manifest-path crates/lean/kernel-checker/Cargo.toml \
+            -c crates/python/about.toml -o dist/THIRD-PARTY-LICENSES.md \
+            crates/lean/kernel-checker/licenses.md.hbs
+          cp target/release/cov-kernel-checker LICENSE-* dist/
+          strip dist/cov-kernel-checker
+          cd dist
+          tar -czf cov-kernel-checker-x86_64-unknown-linux-gnu.tar.gz cov-kernel-checker \
+            LICENSE-* THIRD-PARTY-LICENSES.md
+          sha256sum cov-kernel-checker-x86_64-unknown-linux-gnu.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kernel-checker-linux
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
