@@ -1016,3 +1016,48 @@ fn one_targeted_get_serves_every_package_of_the_workspace() {
         "rebuilt the root: {restored}"
     );
 }
+
+#[test]
+fn native_objects_of_platform_independent_dependencies_are_published() {
+    // Lake's `-o` drops platform-dependent outputs of such packages, as it
+    // does for Mathlib and Aesop.
+    let fixture = Fixture::new();
+    let dependency = fixture.root.join("Dep");
+    fs::create_dir(&dependency).unwrap();
+    fs::write(
+        dependency.join("lakefile.toml"),
+        "name = \"dep\"\nplatformIndependent = true\n[[lean_lib]]\nname = \"Good\"\n",
+    )
+    .unwrap();
+    fs::write(dependency.join("Good.lean"), "def good : Nat := 42\n").unwrap();
+    fs::write(
+        fixture.root.join("Main.lean"),
+        "import Good\ndef main : IO Unit := IO.println good\n",
+    )
+    .unwrap();
+    let config = fixture.root.join("lakefile.toml");
+    fs::write(
+        &config,
+        format!(
+            "{}\n[[lean_exe]]\nname = \"demo-exe\"\nroot = \"Main\"\n[[require]]\nname = \"dep\"\npath = \"Dep\"\n",
+            fs::read_to_string(&config).unwrap()
+        ),
+    )
+    .unwrap();
+    checked(fixture.lake().arg("update"));
+    fixture.commit();
+    checked(fixture.cli("build").args(["--", "demo-exe"]));
+    let recorded = fs::read_to_string(fixture.record("packages/dep.jsonl")).unwrap();
+    assert!(recorded.contains(".o\"]"), "{recorded}");
+    checked(&mut fixture.cli("put"));
+    fixture.reset_local();
+    let packaged = dependency.join(".lake/build");
+    if packaged.exists() {
+        fs::remove_dir_all(&packaged).unwrap();
+    }
+    let restored = log(&checked(fixture.cli("get").args(["--", "demo-exe"])));
+    assert!(
+        !restored.contains("Built Good:c.o"),
+        "compiled the dependency's object: {restored}"
+    );
+}

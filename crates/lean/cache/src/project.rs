@@ -47,6 +47,8 @@ pub(crate) enum Source {
 pub(crate) struct Package {
     pub name: String,
     pub source: Source,
+    /// The package's directory, relative to the root.
+    pub dir: PathBuf,
 }
 
 pub(crate) struct Project {
@@ -181,7 +183,7 @@ impl Project {
     pub fn packages(&self) -> Result<Vec<Package>> {
         let manifest: serde_json::Value =
             json(&fs::read(self.root.join("lake-manifest.json")).operation("read Lake manifest")?)?;
-        let name = |value: &serde_json::Value| {
+        let name_of = |value: &serde_json::Value| {
             let name = package_name(
                 value["name"]
                     .as_str()
@@ -191,31 +193,45 @@ impl Project {
             Ok(name.to_owned())
         };
         let mut packages = vec![Package {
-            name: name(&manifest)?,
+            name: name_of(&manifest)?,
             source: Source::Repository,
+            dir: PathBuf::new(),
         }];
+        let packages_dir = Path::new(manifest["packagesDir"].as_str().unwrap_or(".lake/packages"));
         for package in manifest["packages"]
             .as_array()
             .ok_or_else(|| invalid("Lake manifest has no package list"))?
         {
-            let source = match package["type"].as_str() {
-                Some("path") => Source::Repository,
+            let name = name_of(package)?;
+            let (source, dir) = match package["type"].as_str() {
+                Some("path") => (
+                    Source::Repository,
+                    PathBuf::from(
+                        package["dir"]
+                            .as_str()
+                            .ok_or_else(|| invalid("Lake manifest path package has no dir"))?,
+                    ),
+                ),
                 Some("git") => {
                     let commit = package["rev"].as_str().unwrap_or_default();
                     if !mapping::hex(commit, 40) {
                         return Err(invalid("Lake manifest pins a non-commit revision"));
                     }
-                    Source::Git {
-                        repository: repository_of(package["url"].as_str().unwrap_or_default())?,
-                        commit: commit.to_owned(),
-                    }
+                    let dir = packages_dir.join(&name);
+                    (
+                        Source::Git {
+                            repository: repository_of(package["url"].as_str().unwrap_or_default())?,
+                            commit: commit.to_owned(),
+                        },
+                        match package["subDir"].as_str() {
+                            Some(sub) => dir.join(sub),
+                            None => dir,
+                        },
+                    )
                 }
                 _ => return Err(invalid("unsupported Lake manifest package type")),
             };
-            packages.push(Package {
-                name: name(package)?,
-                source,
-            });
+            packages.push(Package { name, source, dir });
         }
         Ok(packages)
     }
@@ -367,6 +383,11 @@ impl Project {
                 command.args(["--package", &package.name]);
             }
             run("Lake build", command.args(targets))?;
+            add_traced_outputs(
+                &mapping,
+                &self.root.join(&package.dir).join(".lake/build"),
+                &self.cache_dir()?.join("artifacts"),
+            )?;
             recorded.insert(package.name.clone(), digest(&mapping)?);
         }
         self.clean()?;
@@ -404,6 +425,82 @@ impl Project {
         }
         Ok(receipt)
     }
+}
+
+/// Add to the Lake mapping at `mapping` the single-artifact outputs that the
+/// traces under a package's `build` folder record and the mapping lacks.
+///
+/// Lake's `-o` leaves out the platform-dependent outputs, such as the native
+/// objects an executable links, of a package that sets `platformIndependent`,
+/// as Mathlib and Aesop do; every later build then compiles them again. The
+/// pool is per platform, so they belong in its maps. Each output's trace,
+/// beside it, names its input hash and artifact; only artifacts in Lake's
+/// cache in `artifacts` are added, as `-o` adds only cached outputs.
+fn add_traced_outputs(mapping: &Path, build: &Path, artifacts: &Path) -> Result<usize> {
+    let mut rows = mapping::rows(mapping)?
+        .into_iter()
+        .map(|(input, (output, _))| (input, output))
+        .collect::<BTreeMap<_, _>>();
+    let mut added = 0;
+    for trace in traces(build)? {
+        let bytes = fs::read(&trace).operation(format!("read {}", trace.display()))?;
+        // Old trace stubs and outputs of several files carry no single artifact.
+        let Ok(trace) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let (Some(input), Some(name)) = (trace["depHash"].as_str(), trace["outputs"].as_str())
+        else {
+            continue;
+        };
+        if !mapping::hex(input, 16)
+            || !mapping::artifact_name(name)
+            || rows.contains_key(input)
+            || !artifacts.join(name).is_file()
+        {
+            continue;
+        }
+        rows.insert(input.to_owned(), serde_json::Value::from(name).to_string());
+        added += 1;
+    }
+    if added > 0 {
+        mapping::write(mapping, &rows)?;
+    }
+    Ok(added)
+}
+
+/// The `.trace` files under `directory`, if it exists.
+fn traces(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let mut pending = vec![directory.to_owned()];
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(Error::Io {
+                    operation: format!("read {}", directory.display()),
+                    source,
+                });
+            }
+        };
+        for entry in entries {
+            let entry = entry.operation("read build folder")?;
+            let path = entry.path();
+            if entry
+                .file_type()
+                .operation("read build entry type")?
+                .is_dir()
+            {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "trace")
+            {
+                found.push(path);
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// How many first-parent commits a restore searches for a published build.
@@ -458,6 +555,65 @@ mod tests {
     }
 
     #[test]
+    fn traced_single_artifact_outputs_the_mapping_lacks_are_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let (build, artifacts) = (dir.path().join("build"), dir.path().join("artifacts"));
+        fs::create_dir_all(build.join("ir/M")).unwrap();
+        fs::create_dir_all(build.join("lib/lean/M")).unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        for name in ["00000000000000a1.ltar", "00000000000000c1.o"] {
+            fs::write(artifacts.join(name), name).unwrap();
+        }
+        let mapping = dir.path().join("p.jsonl");
+        fs::write(
+            &mapping,
+            "\"2026-03-17\"\n[\"000000000000000a\",\"00000000000000a1.ltar\"]\n",
+        )
+        .unwrap();
+        let trace = |path: &str, input: &str, outputs: &str| {
+            fs::write(
+                build.join(path),
+                format!(r#"{{"schemaVersion": "2025-09-10", "depHash": "{input}", "inputs": [], "outputs": {outputs}, "log": [], "synthetic": false}}"#),
+            )
+            .unwrap();
+        };
+        // A native object of a platform-independent package: added.
+        trace(
+            "ir/M/A.c.o.export.trace",
+            "000000000000000c",
+            r#""00000000000000c1.o""#,
+        );
+        // A module, whose -o row is already there, and several files: skipped.
+        trace(
+            "lib/lean/M/A.trace",
+            "000000000000000a",
+            r#"{"o": "00000000000000a2.olean"}"#,
+        );
+        // Not in Lake's cache, so not published: skipped.
+        trace(
+            "ir/M/B.c.o.export.trace",
+            "000000000000000d",
+            r#""00000000000000d1.o""#,
+        );
+        fs::write(build.join("ir/M/C.c.o.export.trace"), "12345").unwrap();
+        assert_eq!(add_traced_outputs(&mapping, &build, &artifacts).unwrap(), 1);
+        let rows = mapping::rows(&mapping).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows["000000000000000c"],
+            (
+                "\"00000000000000c1.o\"".to_owned(),
+                vec!["00000000000000c1.o".to_owned()]
+            )
+        );
+        assert_eq!(add_traced_outputs(&mapping, &build, &artifacts).unwrap(), 0);
+        assert_eq!(
+            add_traced_outputs(&mapping, &dir.path().join("absent"), &artifacts).unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn quoted_manifest_names_match_lake_package_names() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -470,7 +626,7 @@ mod tests {
                "rev": "0123456789abcdef0123456789abcdef01234567", "inputRev": "main",
                "inherited": true, "manifestFile": "lake-manifest.json", "configFile": "lakefile.lean"},
               {"type": "git", "scope": "", "name": "mathlib", "url": "https://github.com/o/m",
-               "rev": "89abcdef0123456789abcdef0123456789abcdef", "inputRev": "main",
+               "rev": "89abcdef0123456789abcdef0123456789abcdef", "inputRev": "main", "subDir": "mathlib4",
                "inherited": false, "manifestFile": "lake-manifest.json", "configFile": "lakefile.lean"}
             ]}"#,
         )
@@ -489,6 +645,22 @@ mod tests {
         assert_eq!(
             names,
             ["moria-lean", "riscv-zkvm", "lean-ctrees", "mathlib"]
+        );
+        let dirs = project
+            .packages()
+            .unwrap()
+            .into_iter()
+            .map(|package| package.dir)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dirs,
+            [
+                "",
+                "vendor/riscv-zkvm",
+                ".lake/packages/lean-ctrees",
+                ".lake/packages/mathlib/mathlib4"
+            ]
+            .map(PathBuf::from)
         );
         assert_eq!(package_name("«a»"), "a");
         assert_eq!(package_name("«a"), "«a");

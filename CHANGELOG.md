@@ -17,6 +17,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Fixed
 
+- `cov-lake-cache build` records the native objects of dependencies that set
+  `platformIndependent`, such as Mathlib and Aesop, which Lake's own records
+  leave out, so a restore of an executable no longer compiles them.
+
 - Restored dependency outputs reach each package's `.lake/build` again, so
   tools that run `lean` there, such as `lake env lean`, find their `.olean`
   files. Every Lake run of `cov-lake-cache`, and every later step of the
