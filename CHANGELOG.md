@@ -17,6 +17,9 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Fixed
 
+- `cov-lake-cache` serves Lake's bulk artifact downloads from nightly-2026-11-05
+  on, which no longer pass `--retry 3`, as well as from earlier releases.
+
 - Lake cache releases include an upstream archive codec that supports embedded
   NUL strings, scalar arrays, and deeply nested data.
 
