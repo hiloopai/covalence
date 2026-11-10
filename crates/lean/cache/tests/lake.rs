@@ -226,8 +226,8 @@ fn embedded_nul_strings_survive_publication_and_native_restore() {
 
 #[cfg(unix)]
 #[test]
-fn changing_the_archive_tool_invalidates_receipts_and_remote_scope() {
-    use std::os::unix::fs::symlink;
+fn a_foreign_archive_tool_is_refused() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     let fixture = Fixture::new();
     fixture.build();
@@ -246,11 +246,9 @@ fn changing_the_archive_tool_invalidates_receipts_and_remote_scope() {
         let entry = entry.unwrap();
         let destination = overlay.join("bin").join(entry.file_name());
         if entry.file_name() == "leantar" {
-            fs::copy(entry.path(), &destination).unwrap();
-            // ELF permits trailing data: change identity without changing behavior.
-            let mut bytes = fs::read(&destination).unwrap();
-            bytes.extend_from_slice(b"archive-tool-identity-test");
-            fs::write(destination, bytes).unwrap();
+            // Stock and patched upstream leantar both report this version.
+            fs::write(&destination, "#!/bin/sh\necho 'leantar 0.1.21'\n").unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
         } else if matches!(entry.file_name().to_str(), Some("lean" | "lake")) {
             // Lake prefers the toolchain beside its resolved executable.
             fs::copy(entry.path(), destination).unwrap();
@@ -259,23 +257,22 @@ fn changing_the_archive_tool_invalidates_receipts_and_remote_scope() {
         }
     }
     let writes = fixture.server.writes.lock().unwrap().len();
-    let result = fixture
-        .cli("put")
-        .env("LAKE", overlay.join("bin/lake"))
-        .output()
-        .unwrap();
-    assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("receipt does not match"));
+    let reads = fixture.server.reads.lock().unwrap().len();
+    for action in ["put", "get"] {
+        let result = fixture
+            .cli(action)
+            .env("LAKE", overlay.join("bin/lake"))
+            .output()
+            .unwrap();
+        assert!(!result.status.success(), "{action}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("archive codec"),
+            "{action}: {}",
+            log(&result)
+        );
+    }
     assert_eq!(fixture.server.writes.lock().unwrap().len(), writes);
-    fixture.reset_local();
-    let result = checked(fixture.cli("get").env("LAKE", overlay.join("bin/lake")));
-    assert!(String::from_utf8_lossy(&result.stdout).contains("no published build"));
-    assert!(
-        !fixture
-            .root
-            .join(".lake/build/lib/lean/Demo/A.olean")
-            .exists()
-    );
+    assert_eq!(fixture.server.reads.lock().unwrap().len(), reads);
 }
 
 #[test]

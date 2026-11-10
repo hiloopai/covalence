@@ -958,6 +958,7 @@ dependencies = [
  "covalence-kv-memory",
  "covalence-kv-s3",
  "covalence-kv-trait",
+ "covalence-lean-ltar",
  "covalence-lib-cid",
  "covalence-lib-cli",
  "covalence-lib-dasl",
@@ -1005,6 +1006,7 @@ dependencies = [
  "covalence-lib-error",
  "serde_json",
  "sha2",
+ "tempfile",
  "zstd",
 ]
 

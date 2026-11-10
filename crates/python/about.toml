@@ -18,11 +18,11 @@ ignore-dev-dependencies = true
 # The platforms the wheels are built for.
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
-# The upstream archive codec omits Cargo license metadata.
-[leangz.clarify]
+# Apache-2.0 only: it contains code copied from leangz, whose licence it keeps.
+[covalence-lean-ltar.clarify]
 license = "Apache-2.0"
-[[leangz.clarify.files]]
-path = "LICENSE"
+[[covalence-lean-ltar.clarify.files]]
+path = "LICENSE-leangz"
 license = "Apache-2.0"
 checksum = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
 

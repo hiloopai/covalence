@@ -23,8 +23,8 @@ cov-lake-cache put --repository example/proofs
 
 The pool is shared by platform and toolchain, never by repository. Its scope
 is `<os>-<arch>/<toolchain>`, where `<toolchain>` is the SHA-256 of this
-layout's version (`cov-lake/v1`), `lean --version` and the toolchain's
-`leantar` executable. Under `lake/<scope>/`:
+layout's version (`cov-lake/v2`), `lean --version` and the archive codec
+version that the toolchain's `leantar --version` reports. Under `lake/<scope>/`:
 
 - `cas/sha2-256/<digest>/bytes.zst` holds each artifact as a Zstandard frame,
   under the SHA-256 CID of its raw bytes, the hash of Covalence receipts and of
@@ -42,10 +42,13 @@ repositories coincide when their bytes do. Input hashes include no checkout
 path. A revision map, not the pool, says which output an input has: two
 builds of one input can differ, for example in logged messages.
 
-Patched and stock `leantar` both write `LTR4` archives and report the same
-version, and stock `leantar` decodes the patched opcodes `0xa0` and `0xb0` as
-constructors instead of rejecting them. The executable is therefore part of
-the scope.
+Lake packs and unpacks module archives with the `leantar` in its toolchain.
+Every command requires the `leantar` built from `covalence-lean-ltar`, which
+reports `leantar covalence-lean-ltar/<n>`, and fails with any other. Stock
+`leantar` 0.1.21 reads the scalar-array (`0xa0`) and sized-string (`0xb0`)
+opcodes as constructors instead of rejecting them, so it must never read this
+pool. The codec version changes only when archive bytes change, so releases
+share a scope.
 
 ## Commands
 
@@ -136,23 +139,17 @@ Ubuntu 24.04 or newer. Source installs can use
 GitHub workflows can use the `.github/actions/lake-cache` composite action
 pinned to a full public commit, with `revision` and `sha256` inputs. It verifies
 the archive even when restored from disk and puts `cov-lake-cache` on `PATH`.
-It also installs the bundled `leantar` in the selected Lean toolchain, which
-must already be installed and writable. The archive records the upstream
-commits in `LEANTAR-REVISIONS`, their combined source tree in `LEANTAR-TREE`,
-and all license notices. It combines upstream master with the pinned, unmerged
-[explicit-stack fix](https://github.com/digama0/leangz/pull/22). The codec supports
-embedded NUL strings, scalar arrays, and deeply nested data that older Lean
-distributions cannot safely archive. It changes no Lean sources or kernel checks.
-
-Replacing the archive tool changes the scope and invalidates publication
-receipts. Source installations must supply a compatible archiver themselves. Thomas owns the bundled upstream
-pin; remove it once the supported Lean distribution includes
-[leangz#12](https://github.com/digama0/leangz/pull/12),
-[leangz#15](https://github.com/digama0/leangz/pull/15), and
-[leangz#22](https://github.com/digama0/leangz/pull/22).
+It also installs the archive's `leantar` in the selected Lean toolchain, which
+must already be installed and writable. That `leantar` is this workspace's
+`covalence-lean-ltar` binary, which handles embedded NUL strings, scalar
+arrays and deeply nested data that the `leantar` of older Lean distributions
+cannot safely archive. It changes no Lean sources or kernel checks. Source
+installs build it with
+`cargo install --locked --git https://github.com/hiloopai/covalence --rev <commit> covalence-lean-ltar`
+and copy it to the toolchain's `bin/leantar`.
 
 Run `cargo test -p covalence-lean-cache --features lake-tests` with the pinned
-Lean release on `PATH` for the signed S3 server and real Lake integration
+Lean release on `PATH`, and this workspace's `leantar` in its toolchain, for the signed S3 server and real Lake integration
 tests. The umbrella CI calls a separate workflow for these tests so library
 developers do not need to install Lean to run `glu ci`.
 
