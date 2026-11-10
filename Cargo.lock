@@ -972,6 +972,7 @@ dependencies = [
  "s3s-fs",
  "serde_json",
  "sha2",
+ "tar",
  "tempfile",
  "tokio",
  "zstd",

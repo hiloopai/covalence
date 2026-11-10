@@ -26,7 +26,7 @@ use crate::{
     mapping,
     pool::{self, Entry},
     project::{Package, Project, Source},
-    sources_tree,
+    seed, sources_tree,
 };
 
 const WORKERS: usize = 16;
@@ -429,6 +429,8 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>) -> Result<()> {
             published.push(publication);
         }
     }
+    // A seed only shortcuts the maps just published.
+    let seed = seed::publish(project, &**kv, &receipt, local.directory())?;
     // The source tree goes last: a record says its targets built and were
     // published at that tree.
     let sources = sources_tree::publish(project, kv, &receipt.identity.revision, &receipt.targets)?;
@@ -436,6 +438,7 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>) -> Result<()> {
         "scope": scope,
         "packages": published,
         "sources": sources,
+        "seed": seed,
         "seconds": started.elapsed().as_secs_f64(),
     }))?;
     println!(
