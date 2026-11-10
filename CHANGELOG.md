@@ -17,6 +17,12 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Fixed
 
+- Restored dependency outputs reach each package's `.lake/build` again, so
+  tools that run `lean` there, such as `lake env lean`, find their `.olean`
+  files. Every Lake run of `cov-lake-cache`, and every later step of the
+  GitHub action, sets `LAKE_RESTORE_ARTIFACTS=true`; Lake hard-links the
+  files from its cache.
+
 - Eager `cov-lake-cache get` and `dependencies` succeed against a warm
   `LAKE_CACHE_DIR`. They place every artifact themselves, once, skip any
   already in the cache, and hand Lake only the mappings; Lake's `cache get`

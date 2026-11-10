@@ -553,6 +553,90 @@ fn unsuccessful_or_stale_receipts_cannot_publish() {
 }
 
 #[test]
+fn lean_reads_restored_dependency_oleans_from_their_build_folders() {
+    let fixture = Fixture::new();
+    let dependency = fixture.root.join("Dep");
+    fs::create_dir(&dependency).unwrap();
+    fs::write(
+        dependency.join("lakefile.toml"),
+        "name = \"dep\"\n[[lean_lib]]\nname = \"Good\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dependency.join("Good.lean"),
+        "module\npublic theorem good : True := trivial\n",
+    )
+    .unwrap();
+    let config = fixture.root.join("lakefile.toml");
+    fs::write(
+        &config,
+        format!(
+            "{}\n[[require]]\nname = \"dep\"\npath = \"Dep\"\n",
+            fs::read_to_string(&config).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        fixture.root.join("Demo/A.lean"),
+        "module\npublic import Good\npublic theorem fromDependency : True := good\n",
+    )
+    .unwrap();
+    checked(fixture.lake().arg("update"));
+    fixture.commit();
+    fixture.build();
+    fixture.publish();
+    fixture.reset_local();
+    for directory in [
+        dependency.join(".lake/build"),
+        fixture.root.join(".lake/build"),
+    ] {
+        if directory.exists() {
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+    let check = "import Good\n#check good\n";
+    // `lake env lean` runs `lean` on the packages' `.lake/build` folders, as
+    // evidence scripts and checkers do, without Lake resolving the cache.
+    let lean_reads = |root: &Path| {
+        fs::write(root.join("Check.lean"), check).unwrap();
+        checked(
+            fixture
+                .lake()
+                .current_dir(root)
+                .env_remove("LAKE_RESTORE_ARTIFACTS")
+                .args(["env", "lean", "Check.lean"]),
+        );
+    };
+    // Fresh: the restore's own build links every dependency output.
+    checked(fixture.cli("get").args(["--", "Demo"]));
+    assert!(dependency.join(".lake/build/lib/lean/Good.olean").is_file());
+    lean_reads(&fixture.root);
+    // Warm: a second worktree on the same host.
+    let worktree = fixture.temporary.path().join("worktree");
+    checked(
+        Command::new("git")
+            .current_dir(&fixture.root)
+            .args(["worktree", "add", "-q", "--detach"])
+            .arg(&worktree)
+            .arg("HEAD"),
+    );
+    checked(
+        fixture
+            .cli("get")
+            .current_dir(&worktree)
+            .arg("--root")
+            .arg(&worktree)
+            .args(["--", "Demo"]),
+    );
+    assert!(
+        worktree
+            .join("Dep/.lake/build/lib/lean/Good.olean")
+            .is_file()
+    );
+    lean_reads(&worktree);
+}
+
+#[test]
 fn dependencies_are_recorded_for_the_build_targets_closure_only() {
     // A hyphenated name, which Lake quotes as `«path-dep»` in its manifest.
     let fixture = Fixture::new();

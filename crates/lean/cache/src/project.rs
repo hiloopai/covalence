@@ -152,6 +152,14 @@ impl Project {
         {
             command.env("LAKE_CACHE_DIR", directory);
         }
+        // A restored module's files live in the artifact cache. Lake links
+        // only its `.ilean` into the package's `.lake/build` unless it
+        // restores all artifacts, and tools that run `lean` on that folder
+        // need the rest. Every package that does not set
+        // `restoreAllArtifacts` itself inherits this.
+        if env::var_os("LAKE_RESTORE_ARTIFACTS").is_none() {
+            command.env("LAKE_RESTORE_ARTIFACTS", "true");
+        }
         command
     }
 

@@ -99,11 +99,15 @@ outputs as the mapping. It downloads every other artifact too, each once, and
 never rewrites a file already in the cache: a cache entry is immutable once
 written. Lake records only the mappings, then finds every file in its cache
 and runs no archiver. Targeted restores and the upstream Mathlib/CSLib snapshot still
-leave archives to Lake. As for any cache hit, with `LAKE_ARTIFACT_CACHE=true`
-Lake then reads `.olean` files from its cache and links only `.ilean` files
-into `.lake/build`; set the package's `restoreAllArtifacts` or
-`LAKE_RESTORE_ARTIFACTS=true` where tools such as `lake env lean` read
-`.lake/build` directly.
+leave archives to Lake. With `LAKE_ARTIFACT_CACHE=true`, a cache hit
+leaves a module's files in Lake's cache and links only its `.ilean` into the
+package's `.lake/build`, unless Lake restores all artifacts. Tools that run
+`lean` on `.lake/build`, such as `lake env lean`, need every file there, so
+every Lake run of this command sets `LAKE_RESTORE_ARTIFACTS=true`, and so does
+the GitHub action for later steps. Elsewhere, export it beside
+`LAKE_ARTIFACT_CACHE=true`, or set `restoreAllArtifacts = true` in the root
+lakefile; packages that do not set it themselves inherit it. Lake hard-links
+the files, so this costs no space.
 
 ## Seeds
 
@@ -148,8 +152,8 @@ holds map nodes, `covalence/mapped/` the root whose mappings were last
 installed per scope and package, and `covalence/installed/` the root whose
 artifacts were too. Restores read Lake's artifact cache without writing to it,
 so a one-shot runner does not copy every unpacked artifact. On a host that keeps
-its cache, export the same `LAKE_CACHE_DIR` and `LAKE_ARTIFACT_CACHE=true` for
-every Lake run, this command's included: Lake then keeps each archive unpacked
+its cache, export the same `LAKE_CACHE_DIR`, `LAKE_ARTIFACT_CACHE=true` and
+`LAKE_RESTORE_ARTIFACTS=true` for every Lake run, this command's included: Lake then keeps each archive unpacked
 in the cache after its first use, and later worktrees restore without unpacking. Nothing
 evicts old entries yet.
 

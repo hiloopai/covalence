@@ -44,3 +44,9 @@ runs:
         toolchain=$(lean --print-prefix)
         install -m 755 "$install_dir/leantar" "$toolchain/bin/leantar"
         echo "$install_dir" >> "$GITHUB_PATH"
+        # Restored outputs live in Lake's artifact cache; later steps' own
+        # `lake build` must link them all into each package's `.lake/build`
+        # for tools that run `lean` there. A job's own setting wins.
+        if [ -z "${LAKE_RESTORE_ARTIFACTS:-}" ]; then
+          echo "LAKE_RESTORE_ARTIFACTS=true" >> "$GITHUB_ENV"
+        fi
