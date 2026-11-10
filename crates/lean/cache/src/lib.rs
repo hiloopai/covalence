@@ -104,7 +104,7 @@ fn execute(cli: Cli) -> Result<()> {
         let kv = storage::store()?;
         // A restore checks the dependencies out while its seed downloads.
         if !matches!(cli.action, Action::Put | Action::Get) {
-            sources::materialize(&project)?;
+            sources::materialize(&project, &*kv)?;
         }
         Ok::<_, error::Error>(kv)
     };

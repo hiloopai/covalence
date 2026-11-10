@@ -117,6 +117,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Added
 
+- `cov-lake-cache put` publishes each pinned Git dependency the pool lacks as
+  one Git pack, and host mirrors take pins from those packs before asking
+  the Git host, so a fresh host checks dependencies out from S3.
+
 - `cov-lake-cache gc` deletes from a host's Lake cache what only toolchain
   scopes unused for `COVALENCE_LAKE_GC_DAYS` days (14 by default) hold,
   keeping the most recent scope and any scope in use. `get` runs it when the

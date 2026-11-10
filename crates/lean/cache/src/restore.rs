@@ -256,7 +256,7 @@ pub(crate) fn restore(
     thread::scope(|threads| {
         // The seed needs only the toolchain and the pool, so it downloads
         // while the dependencies check out.
-        let mirrors = threads.spawn(|| sources::materialize(project));
+        let mirrors = threads.spawn(|| sources::materialize(project, &**kv));
         let identity = project.identity()?;
         let scope = identity.scope.as_str();
         let identified = started.elapsed();

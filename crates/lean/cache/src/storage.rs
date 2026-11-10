@@ -28,7 +28,7 @@ use crate::{
     modules::Index,
     pool::{self, Entry},
     project::{Package, Project, Source},
-    seed, sources_tree,
+    seed, sources, sources_tree,
 };
 
 const WORKERS: usize = 16;
@@ -474,6 +474,7 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>) -> Result<()> {
             published.push(publication);
         }
     }
+    let git_packs = sources::publish_packs(project, &**kv)?;
     // A seed only shortcuts the maps just published.
     let seed = seed::publish(project, &**kv, &receipt, local.directory())?;
     // The source tree goes last: a record says its targets built and were
@@ -484,6 +485,7 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>) -> Result<()> {
         "packages": published,
         "sources": sources,
         "seed": seed,
+        "git_packs": git_packs,
         "seconds": started.elapsed().as_secs_f64(),
     }))?;
     println!(

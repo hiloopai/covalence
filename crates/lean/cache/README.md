@@ -173,7 +173,11 @@ Before any Lake run, `dependencies`, `build` and `get` check out each Git
 dependency missing from the packages directory from a shallow bare mirror in
 `covalence/git/` under Lake's cache directory. The mirror fetches only pinned
 commits it lacks, at depth one, and different mirrors fetch at once;
-checkouts borrow its objects through Git alternates. Lake then finds each package at its pinned revision and clones
+checkouts borrow its objects through Git alternates. A mirror takes a pinned
+commit from the pool first: `put` publishes each pin it lacks as one Git pack
+of the commit and its tree, at `lake/git/<owner>/<repo>/<commit>.pack`, and
+`git index-pack` hashes every object as the mirror takes it in. Only a pin the
+pool lacks is fetched from its Git host. Lake then finds each package at its pinned revision and clones
 nothing. Local-path Git URLs are left to Lake.
 
 Lake's cache directory is the local layer. It is `LAKE_CACHE_DIR`, which this
