@@ -276,6 +276,13 @@ pub trait Put<K = Cid> {
     {
         self.put(fact.bytes().clone())
     }
+
+    /// Store each of `values` and return their keys, in order. One
+    /// [`Put::put`] each by default; a store may write them all at once,
+    /// such as in one transaction. On an error, some may be stored.
+    fn put_many(&self, values: Vec<Bytes>) -> Result<Vec<K>, Error> {
+        values.into_iter().map(|bytes| self.put(bytes)).collect()
+    }
 }
 
 /// Writes, async.
@@ -487,6 +494,9 @@ impl Put for Arc<dyn Cas> {
     }
     fn put_fact(&self, fact: Fact) -> Result<Cid, Error> {
         (**self).put_fact(fact)
+    }
+    fn put_many(&self, values: Vec<Bytes>) -> Result<Vec<Cid>, Error> {
+        (**self).put_many(values)
     }
 }
 

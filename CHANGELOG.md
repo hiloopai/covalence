@@ -119,6 +119,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
   cache's disk has less than `COVALENCE_LAKE_GC_FREE_PERCENT` (10) percent
   free.
 
+- `Put::put_many` stores several values and returns their keys in order.
+  `SqliteCas` writes them in one transaction, not one per value; other
+  stores put them one at a time. Python: `Cas.put_many`.
+
 - `AwsOptions::accelerate` sends `S3Kv` requests to the bucket's Transfer
   Acceleration endpoint. **Breaking:** construct `AwsOptions` with
   `..AwsOptions::default()` to pick up the new field.

@@ -469,6 +469,13 @@ class Cas:
 
         Checks that the store keeps the data under that CID.
         """
+    def put_many(self, values: Sequence[_BytesLike]) -> list[Cid]:
+        """Store each of `values` and return their raw BLAKE3 CIDs, in order.
+
+        Checks that the store keeps each under its CID. A SQLite store writes
+        them in one transaction; others store them one at a time. On an
+        error, some may be stored.
+        """
     def put_value(self, value: _NativeInput) -> Cid:
         """Store the DRISL encoding of `value` and return its DRISL CID.
 

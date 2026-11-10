@@ -850,6 +850,16 @@ class CasTests(ApiCase):
             with self.subTest(prefix=prefix):
                 self.assert_fails(Cas.kv, kv, prefix)
 
+    def test_put_many_stores_each_value_and_returns_its_cid_in_order(self):
+        for name, cas in self.stores().items():
+            with self.subTest(store=name):
+                held = cas.put(b"held")
+                values = [b"a", bytearray(b"held"), b"b", b"a"]
+                cids = cas.put_many(values)
+                self.assertEqual(cids, [Cid.of(b"a"), held, Cid.of(b"b"), Cid.of(b"a")])
+                self.assertEqual([cas.get(cid) for cid in cids], [b"a", b"held", b"b", b"a"])
+                self.assertEqual(cas.put_many([]), [])
+
     def test_untrusted_sizes_and_ranges(self):
         for name, cas in self.stores().items():
             with self.subTest(store=name):

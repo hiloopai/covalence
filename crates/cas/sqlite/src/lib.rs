@@ -362,33 +362,45 @@ impl SqliteCas {
     /// Stores `data` unless a blob has its BLAKE3 digest, and adds a SHA-256
     /// row if `sha256` is given, in one write transaction.
     fn insert(&self, blake3: &[u8], sha256: Option<&[u8]>, data: &[u8]) -> Result<(), Error> {
+        self.insert_all(&[(blake3, sha256, data)])
+    }
+
+    /// [`SqliteCas::insert`] for each `(blake3, sha256, data)`, all in one
+    /// write transaction: one commit, not one per blob.
+    fn insert_all(&self, rows: &[Row<'_>]) -> Result<(), Error> {
         let db = self.db();
         let insert = || {
             let tx = db.unchecked_transaction()?;
-            let found = tx
-                .prepare_cached("SELECT blobid FROM hashes WHERE digest = ?1 AND hashfn = ?2")?
-                .query_row(params![blake3, Multicodec::BLAKE3.0 as i64], |row| {
-                    row.get(0)
-                })
-                .optional()?;
-            let blobid: i64 = match found {
-                Some(blobid) => blobid,
-                None => {
-                    tx.prepare_cached("INSERT INTO blobs (data) VALUES (?1)")?
-                        .execute([data])?;
-                    let blobid = tx.last_insert_rowid();
-                    add_row(&tx, blake3, Multicodec::BLAKE3, blobid)?;
-                    blobid
+            for &(blake3, sha256, data) in rows {
+                let found = tx
+                    .prepare_cached("SELECT blobid FROM hashes WHERE digest = ?1 AND hashfn = ?2")?
+                    .query_row(params![blake3, Multicodec::BLAKE3.0 as i64], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                let blobid: i64 = match found {
+                    Some(blobid) => blobid,
+                    None => {
+                        tx.prepare_cached("INSERT INTO blobs (data) VALUES (?1)")?
+                            .execute([data])?;
+                        let blobid = tx.last_insert_rowid();
+                        add_row(&tx, blake3, Multicodec::BLAKE3, blobid)?;
+                        blobid
+                    }
+                };
+                if let Some(sha256) = sha256 {
+                    add_row(&tx, sha256, Multicodec::SHA2_256, blobid)?;
                 }
-            };
-            if let Some(sha256) = sha256 {
-                add_row(&tx, sha256, Multicodec::SHA2_256, blobid)?;
             }
             tx.commit()
         };
         insert().map_err(backend)
     }
 }
+
+/// A blob to insert: its BLAKE3 digest, its SHA-256 digest when one is
+/// recorded, and its bytes.
+type Row<'a> = (&'a [u8], Option<&'a [u8]>, &'a [u8]);
 
 /// Maps `digest` under `hash` to `blobid`, unless it maps somewhere already.
 fn add_row(db: &Connection, digest: &[u8], hash: Multicodec, blobid: i64) -> rusqlite::Result<()> {
@@ -630,6 +642,28 @@ impl Put for SqliteCas {
             Some(fact) => Ok(self.put_fact(fact)?.into()),
             None => self.put(fact.bytes().clone()),
         }
+    }
+    /// Stores every value in one write transaction; also adds each SHA-256
+    /// row under [`Sha256Policy::Always`].
+    fn put_many(&self, values: Vec<Bytes>) -> Result<Vec<Cid>, Error> {
+        let facts: Vec<Fact<Blake3>> = values.into_iter().map(Fact::of).collect();
+        let sha256s: Vec<Option<_>> = facts
+            .iter()
+            .map(|fact| {
+                (self.policy == Sha256Policy::Always)
+                    .then(|| storage::Sha256::digest_of(fact.bytes()))
+            })
+            .collect();
+        let rows: Vec<_> = facts
+            .iter()
+            .zip(&sha256s)
+            .map(|(fact, sha256)| {
+                let sha256 = sha256.as_ref().map(|digest| &digest[..]);
+                (&fact.claim().digest()[..], sha256, &fact.bytes()[..])
+            })
+            .collect();
+        self.insert_all(&rows)?;
+        Ok(facts.iter().map(|fact| (*fact.claim()).into()).collect())
     }
 }
 

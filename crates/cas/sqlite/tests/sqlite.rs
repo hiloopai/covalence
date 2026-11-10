@@ -479,3 +479,18 @@ fn put_fact_stores_bytes() -> Result<(), Error> {
     assert_eq!(store.get(&raw(b"four"))?.unwrap(), "four");
     Ok(())
 }
+
+#[test]
+fn put_many_stores_every_value_and_returns_their_keys_in_order() -> Result<(), Error> {
+    let store = SqliteCas::open_in_memory_with(Sha256Policy::Always)?.into_dyn();
+    let held: Cid = store.put("held".into())?;
+    let keys = store.put_many(vec!["a".into(), "held".into(), "b".into(), "a".into()])?;
+    assert_eq!(keys, [raw(b"a"), held, raw(b"b"), raw(b"a")]);
+    for (key, bytes) in keys.iter().zip(["a", "held", "b", "a"]) {
+        assert_eq!(store.get(key)?.unwrap(), bytes);
+    }
+    let sha256: Cid = Sha256::of(b"b").into();
+    assert_eq!(store.get(&sha256)?.unwrap(), "b");
+    assert!(store.put_many(Vec::new())?.is_empty());
+    Ok(())
+}

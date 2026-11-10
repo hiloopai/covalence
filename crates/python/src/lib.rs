@@ -1063,6 +1063,29 @@ impl PyCas {
         Ok(PyCid { inner: key.into() })
     }
 
+    /// Store each of `values` and return their raw BLAKE3 CIDs, in order.
+    ///
+    /// Checks that the store keeps each under its CID. A SQLite store writes
+    /// them in one transaction; others store them one at a time. On an
+    /// error, some may be stored.
+    fn put_many(&self, py: Python<'_>, values: Vec<PyBackedBytes>) -> PyResult<Vec<PyCid>> {
+        let values: Vec<Bytes> = values.into_iter().map(Bytes::from_owner).collect();
+        let claims: Vec<Blake3> = py.detach(|| {
+            values
+                .iter()
+                .map(|value| *Fact::<Blake3>::of(value.clone()).claim())
+                .collect()
+        });
+        let keys = py.detach(|| self.inner.put_many(values)).map_err(raise)?;
+        keys.into_iter()
+            .zip(claims)
+            .map(|(key, claim)| {
+                check_key(key, claim)?;
+                Ok(PyCid { inner: key.into() })
+            })
+            .collect()
+    }
+
     /// Store the DRISL encoding of `value` and return its DRISL CID.
     ///
     /// The CID is hashed with BLAKE3, so it is `Value(value).cid()`.
