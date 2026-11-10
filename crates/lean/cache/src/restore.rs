@@ -42,7 +42,6 @@ pub(crate) struct Session {
     scope: String,
     local: Local,
     remote: KvCas,
-    blobs: Blobs,
     index: BTreeMap<String, String>,
 }
 
@@ -66,7 +65,6 @@ impl Session {
             scope: scope.to_owned(),
             local,
             remote: pool::store(kv.clone(), scope)?,
-            blobs: pool::blobs(kv.clone(), scope)?,
             index: BTreeMap::new(),
         };
         session.save_index()?;
@@ -90,7 +88,6 @@ impl Session {
         let mut command = project.lake();
         command
             .env("LAKE_CONFIG", self.directory.path().join("config.toml"))
-            .env("LAKE_ARTIFACT_CACHE", "true")
             .env(
                 "CURL",
                 env::current_exe().operation("locate cache executable")?,
@@ -169,12 +166,6 @@ impl Session {
                 command.args(["--package", &package.name]);
             }
             run("Lake restore", command.arg(&file))?;
-            // Lake fetches lazily one artifact per request. This repository's
-            // own changed artifacts are likely needed, so fetch them now in
-            // parallel; dependencies stay lazy.
-            if lazy && package.source == Source::Repository {
-                self.prefetch(&transfer.artifacts)?;
-            }
         }
         let levels: &[Installed] = if lazy {
             &[Installed::Mappings]
@@ -185,29 +176,6 @@ impl Session {
             self.local
                 .set_installed(*level, &self.scope, &package.name, root)?;
         }
-        Ok(())
-    }
-
-    /// Download `artifacts` that Lake's cache lacks into it, in parallel.
-    fn prefetch(&self, artifacts: &BTreeMap<String, Sha256>) -> Result<()> {
-        let directory = self.local.directory().join("artifacts");
-        let missing = artifacts
-            .iter()
-            .filter(|(name, _)| !directory.join(name).exists())
-            .collect::<Vec<_>>();
-        storage::parallel(&missing, |_, (name, cid)| {
-            let staged = directory.join(format!("{name}.cov-tmp"));
-            if staged.exists() {
-                fs::remove_file(&staged).operation("remove stale prefetch")?;
-            }
-            match fetch(&self.blobs, cid, &staged)? {
-                // The store checked the bytes against the CID the map names.
-                Some(_) => fs::rename(&staged, directory.join(name))
-                    .operation("install prefetched artifact"),
-                None => Ok(()),
-            }
-        })?;
-        println!("Lake cache: prefetched {} artifacts", missing.len());
         Ok(())
     }
 

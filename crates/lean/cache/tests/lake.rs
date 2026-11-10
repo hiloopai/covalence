@@ -648,7 +648,7 @@ fn other_services_reach_curl_without_cache_credentials() {
 }
 
 #[test]
-fn target_restore_builds_only_the_target_closure_and_then_works_offline() {
+fn target_restore_fetches_only_the_target_closure_and_then_works_offline() {
     let fixture = Fixture::new();
     fixture.build();
     fixture.publish();
@@ -673,14 +673,11 @@ fn target_restore_builds_only_the_target_closure_and_then_works_offline() {
     let start = fixture.server.reads.lock().unwrap().len();
     let restored = log(checked(fixture.cli("get").args(["--", "Demo.A"])));
     assert!(!restored.contains("Built Demo.A"), "rebuilt: {restored}");
-    // This repository's changed artifacts are prefetched in one parallel
-    // round; only what the targets need reaches the build directory.
     let fetched = artifacts(start);
     assert!(
-        0 < fetched && fetched <= everything,
+        0 < fetched && fetched < everything,
         "{fetched} of {everything}"
     );
-    assert!(restored.contains("Lake cache: prefetched"), "{restored}");
     let built = fixture.root.join(".lake/build/lib/lean/Demo");
     assert!(built.join("A.olean").exists());
     assert!(!built.join("B.olean").exists());

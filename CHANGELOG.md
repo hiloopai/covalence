@@ -17,6 +17,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Fixed
 
+- `cov-lake-cache get -- <targets>` again fetches only the targets' closure,
+  and restores no longer force Lake to copy every unpacked artifact into its
+  cache; set `LAKE_ARTIFACT_CACHE=true` on hosts that keep the cache.
+
 - `cov-lake-cache` accepts Lake manifests whose package names Lean quotes,
   such as `«riscv-zkvm»`, and uses the unquoted name for keys and `--package`.
 
