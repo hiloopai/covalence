@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
+mod archives;
 mod blobs;
 mod dependencies;
 pub mod error;

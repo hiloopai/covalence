@@ -184,6 +184,23 @@ impl Fixture {
     }
 }
 
+/// Asserts that Lake's artifact cache holds each of `expected`. A restore
+/// leaves outputs there; with the cache writable and `restoreAllArtifacts`
+/// unset, Lake reads them from the cache and copies only `.ilean` files into
+/// `.lake/build`.
+fn assert_restored(fixture: &Fixture, expected: &[Vec<u8>]) {
+    let cached: Vec<Vec<u8>> = fs::read_dir(fixture.temporary.path().join("cache/artifacts"))
+        .unwrap()
+        .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+        .collect();
+    for (index, bytes) in expected.iter().enumerate() {
+        assert!(
+            cached.contains(bytes),
+            "olean {index} is not in the artifact cache"
+        );
+    }
+}
+
 fn oleans(root: &Path) -> Vec<Vec<u8>> {
     ["A", "B"]
         .into_iter()
@@ -209,9 +226,19 @@ fn embedded_nul_strings_survive_publication_and_native_restore() {
     let expected = oleans(&fixture.root);
     fixture.publish();
     fixture.reset_local();
-    checked(&mut fixture.cli("get"));
-    checked(fixture.lake().args(["build", "--wfail", "Demo"]));
-    assert_eq!(oleans(&fixture.root), expected);
+    let restored = log(&checked(&mut fixture.cli("get")));
+    assert!(restored.contains("unpacked"), "{restored}");
+    // The restore decoded every archive, so Lake runs no archiver.
+    // `lake env lean` below reads `.lake/build`, which a cache hit fills only
+    // when all artifacts are restored.
+    let built = log(&checked(
+        fixture
+            .lake()
+            .env("LAKE_RESTORE_ARTIFACTS", "true")
+            .args(["build", "--wfail", "Demo"]),
+    ));
+    assert!(!built.contains("Unpacked"), "{built}");
+    assert_restored(&fixture, &expected);
     fs::write(
         fixture.root.join("Check.lean"),
         "import Demo.A\n#eval withNul.toList.map Char.toNat\n",
@@ -306,7 +333,12 @@ initialize listExt : SimplePersistentEnvExtension (List Nat) (Array (List Nat)) 
     fixture.publish();
     fixture.reset_local();
     checked(&mut fixture.cli("get"));
-    let result = checked(fixture.lake().args(["build", "--wfail", "Demo"]));
+    let result = checked(
+        fixture
+            .lake()
+            .env("LAKE_RESTORE_ARTIFACTS", "true")
+            .args(["build", "--wfail", "Demo"]),
+    );
     for log in [&result.stdout, &result.stderr] {
         let log = String::from_utf8_lossy(log);
         assert!(
@@ -314,7 +346,7 @@ initialize listExt : SimplePersistentEnvExtension (List Nat) (Array (List Nat)) 
             "recompiled restored data: {log}"
         );
     }
-    assert_eq!(fs::read(path).unwrap(), expected);
+    assert_restored(&fixture, std::slice::from_ref(&expected));
     fs::write(
         fixture.root.join("Check.lean"),
         r#"import Demo.B
@@ -390,7 +422,7 @@ fn incremental_publish_sends_only_the_difference_and_restore_reuses_proofs() {
         !result.contains("Built Demo"),
         "recompiled restored proofs: {result}"
     );
-    assert_eq!(oleans(&fixture.root), expected);
+    assert_restored(&fixture, &expected);
     // Same-size corruption of a stored artifact fails its CID check.
     let mut decoded = zstd::stream::decode_all(fs::read(&object).unwrap().as_slice()).unwrap();
     decoded[0] ^= 1;

@@ -22,6 +22,7 @@ use covalence_lib_cid::{Bdasl, Cid, Sha256};
 use serde_json::json;
 
 use crate::{
+    archives,
     blobs::Blobs,
     dependencies,
     error::{IoResult, Result, encode, invalid, json},
@@ -42,6 +43,7 @@ pub(crate) struct Session {
     scope: String,
     local: Local,
     remote: KvCas,
+    blobs: Blobs,
     index: BTreeMap<String, String>,
     /// Credentials resolved once for every download process.
     lease: Vec<(&'static str, String)>,
@@ -67,6 +69,7 @@ impl Session {
             scope: scope.to_owned(),
             local,
             remote: pool::store(kv.clone(), scope)?,
+            blobs: pool::blobs(kv.clone(), scope)?,
             index: BTreeMap::new(),
             lease: storage::lease()?,
         };
@@ -155,13 +158,20 @@ impl Session {
                 .directory
                 .path()
                 .join(format!("{}.jsonl", package.name));
-            mapping::write(
-                &file,
+            let outputs = if lazy {
                 transfer
                     .entries
                     .iter()
-                    .map(|(input, entry)| (input, &entry.output)),
-            )?;
+                    .map(|(input, entry)| (input.clone(), entry.output.clone()))
+                    .collect()
+            } else {
+                archives::unpack(
+                    &self.blobs,
+                    &self.local.directory().join("artifacts"),
+                    &transfer.entries,
+                )?
+            };
+            mapping::write(&file, &outputs)?;
             let mut command = self.lake(project)?;
             command
                 .args(["cache", if lazy { "add" } else { "get" }])
