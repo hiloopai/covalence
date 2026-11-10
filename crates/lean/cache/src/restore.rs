@@ -165,7 +165,7 @@ impl Session {
                     .map(|(input, entry)| (input.clone(), entry.output.clone()))
                     .collect()
             } else {
-                archives::unpack(
+                archives::install(
                     &self.blobs,
                     &self.local.directory().join("artifacts"),
                     &transfer.entries,
@@ -173,8 +173,10 @@ impl Session {
             };
             mapping::write(&file, &outputs)?;
             let mut command = self.lake(project)?;
+            // Every artifact of an eager restore is in place, so Lake only
+            // records the mappings.
             command
-                .args(["cache", if lazy { "add" } else { "get" }])
+                .args(["cache", "add"])
                 .args(["--service", SERVICE, "--scope", &self.scope]);
             if !root_package {
                 command.args(["--package", &package.name]);

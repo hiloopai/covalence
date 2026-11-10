@@ -435,6 +435,40 @@ fn incremental_publish_sends_only_the_difference_and_restore_reuses_proofs() {
     assert!(!fixture.cli("get").output().unwrap().status.success());
 }
 
+/// Each file of Lake's artifact cache with its modification time.
+fn artifact_listing(fixture: &Fixture) -> Vec<(PathBuf, std::time::SystemTime)> {
+    let mut files: Vec<_> = fs::read_dir(fixture.temporary.path().join("cache/artifacts"))
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (entry.path(), entry.metadata().unwrap().modified().unwrap())
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn a_second_restore_into_a_warm_cache_succeeds_and_writes_nothing() {
+    let fixture = Fixture::new();
+    fixture.build();
+    fixture.publish();
+    fixture.reset_local();
+    checked(&mut fixture.cli("dependencies"));
+    checked(&mut fixture.cli("get"));
+    let warm = artifact_listing(&fixture);
+    assert!(!warm.is_empty());
+    // Forget which roots this host installed, so the restore transfers every
+    // entry again into a cache that already holds its read-only artifacts.
+    fs::remove_dir_all(fixture.temporary.path().join("cache/covalence/installed")).unwrap();
+    fs::remove_dir_all(fixture.temporary.path().join("cache/covalence/mapped")).unwrap();
+    checked(&mut fixture.cli("dependencies"));
+    let again = log(&checked(&mut fixture.cli("get")));
+    assert!(!again.contains(" 0 changed entries"), "{again}");
+    assert_eq!(artifact_listing(&fixture), warm);
+    checked(fixture.lake().args(["build", "--wfail", "Demo"]));
+}
+
 #[test]
 fn restore_uses_the_nearest_published_ancestor_and_worktrees_share_one_cache() {
     let fixture = Fixture::new();
