@@ -248,9 +248,16 @@ impl Project {
             .operation("locate Lake cache directory")
     }
 
-    /// The commits to try for this repository's published builds: `HEAD`,
-    /// then its first-parent ancestors, nearest first.
+    /// The commits to try for this repository's published builds: those
+    /// [`COMMITS`] names, else `HEAD` then its first-parent ancestors,
+    /// nearest first.
     pub fn ancestors(&self) -> Result<Vec<String>> {
+        if let Some(named) = env::var_os(COMMITS) {
+            let named = named
+                .into_string()
+                .map_err(|_| invalid(format!("{COMMITS} is not UTF-8")))?;
+            return named_commits(&named);
+        }
         let list = self.git(&[
             "rev-list",
             "--first-parent",
@@ -402,9 +409,53 @@ impl Project {
 /// How many first-parent commits a restore searches for a published build.
 const ANCESTORS: usize = 64;
 
+/// The commits a restore searches instead of the checkout's history,
+/// nearest first: for a checkout that has none of its own, such as a remote
+/// build's copy of a client's tree.
+const COMMITS: &str = "COVALENCE_LAKE_COMMITS";
+
+/// The full Git revisions in `text`, separated by commas or newlines, at
+/// most [`ANCESTORS`] of them.
+fn named_commits(text: &str) -> Result<Vec<String>> {
+    let commits = text
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|commit| !commit.is_empty())
+        .take(ANCESTORS)
+        .map(|commit| {
+            if !mapping::hex(commit, 40) {
+                return Err(invalid(format!(
+                    "{COMMITS} names 40-digit lowercase Git revisions, not {commit:?}"
+                )));
+            }
+            Ok(commit.to_owned())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if commits.is_empty() {
+        return Err(invalid(format!("{COMMITS} names no commits")));
+    }
+    Ok(commits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_commits_are_full_revisions_nearest_first() {
+        let (a, b) = ("a".repeat(40), "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(
+            named_commits(&format!("{a},\n {b}\n")).unwrap(),
+            [a.clone(), b.to_owned()]
+        );
+        assert_eq!(
+            named_commits(&vec![a; 70].join(",")).unwrap().len(),
+            ANCESTORS
+        );
+        for bad in ["", " ,\n", "HEAD", &"A".repeat(40), &"a".repeat(39)] {
+            assert!(named_commits(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn quoted_manifest_names_match_lake_package_names() {

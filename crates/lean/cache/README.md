@@ -75,7 +75,10 @@ the scope.
   repository's two seed slots already holds it.
 - `get` restores this repository's packages from `HEAD`, else from the
   nearest of its 64 first-parent ancestors with a published build, and
-  prints which commit it used.
+  prints which commit it used. `COVALENCE_LAKE_COMMITS` (full revisions,
+  comma- or newline-separated, nearest first) names the commits to search
+  instead, for a checkout without the repository's history, such as a
+  remote build's copy of a client's tree.
 - `dependencies` restores the Mathlib/CSLib snapshot from upstream, then
   each Git dependency's build of its pin from the pool on top of it, so a
   partial pool map never hides upstream's artifacts.

@@ -89,6 +89,11 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Added
 
+- `cov-lake-cache get` searches the commits `COVALENCE_LAKE_COMMITS` names
+  instead of the checkout's own history, so a copy of a tree without its
+  repository's history can restore the published build of its nearest
+  ancestor.
+
 - `covalence-lean-ltar` decodes Lake's `.ltar` module archives in memory, with
   the same output as the `leantar` that Lake cache releases bundle, including
   scalar arrays and strings with embedded NULs.
