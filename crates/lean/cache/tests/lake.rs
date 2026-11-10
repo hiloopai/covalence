@@ -722,12 +722,17 @@ fn one_targeted_get_serves_every_package_of_the_workspace() {
     fs::create_dir(&dependency).unwrap();
     fs::write(
         dependency.join("lakefile.toml"),
-        "name = \"git-dep\"\ndefaultTargets = [\"Good\"]\n[[lean_lib]]\nname = \"Good\"\n",
+        "name = \"git-dep\"\ndefaultTargets = [\"Good\"]\n[[lean_lib]]\nname = \"Good\"\n[[lean_lib]]\nname = \"Better\"\n",
     )
     .unwrap();
     fs::write(
         dependency.join("Good.lean"),
         "module\npublic theorem good : True := trivial\n",
+    )
+    .unwrap();
+    fs::write(
+        dependency.join("Better.lean"),
+        "module\npublic theorem better : True := trivial\n",
     )
     .unwrap();
     fs::write(dependency.join(".gitignore"), ".lake/\n").unwrap();
@@ -769,6 +774,26 @@ fn one_targeted_get_serves_every_package_of_the_workspace() {
     fixture.commit();
     fixture.build();
     checked(&mut fixture.cli("put"));
+    let dep_entries = || {
+        let report: Value =
+            serde_json::from_slice(&fs::read(fixture.record("publication.json")).unwrap()).unwrap();
+        report["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| package["package"] == "git-dep")
+            .map(|package| package["entries"].as_u64().unwrap())
+    };
+    let first = dep_entries().expect("first publication records the dependency");
+    // A second closure of the same pin adds to the pool's map.
+    fs::write(
+        fixture.root.join("Demo/A.lean"),
+        "module\npublic import Good\npublic import Better\npublic theorem a : True := good\n",
+    )
+    .unwrap();
+    fixture.commit();
+    fixture.build();
+    checked(&mut fixture.cli("put"));
     assert!(
         fixture
             .server
@@ -777,6 +802,10 @@ fn one_targeted_get_serves_every_package_of_the_workspace() {
             .unwrap()
             .iter()
             .any(|key| key.contains("/rev/") && key.ends_with("/git-dep"))
+    );
+    assert!(
+        dep_entries().unwrap() > first,
+        "the union lost the first closure"
     );
     fixture.reset_local();
     let packaged = fixture.root.join(".lake/packages/git-dep/.lake/build");

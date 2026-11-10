@@ -18,7 +18,7 @@ use covalence_lib_cli::clap::{self, Parser, ValueEnum};
 use covalence_lib_error::miette;
 
 use error::{IoResult, Result, invalid};
-use project::{Project, Source};
+use project::Project;
 
 #[derive(Clone, ValueEnum)]
 enum Action {
@@ -82,19 +82,7 @@ fn execute(cli: Cli) -> Result<()> {
     }
     match cli.action {
         Action::Dependencies => dependencies::fetch(&project, &kv, &cli.targets),
-        Action::Build => {
-            let scope = project.identity()?.scope;
-            // A dependency pin the pool already has needs no second record.
-            project.build(&cli.targets, |package| {
-                Ok(match &package.source {
-                    Source::Git { commit, .. } => {
-                        storage::pointer(&*kv, &project.revision_key(&scope, package, commit)?)?
-                            .is_some()
-                    }
-                    Source::Repository => false,
-                })
-            })
-        }
+        Action::Build => project.build(&cli.targets),
         Action::Put => storage::publish(&project, &kv),
         Action::Get => restore::restore(&project, &kv, &cli.targets),
     }

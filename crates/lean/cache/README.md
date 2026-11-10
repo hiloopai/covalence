@@ -51,23 +51,24 @@ the scope.
 
 - `build` runs `lake build --wfail` once on the given targets (pass every
   target CI builds, such as executables, so they are published), records the root package's outputs,
-  then replays the build once per other package to record its outputs too:
-  path dependencies always, Git dependencies only when the pool has no build
-  of their pin. A failed build removes the previous receipt. Recording
+  then replays the build once per other package, path and Git
+  dependencies alike, to record its outputs too. A failed build removes the previous receipt. Recording
   requires a clean checkout; put generated output under an ignored directory.
 - `put` requires that receipt from the same revision, toolchain, platform and
   CI run. It never builds. For each recorded package it builds the revision
   map locally, diffs it against the nearest published ancestor's map, uploads
   the artifacts the diff names that the pool lacks, then the map nodes the
   pool lacks, children first, and only then the revision pointer. A Git
-  dependency's map also takes in the upstream snapshot Lake fetched for a
-  pinned commit, for the artifacts on disk.
+  dependency's map is the union of every publisher's entries for its pin,
+  this publisher's winning, plus the upstream snapshot Lake fetched for a
+  pinned commit, for the artifacts on disk. A pin's map can still lack
+  modules no publisher built.
 - `get` restores this repository's packages from `HEAD`, else from the
   nearest of its 64 first-parent ancestors with a published build, and
   prints which commit it used.
-- `dependencies` restores each Git dependency's build of its pin from the
-  pool, and the Mathlib/CSLib snapshot from upstream only for packages the
-  pool has no build of.
+- `dependencies` restores the Mathlib/CSLib snapshot from upstream, then
+  each Git dependency's build of its pin from the pool on top of it, so a
+  partial pool map never hides upstream's artifacts.
 - With targets, `get` and `dependencies` install only mappings (`get` also
   those of the dependencies). `get` then runs `lake build --wfail` on the
   targets, which fetches only the artifacts they need. Lake takes each artifact from its local
