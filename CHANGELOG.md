@@ -56,6 +56,12 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Changed
 
+- Restores no longer refetch an upstream Mathlib/CSLib snapshot this host
+  already installed, which overwrote Lake's unpacked outputs with archives on
+  every warm run, and eager restores decode the snapshot's archives in process
+  too. A second worktree starts without loading the workspace to find Lake's
+  cache directory.
+
 - Eager `cov-lake-cache get` and `dependencies` decode the module archives
   they restore from the pool in process, in parallel, into Lake's artifact
   cache, so the next `lake build` runs no `leantar` for them.

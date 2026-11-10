@@ -15,6 +15,7 @@ use std::{
 use covalence_cas_sqlite::SqliteCas;
 use covalence_cas_trait::Cas;
 use covalence_lib_cid::{Bdasl, Cid};
+use sha2::{Digest, Sha256};
 
 use crate::{
     error::{Error, IoResult, Result, invalid},
@@ -78,6 +79,40 @@ impl Local {
             .join(level.directory())
             .join(scope)
             .join(package))
+    }
+
+    /// Where this host records that it installed `level` of an upstream
+    /// snapshot, named by a digest of the request because its scope holds
+    /// characters no path segment may.
+    fn upstream_path(&self, level: Installed, request: &[&str]) -> PathBuf {
+        let mut hash = Sha256::new();
+        for part in request {
+            hash.update(part.as_bytes());
+            hash.update([0]);
+        }
+        self.directory
+            .join("covalence")
+            .join("upstream")
+            .join(level.directory())
+            .join(data_encoding::HEXLOWER.encode(&hash.finalize()))
+    }
+
+    /// Whether this host installed at least `level` of the upstream snapshot
+    /// that `request` names. Installed artifacts include the mappings.
+    pub fn upstream_installed(&self, level: Installed, request: &[&str]) -> bool {
+        [level, Installed::Artifacts]
+            .into_iter()
+            .any(|level| self.upstream_path(level, request).exists())
+    }
+
+    /// Records that this host installed `level` of an upstream snapshot.
+    pub fn set_upstream_installed(&self, level: Installed, request: &[&str]) -> Result<()> {
+        let path = self.upstream_path(level, request);
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid("upstream marker has no parent"))?;
+        fs::create_dir_all(parent).operation("create upstream marker directory")?;
+        fs::write(&path, request.join("\n") + "\n").operation("write upstream marker")
     }
 
     /// The root whose `level` was last installed for `package` in `scope`.

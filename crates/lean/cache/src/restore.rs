@@ -79,6 +79,11 @@ impl Session {
         Ok(session)
     }
 
+    /// The host-wide local layer.
+    pub fn local(&self) -> &Local {
+        &self.local
+    }
+
     pub fn scope(&self) -> &str {
         &self.scope
     }
@@ -252,7 +257,7 @@ pub(crate) fn restore(
         });
         let mut installs = Vec::new();
         if lazy {
-            dependencies::upstream(project, true)?;
+            dependencies::upstream(project, &session.local, true)?;
             installs = dependencies::pins(project, kv, &session)?;
         }
         // Upstream installs rewrite their packages' mappings, so the seed's

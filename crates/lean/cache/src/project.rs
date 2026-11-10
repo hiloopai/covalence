@@ -147,9 +147,7 @@ impl Project {
     pub fn lake(&self) -> Command {
         let mut command = Command::new(env::var_os("LAKE").unwrap_or_else(|| "lake".into()));
         command.current_dir(&self.root);
-        if env::var_os("LAKE_CACHE_DIR").is_none()
-            && let Some(directory) = default_cache_dir()
-        {
+        if let Some(directory) = host_cache_dir() {
             command.env("LAKE_CACHE_DIR", directory);
         }
         // A restored module's files live in the artifact cache. Lake links
@@ -238,14 +236,10 @@ impl Project {
     /// Lake's cache directory, which every worktree on this host shares
     /// unless `LAKE_CACHE_DIR` says otherwise.
     pub fn cache_dir(&self) -> Result<PathBuf> {
-        let directory = output(
-            "Lake",
-            self.lake().args(["env", "printenv", "LAKE_CACHE_DIR"]),
-        )?;
-        if directory.is_empty() {
-            return Err(invalid("Lake has no cache directory"));
-        }
-        let artifacts = Path::new(&directory).join("artifacts");
+        // Every Lake this tool runs gets this directory (see `lake`), so
+        // there is no need to ask Lake.
+        let directory = host_cache_dir().ok_or_else(|| invalid("Lake has no cache directory"))?;
+        let artifacts = directory.join("artifacts");
         fs::create_dir_all(&artifacts).operation("create Lake artifact directory")?;
         artifacts
             .parent()

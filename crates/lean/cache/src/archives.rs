@@ -130,20 +130,72 @@ fn unpack_one(blobs: &Blobs, artifacts: &Path, cid: &Sha256) -> Result<String> {
     blobs
         .get_to(cid, &mut bytes)?
         .ok_or_else(|| invalid(format!("{cid} is missing from the pool")))?;
+    place(artifacts, &bytes, &cid.to_string())
+}
+
+/// Lake's output descriptor for each row of an upstream snapshot's mapping
+/// whose output is an archive Lake already downloaded into `artifacts`, after
+/// placing that archive's files there. Other rows are left out.
+///
+/// Lake unpacks such an archive on every build that finds only it, and its
+/// `cache get` downloads only archives, so the snapshot is decoded here.
+pub(crate) fn expand(
+    artifacts: &Path,
+    rows: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let started = Instant::now();
+    let archives: BTreeSet<&str> = rows
+        .values()
+        .filter_map(|output| local_archive(artifacts, output))
+        .collect();
+    let archives: Vec<_> = archives.into_iter().collect();
+    let descriptors = storage::parallel_with(storage::ARCHIVE_WORKERS, &archives, |_, name| {
+        let path = artifacts.join(name);
+        let bytes = fs::read(&path).operation(format!("read {}", path.display()))?;
+        place(artifacts, &bytes, name)
+    })?;
+    let descriptors: BTreeMap<_, _> = archives.into_iter().zip(descriptors).collect();
+    if !descriptors.is_empty() {
+        println!(
+            "Lake cache: placed {} upstream archives in {:.1} s",
+            descriptors.len(),
+            started.elapsed().as_secs_f64()
+        );
+    }
+    Ok(rows
+        .iter()
+        .filter_map(|(input, output)| {
+            let descriptor = descriptors.get(local_archive(artifacts, output)?)?;
+            Some((input.clone(), descriptor.clone()))
+        })
+        .collect())
+}
+
+/// The archive file in `artifacts` that a Lake output descriptor is, if it
+/// is only one archive and Lake downloaded it.
+fn local_archive<'a>(artifacts: &Path, output: &'a str) -> Option<&'a str> {
+    let name = output.strip_prefix('"')?.strip_suffix('"')?;
+    (name.ends_with(".ltar") && mapping::artifact_name(name) && artifacts.join(name).is_file())
+        .then_some(name)
+}
+
+/// Writes an archive's files, which `name` names in errors, and returns the
+/// outputs its trace names.
+fn place(artifacts: &Path, bytes: &[u8], name: &str) -> Result<String> {
     // The input hash goes only into the trace's `depHash`, which Lake does
     // not read here, so one decode serves every input naming the archive.
-    let archive = covalence_lean_ltar::unpack(&bytes, 0).map_err(|source| Error::Archive {
-        cid: cid.to_string(),
+    let archive = covalence_lean_ltar::unpack(bytes, 0).map_err(|source| Error::Archive {
+        archive: name.to_owned(),
         source,
     })?;
     let stem = archive
         .trace
         .path
         .strip_suffix(".trace")
-        .ok_or_else(|| invalid(format!("archive {cid} has no module trace")))?;
+        .ok_or_else(|| invalid(format!("archive {name} has no module trace")))?;
     let trace: Value = json(&archive.trace.bytes)?;
     let Some(Value::Object(mut outputs)) = trace.get("outputs").cloned() else {
-        return Err(invalid(format!("archive {cid} names no module outputs")));
+        return Err(invalid(format!("archive {name} names no module outputs")));
     };
     // Lake would resolve the archive too; the files are all it needs.
     outputs.remove("l");
@@ -154,7 +206,7 @@ fn unpack_one(blobs: &Blobs, artifacts: &Path, cid: &Sha256) -> Result<String> {
             Value::Array(items) => {
                 for item in items {
                     let Value::String(name) = item else {
-                        return Err(invalid(format!("archive {cid} names an invalid output")));
+                        return Err(invalid(format!("archive {name} names an invalid output")));
                     };
                     names.push(name);
                 }
@@ -168,13 +220,13 @@ fn unpack_one(blobs: &Blobs, artifacts: &Path, cid: &Sha256) -> Result<String> {
             .split_once('.')
             .filter(|_| mapping::artifact_name(name))
             .map(|(_, extension)| extension)
-            .ok_or_else(|| invalid(format!("archive {cid} names an invalid output")))?;
+            .ok_or_else(|| invalid(format!("archive {name} names an invalid output")))?;
         let path = format!("{stem}.{extension}");
         let file = archive
             .files
             .iter()
             .find(|file| file.path == path)
-            .ok_or_else(|| invalid(format!("archive {cid} lacks its {extension} output")))?;
+            .ok_or_else(|| invalid(format!("archive {name} lacks its {extension} output")))?;
         save(&artifacts.join(name), &file.bytes)?;
     }
     serde_json::to_string(&Value::Object(outputs)).map_err(|source| Error::Json {
@@ -305,6 +357,38 @@ mod tests {
         assert_eq!(fs::read(artifacts.path().join(&o)).unwrap(), b"object code");
         // A warm cache: the same restore again succeeds and writes nothing.
         assert_eq!(install(&blobs, artifacts.path(), &entries).unwrap(), rows);
+        assert_eq!(listing(artifacts.path()), first);
+    }
+
+    #[test]
+    fn upstream_archives_lake_downloaded_become_their_outputs() {
+        let artifacts = tempfile::tempdir().unwrap();
+        let archive = "89abcdef01234567.ltar";
+        fs::copy(fixture(), artifacts.path().join(archive)).unwrap();
+        let rows = BTreeMap::from([
+            ("0123456789abcdef".to_owned(), format!("\"{archive}\"")),
+            // Another input with the same archive, an object file, and an
+            // archive Lake did not download: only archives on disk expand.
+            ("0123456789abcde0".to_owned(), format!("\"{archive}\"")),
+            (
+                "1123456789abcdef".to_owned(),
+                "\"0d9deac573f269f3.o\"".to_owned(),
+            ),
+            (
+                "2123456789abcdef".to_owned(),
+                "\"aaaaaaaaaaaaaaaa.ltar\"".to_owned(),
+            ),
+        ]);
+        let expanded = expand(artifacts.path(), &rows).unwrap();
+        assert_eq!(
+            expanded.keys().collect::<Vec<_>>(),
+            ["0123456789abcde0", "0123456789abcdef"]
+        );
+        let outputs: Value = serde_json::from_str(&expanded["0123456789abcdef"]).unwrap();
+        assert_eq!(outputs["c"], "7777777777777777.c");
+        assert!(artifacts.path().join("1111111111111111.olean").is_file());
+        let first = listing(artifacts.path());
+        assert_eq!(expand(artifacts.path(), &rows).unwrap(), expanded);
         assert_eq!(listing(artifacts.path()), first);
     }
 }

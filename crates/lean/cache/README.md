@@ -98,8 +98,10 @@ directory under the names its trace gives them, and installs the trace's
 outputs as the mapping. It downloads every other artifact too, each once, and
 never rewrites a file already in the cache: a cache entry is immutable once
 written. Lake records only the mappings, then finds every file in its cache
-and runs no archiver. Targeted restores and the upstream Mathlib/CSLib snapshot still
-leave archives to Lake. With `LAKE_ARTIFACT_CACHE=true`, a cache hit
+and runs no archiver. An eager restore of the upstream Mathlib/CSLib snapshot
+decodes the archives Lake downloaded the same way. Each host fetches an
+upstream snapshot once per pin; `covalence/upstream/` records which it has.
+Targeted restores still leave archives to Lake. With `LAKE_ARTIFACT_CACHE=true`, a cache hit
 leaves a module's files in Lake's cache and links only its `.ilean` into the
 package's `.lake/build`, unless Lake restores all artifacts. Tools that run
 `lean` on `.lake/build`, such as `lake env lean`, need every file there, so

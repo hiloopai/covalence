@@ -17,6 +17,7 @@ use crate::{
     error::{IoResult, Result, invalid, json},
     mapping,
     project::{Project, host_cache_dir, output, package_name, repository_of, run},
+    storage,
 };
 
 fn git(directory: &Path) -> Command {
@@ -44,6 +45,7 @@ fn materialize_in(project: &Project, cache: &Path) -> Result<()> {
         .root
         .join(manifest["packagesDir"].as_str().unwrap_or(".lake/packages"));
     let mirrors = cache.join("covalence/git");
+    let mut checkouts = Vec::new();
     for package in manifest["packages"].as_array().into_iter().flatten() {
         if package["type"].as_str() != Some("git") {
             continue;
@@ -68,33 +70,43 @@ fn materialize_in(project: &Project, cache: &Path) -> Result<()> {
             continue;
         }
         let mirror = mirrors.join(format!("{}.git", repository_of(url)?));
+        // Several packages can share a mirror, so fetches run one at a time.
         fetch(&mirror, url, commit)?;
-        // A repository borrowing the mirror's objects: no copy, no network.
-        fs::create_dir_all(&destination).operation("create Lake package directory")?;
-        run("git init", git(&destination).args(["init", "-q"]))?;
-        let objects = mirror
-            .join("objects")
-            .canonicalize()
-            .operation("locate mirror objects")?;
-        let git_dir = destination.join(".git");
-        fs::write(
-            git_dir.join("objects/info/alternates"),
-            format!("{}\n", objects.display()),
-        )
-        .operation("link mirror objects")?;
-        // Lake and Git must see the mirror's shallow boundary as their own.
-        fs::copy(mirror.join("shallow"), git_dir.join("shallow"))
-            .operation("copy shallow boundary")?;
-        run(
-            "git remote",
-            git(&destination).args(["remote", "add", "origin", url]),
-        )?;
-        run(
-            "git checkout",
-            git(&destination).args(["checkout", "-q", "--detach", commit]),
-        )?;
-        println!("Lake cache: checked out {name} at {commit} from the host mirror");
+        checkouts.push((name, url, commit, destination, mirror));
     }
+    // Checkouts write disjoint directories and only read their mirrors.
+    storage::parallel(&checkouts, |_, (name, url, commit, destination, mirror)| {
+        check_out(name, url, commit, destination, mirror)
+    })?;
+    Ok(())
+}
+
+/// Check out `commit` at `destination` from `mirror`, which holds it.
+fn check_out(name: &str, url: &str, commit: &str, destination: &Path, mirror: &Path) -> Result<()> {
+    // A repository borrowing the mirror's objects: no copy, no network.
+    fs::create_dir_all(destination).operation("create Lake package directory")?;
+    run("git init", git(destination).args(["init", "-q"]))?;
+    let objects = mirror
+        .join("objects")
+        .canonicalize()
+        .operation("locate mirror objects")?;
+    let git_dir = destination.join(".git");
+    fs::write(
+        git_dir.join("objects/info/alternates"),
+        format!("{}\n", objects.display()),
+    )
+    .operation("link mirror objects")?;
+    // Lake and Git must see the mirror's shallow boundary as their own.
+    fs::copy(mirror.join("shallow"), git_dir.join("shallow")).operation("copy shallow boundary")?;
+    run(
+        "git remote",
+        git(destination).args(["remote", "add", "origin", url]),
+    )?;
+    run(
+        "git checkout",
+        git(destination).args(["checkout", "-q", "--detach", commit]),
+    )?;
+    println!("Lake cache: checked out {name} at {commit} from the host mirror");
     Ok(())
 }
 

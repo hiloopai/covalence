@@ -46,9 +46,9 @@ pub enum Error {
         operation: String,
         source: covalence_lib_cid::Error,
     },
-    #[snafu(display("unpack archive {cid}: {source}"))]
+    #[snafu(display("unpack archive {archive}: {source}"))]
     Archive {
-        cid: String,
+        archive: String,
         source: covalence_lean_ltar::Error,
     },
     #[snafu(display("{program} failed with {status}"))]
