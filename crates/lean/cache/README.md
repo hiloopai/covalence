@@ -88,7 +88,7 @@ such as a remote builder computing a minimal upload.
 
 Lake restores a module whose output is only its `.ltar` archive by running
 `leantar` once per module. An eager restore (without targets) instead
-downloads each archive itself, sixteen at a time, decodes it in process with
+downloads each archive itself, 64 at a time, decodes it in process with
 `covalence-lean-ltar`, writes its files into Lake's artifact
 directory under the names its trace gives them, and installs the trace's
 outputs as the mapping. Lake then finds every file in its cache and runs no

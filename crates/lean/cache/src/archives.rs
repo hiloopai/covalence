@@ -2,7 +2,7 @@
 //!
 //! Lake restores a module whose cached output is only its `.ltar` by running
 //! `leantar` once per module. For the archives an eager restore installs,
-//! this tool instead downloads and decodes each one here, in parallel, writes
+//! this tool instead downloads and decodes each one here, 64 at a time, writes
 //! its files into Lake's artifact directory under the names its trace gives
 //! them, and hands Lake the trace's outputs as the mapping. Lake then finds
 //! every file in its cache and runs no archiver.
@@ -52,9 +52,10 @@ pub(crate) fn unpack(
     if !archives.is_empty() {
         fs::create_dir_all(artifacts).operation("create Lake artifact directory")?;
     }
-    let outputs = storage::parallel(&archives, |_, (input, cid)| {
-        unpack_one(blobs, artifacts, input, cid)
-    })?;
+    let outputs =
+        storage::parallel_with(storage::ARCHIVE_WORKERS, &archives, |_, (input, cid)| {
+            unpack_one(blobs, artifacts, input, cid)
+        })?;
     if !archives.is_empty() {
         println!(
             "Lake cache: unpacked {} archives in {:.1} s",

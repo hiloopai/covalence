@@ -30,6 +30,9 @@ use crate::{
 };
 
 const WORKERS: usize = 16;
+/// Archive downloads are single small GETs that a restore decodes as they
+/// arrive, so more of them run at once than transfers do.
+pub(crate) const ARCHIVE_WORKERS: usize = 64;
 
 /// The bucket holding the pool, from `LAKE_CI_BUCKET`.
 pub(crate) fn store() -> Result<Arc<dyn Kv>> {
@@ -38,7 +41,7 @@ pub(crate) fn store() -> Result<Arc<dyn Kv>> {
     Ok(Arc::new(
         s3()?
             .concurrency(2)
-            .max_idle_connections(WORKERS * 2)
+            .max_idle_connections(ARCHIVE_WORKERS)
             .part_size(8 * 1024 * 1024)
             .upload_buffer_bytes(256 * 1024 * 1024),
     ))
@@ -110,11 +113,20 @@ pub(crate) fn parallel<T: Sync, R: Send>(
     items: &[T],
     work: impl Fn(usize, &T) -> Result<R> + Sync,
 ) -> Result<Vec<R>> {
+    parallel_with(WORKERS, items, work)
+}
+
+/// [`parallel`] with `width` at a time.
+pub(crate) fn parallel_with<T: Sync, R: Send>(
+    width: usize,
+    items: &[T],
+    work: impl Fn(usize, &T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     thread::scope(|scope| {
         let mut workers = Vec::new();
-        for _ in 0..WORKERS.min(items.len()) {
+        for _ in 0..width.min(items.len()) {
             workers.push(
                 thread::Builder::new()
                     .name("lake-cache-transfer".into())
