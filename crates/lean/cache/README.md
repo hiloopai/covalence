@@ -69,8 +69,8 @@ the scope.
   pool, and the Mathlib/CSLib snapshot from upstream only for packages the
   pool has no build of.
 - With targets, `get` and `dependencies` install only mappings (`get` also
-  those of the dependencies). `get` then fetches this repository's changed
-  artifacts in parallel, and runs `lake build --wfail` on the targets. Lake takes each artifact from its local
+  those of the dependencies). `get` then runs `lake build --wfail` on the
+  targets, which fetches only the artifacts they need. Lake takes each artifact from its local
   cache, else downloads it the first time the build needs it, else builds the
   module.
 
@@ -94,10 +94,11 @@ save one directory: every worktree and checkout on
 a host shares its artifacts and mappings. Beside them, `covalence/nodes.db`
 holds map nodes, `covalence/mapped/` the root whose mappings were last
 installed per scope and package, and `covalence/installed/` the root whose
-artifacts were too. This command enables Lake's artifact cache for its own
-Lake runs. Export the same `LAKE_CACHE_DIR` and `LAKE_ARTIFACT_CACHE=true` for
-every other Lake build on the host: Lake then keeps each archive unpacked in the
-cache after its first use, and later worktrees restore without unpacking. Nothing
+artifacts were too. Restores read Lake's artifact cache without writing to it,
+so a one-shot runner does not copy every unpacked artifact. On a host that keeps
+its cache, export the same `LAKE_CACHE_DIR` and `LAKE_ARTIFACT_CACHE=true` for
+every Lake run, this command's included: Lake then keeps each archive unpacked
+in the cache after its first use, and later worktrees restore without unpacking. Nothing
 evicts old entries yet.
 
 Set `LAKE_CI_BUCKET`. Credentials, region and endpoint follow the AWS
