@@ -257,17 +257,44 @@ fn download_file(scope: &str, url: &str, path: &Path) -> Result<ExitCode> {
     }
 }
 
+/// The configuration file of a bulk download, if `args` are one.
+///
+/// Lake before nightly-2026-11-05 passed `--retry 3` after `-L`; later Lake
+/// retries failed transfers itself and omits it.
+fn bulk_config(args: &[String]) -> Option<&str> {
+    let args = match args {
+        [z, x, get, l, retry, count, rest @ ..] if retry == "--retry" && count == "3" => {
+            let head = [z, x, get, l];
+            return (head == ["-Z", "-X", "GET", "-L"])
+                .then(|| bulk_tail(rest))
+                .flatten();
+        }
+        [z, x, get, l, rest @ ..] if [z, x, get, l] == ["-Z", "-X", "GET", "-L"] => rest,
+        _ => return None,
+    };
+    bulk_tail(args)
+}
+
+fn bulk_tail(args: &[String]) -> Option<&str> {
+    match args {
+        [s, w, format, config, path]
+            if [s, w, format, config] == ["-s", "-w", FORMAT, "--config"] =>
+        {
+            Some(path)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn download(args: &[String]) -> Result<ExitCode> {
     let scope =
         env::var("COVALENCE_LAKE_SCOPE").map_err(|_| invalid("missing Lake transfer scope"))?;
     mapping::segment_path(&scope)?;
     let single = ["-s", "-L", "-w", FORMAT, "--retry", "3"];
     let file = ["-s", "-S", "-f", "-o"];
-    let bulk = [
-        "-Z", "-X", "GET", "-L", "--retry", "3", "-s", "-w", FORMAT, "--config",
-    ];
     let url = args.last().map(String::as_str).unwrap_or_default();
-    if !(args.starts_with(&bulk.map(String::from)) || url.starts_with(&format!("{BASE}/"))) {
+    let bulk = bulk_config(args);
+    if !(bulk.is_some() || url.starts_with(&format!("{BASE}/"))) {
         // Another service's request, such as a dependency artifact. Curl gets
         // Lake's arguments but none of the cache's AWS credentials.
         let status = Command::new("curl")
@@ -305,11 +332,10 @@ pub(crate) fn download(args: &[String]) -> Result<ExitCode> {
         report(0, found)?;
         return Ok(ExitCode::SUCCESS);
     }
-    if args.len() != bulk.len() + 1 || args[..bulk.len()] != bulk {
+    let Some(config) = bulk else {
         return Err(invalid("unsupported Lake download protocol"));
-    }
-    let config =
-        fs::read_to_string(&args[bulk.len()]).operation("read Lake transfer configuration")?;
+    };
+    let config = fs::read_to_string(config).operation("read Lake transfer configuration")?;
     let directory = artifact_directory()?;
     let lines = config.lines().collect::<Vec<_>>();
     if lines.is_empty() || !lines.len().is_multiple_of(2) {
@@ -384,4 +410,47 @@ pub(crate) fn download(args: &[String]) -> Result<ExitCode> {
         report(index, found)
     })?;
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    #[test]
+    fn bulk_downloads_match_lake_before_and_after_nightly_2026_11_05() {
+        // Lake at nightly-2026-11-05 (lean4#14725) and later.
+        let current = argv(&[
+            "-Z", "-X", "GET", "-L", "-s", "-w", FORMAT, "--config", "/t/c",
+        ]);
+        assert_eq!(bulk_config(&current), Some("/t/c"));
+        // Lake at nightly-2026-10-30 and earlier.
+        let earlier = argv(&[
+            "-Z", "-X", "GET", "-L", "--retry", "3", "-s", "-w", FORMAT, "--config", "/t/c",
+        ]);
+        assert_eq!(bulk_config(&earlier), Some("/t/c"));
+        for other in [
+            argv(&[
+                "-Z", "-X", "PUT", "-L", "-s", "-w", FORMAT, "--config", "/t/c",
+            ]),
+            argv(&["-Z", "-X", "GET", "-L", "-s", "-w", FORMAT, "--config"]),
+            argv(&[
+                "-Z", "-X", "GET", "-L", "--retry", "9", "-s", "-w", FORMAT, "--config", "/t/c",
+            ]),
+            argv(&[
+                "-s",
+                "-S",
+                "-f",
+                "-o",
+                "/t/a",
+                "-L",
+                "https://example.invalid/a",
+            ]),
+        ] {
+            assert_eq!(bulk_config(&other), None, "{other:?}");
+        }
+    }
 }
