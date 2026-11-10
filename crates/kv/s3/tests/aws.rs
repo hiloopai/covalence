@@ -12,6 +12,11 @@ const CHILD: &str = "COVALENCE_KV_S3_TEST_CHILD";
 /// Run the test `name` in a child process with an empty home directory, no
 /// instance metadata, and require it to pass.
 fn in_child(name: &str) {
+    in_child_with(name, &[]);
+}
+
+/// [`in_child`], with `vars` also set.
+fn in_child_with(name: &str, vars: &[(&str, &str)]) {
     let home = tempfile::tempdir().unwrap();
     let output = Command::new(env::current_exe().unwrap())
         .args([name, "--exact", "--test-threads=1"])
@@ -19,6 +24,7 @@ fn in_child(name: &str) {
         .env(CHILD, "1")
         .env("HOME", home.path())
         .env("AWS_EC2_METADATA_DISABLED", "true")
+        .envs(vars.iter().copied())
         .output()
         .unwrap();
     let report = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
@@ -57,4 +63,41 @@ fn default_endpoints_follow_the_partition() {
         let debug = format!("{kv:?}");
         assert!(debug.contains(&format!("Domain({host:?})")), "{debug}");
     }
+}
+
+#[test]
+fn acceleration_names_the_bucket_host() {
+    if env::var_os(CHILD).is_none() {
+        return in_child("acceleration_names_the_bucket_host");
+    }
+    let options = AwsOptions {
+        region: Some("us-east-1".into()),
+        accelerate: true,
+        ..AwsOptions::default()
+    };
+    let kv = S3Kv::from_aws("s3://bucket/".parse().unwrap(), &options).unwrap();
+    let debug = format!("{kv:?}");
+    assert!(
+        debug.contains("Domain(\"bucket.s3-accelerate.amazonaws.com\")"),
+        "{debug}"
+    );
+}
+
+#[test]
+fn a_configured_endpoint_overrides_acceleration() {
+    if env::var_os(CHILD).is_none() {
+        return in_child_with(
+            "a_configured_endpoint_overrides_acceleration",
+            &[("AWS_ENDPOINT_URL", "http://127.0.0.1:9000")],
+        );
+    }
+    let options = AwsOptions {
+        region: Some("us-east-1".into()),
+        accelerate: true,
+        ..AwsOptions::default()
+    };
+    let kv = S3Kv::from_aws("s3://bucket/".parse().unwrap(), &options).unwrap();
+    let debug = format!("{kv:?}");
+    assert!(debug.contains("127.0.0.1"), "{debug}");
+    assert!(!debug.contains("s3-accelerate"), "{debug}");
 }

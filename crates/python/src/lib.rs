@@ -663,7 +663,11 @@ impl PyKv {
             }
         }
         .map_err(raise)?;
-        let options = AwsOptions { profile, region };
+        let options = AwsOptions {
+            profile,
+            region,
+            ..AwsOptions::default()
+        };
         let kv = py
             .detach(|| S3Kv::from_aws(location, &options))
             .map_err(raise)?;

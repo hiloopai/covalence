@@ -20,6 +20,7 @@ use covalence_lib_data::Bytes;
 use covalence_lib_serde::Serialize;
 
 use crate::{
+    accelerate,
     blobs::{self, Blobs},
     error::{Error, IoResult, Result, encode, invalid},
     local::Local,
@@ -59,7 +60,10 @@ const LEASE: [&str; 4] = [
 fn s3() -> Result<S3Kv> {
     let bucket = env::var("LAKE_CI_BUCKET").map_err(|_| invalid("LAKE_CI_BUCKET is required"))?;
     let location = S3Location::new(&bucket, "").map_err(|source| Error::S3 { source })?;
-    let options = AwsOptions::default();
+    let options = AwsOptions {
+        accelerate: accelerate::enabled()?,
+        ..AwsOptions::default()
+    };
     let lease = LEASE.map(|name| env::var(name).ok());
     match lease {
         [Some(key), Some(secret), Some(token), Some(expiry)] => {
@@ -79,15 +83,19 @@ fn s3() -> Result<S3Kv> {
     .map_err(|source| Error::S3 { source })
 }
 
-/// Credentials to hand to download processes, resolved once, so each does
-/// not ask the credential chain again: empty for credentials that do not
-/// expire, which the chain finds cheaply.
+/// The environment to hand to download processes, resolved once, so each
+/// neither probes for acceleration nor asks the credential chain again. It
+/// carries no credentials that do not expire, which the chain finds cheaply.
 pub(crate) fn lease() -> Result<Vec<(&'static str, String)>> {
+    let accelerate = (
+        accelerate::VARIABLE,
+        if accelerate::enabled()? { "on" } else { "off" }.to_owned(),
+    );
     let (credentials, expiry) = s3()?
         .credential_lease()
         .map_err(|source| Error::S3 { source })?;
     let (Some(expiry), Some(token)) = (expiry, credentials.token()) else {
-        return Ok(Vec::new());
+        return Ok(vec![accelerate]);
     };
     let expiry = expiry
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -101,6 +109,7 @@ pub(crate) fn lease() -> Result<Vec<(&'static str, String)>> {
             token.to_owned(),
             expiry.to_string(),
         ])
+        .chain([accelerate])
         .collect())
 }
 

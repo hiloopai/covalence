@@ -97,6 +97,14 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Added
 
+- `AwsOptions::accelerate` sends `S3Kv` requests to the bucket's Transfer
+  Acceleration endpoint. **Breaking:** construct `AwsOptions` with
+  `..AwsOptions::default()` to pick up the new field.
+
+- `cov-lake-cache` transfers through S3 Transfer Acceleration outside AWS, and
+  through the regional endpoint inside it. Set `COVALENCE_S3_ACCELERATE` to
+  `on` or `off` to override detection.
+
 - `cov-lake-cache get` searches the commits `COVALENCE_LAKE_COMMITS` names
   instead of the checkout's own history, so a copy of a tree without its
   repository's history can restore the published build of its nearest

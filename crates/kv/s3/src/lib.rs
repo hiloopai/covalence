@@ -343,6 +343,12 @@ pub struct AwsOptions {
     pub profile: Option<String>,
     /// The region, instead of the configured one.
     pub region: Option<String>,
+    /// Send requests to the bucket's
+    /// [Transfer Acceleration](https://docs.aws.amazon.com/AmazonS3/latest/userguide/transfer-acceleration.html)
+    /// endpoint, `<bucket>.s3-accelerate.amazonaws.com`, instead of the
+    /// regional one. The bucket must have acceleration enabled; an endpoint
+    /// set in the configuration still takes precedence.
+    pub accelerate: bool,
 }
 
 /// The limit on a request attempt moving `bytes` of body.
@@ -455,7 +461,8 @@ impl Cached {
 }
 
 /// A store under an S3 location, using path-style requests
-/// (`<endpoint>/<bucket>/<key>`).
+/// (`<endpoint>/<bucket>/<key>`), or virtual-hosted ones
+/// (`<bucket>.<endpoint>/<key>`) for [`AwsOptions::accelerate`].
 ///
 /// # Keys
 ///
@@ -588,18 +595,25 @@ impl S3Kv {
         location: S3Location,
         credentials: Credentials,
     ) -> Result<Self, Error> {
-        Self::with_source(endpoint, region, location, Source::Static(credentials))
+        Self::with_source(
+            endpoint,
+            UrlStyle::Path,
+            region,
+            location,
+            Source::Static(credentials),
+        )
     }
 
     fn with_source(
         endpoint: &str,
+        style: UrlStyle,
         region: &str,
         location: S3Location,
         credentials: Source,
     ) -> Result<Self, Error> {
         let url = url::Url::parse(endpoint).context(EndpointSnafu { endpoint })?;
-        let bucket = Bucket::new(url, UrlStyle::Path, location.bucket, region.to_owned())
-            .context(BucketSnafu)?;
+        let bucket =
+            Bucket::new(url, style, location.bucket, region.to_owned()).context(BucketSnafu)?;
         Ok(Self {
             bucket,
             prefix: location.prefix,
@@ -668,7 +682,8 @@ impl S3Kv {
     ///   the profile, or EC2 instance metadata, in that order; else
     ///   [`Error::Region`].
     /// - Endpoint: `AWS_ENDPOINT_URL` or the profile's `endpoint_url`, else
-    ///   `https://s3.<region>.amazonaws.com`, or `.amazonaws.com.cn` for a
+    ///   with `options.accelerate` `https://<bucket>.s3-accelerate.amazonaws.com`,
+    ///   else `https://s3.<region>.amazonaws.com`, or `.amazonaws.com.cn` for a
     ///   region starting `cn-`. Other partitions need `AWS_ENDPOINT_URL`.
     /// - Credentials: the SDKs' default chain (environment variables, profile
     ///   files including SSO and `credential_process`, web identity, ECS and
@@ -742,11 +757,19 @@ impl S3Kv {
         }
         let config = block_on(runtime.get(), loader.load())?;
         let region = config.region().context(RegionSnafu)?.to_string();
-        let endpoint = match config.endpoint_url() {
-            Some(endpoint) => endpoint.to_owned(),
+        let (endpoint, style) = match config.endpoint_url() {
+            Some(endpoint) => (endpoint.to_owned(), UrlStyle::Path),
+            // Acceleration answers only on the bucket's own host name.
+            None if options.accelerate => (
+                "https://s3-accelerate.amazonaws.com".to_owned(),
+                UrlStyle::VirtualHost,
+            ),
             // Other partitions, such as the ISO regions, need AWS_ENDPOINT_URL.
-            None if region.starts_with("cn-") => format!("https://s3.{region}.amazonaws.com.cn"),
-            None => format!("https://s3.{region}.amazonaws.com"),
+            None if region.starts_with("cn-") => (
+                format!("https://s3.{region}.amazonaws.com.cn"),
+                UrlStyle::Path,
+            ),
+            None => (format!("https://s3.{region}.amazonaws.com"), UrlStyle::Path),
         };
         let provider = config
             .credentials_provider()
@@ -754,7 +777,7 @@ impl S3Kv {
                 source: CredentialsError::not_loaded("no credential provider configured"),
             })?;
         let source = Source::Provider(Box::new(Cached::new(runtime, provider, seed)));
-        Self::with_source(&endpoint, &region, location, source)
+        Self::with_source(&endpoint, style, &region, location, source)
     }
 
     /// The credentials to sign the next request with.
