@@ -43,6 +43,8 @@ pub(crate) struct Session {
     local: Local,
     remote: KvCas,
     index: BTreeMap<String, String>,
+    /// Credentials resolved once for every download process.
+    lease: Vec<(&'static str, String)>,
 }
 
 impl Session {
@@ -66,6 +68,7 @@ impl Session {
             local,
             remote: pool::store(kv.clone(), scope)?,
             index: BTreeMap::new(),
+            lease: storage::lease()?,
         };
         session.save_index()?;
         Ok(session)
@@ -92,6 +95,7 @@ impl Session {
                 "CURL",
                 env::current_exe().operation("locate cache executable")?,
             )
+            .envs(self.lease.iter().map(|(name, value)| (*name, value)))
             .env("COVALENCE_LAKE_SCOPE", &self.scope)
             .env(
                 "COVALENCE_LAKE_ARTIFACTS",
@@ -377,13 +381,15 @@ pub(crate) fn download(args: &[String]) -> Result<ExitCode> {
     if !(bulk.is_some() || url.starts_with(&format!("{BASE}/"))) {
         // Another service's request, such as a dependency artifact. Curl gets
         // Lake's arguments but none of the cache's AWS credentials.
-        let status = Command::new("curl")
-            .args(args)
+        let mut curl = Command::new("curl");
+        curl.args(args)
             .env_remove("AWS_ACCESS_KEY_ID")
             .env_remove("AWS_SECRET_ACCESS_KEY")
-            .env_remove("AWS_SESSION_TOKEN")
-            .status()
-            .operation("start curl")?;
+            .env_remove("AWS_SESSION_TOKEN");
+        for name in storage::LEASED {
+            curl.env_remove(name);
+        }
+        let status = curl.status().operation("start curl")?;
         return Ok(status
             .code()
             .and_then(|code| u8::try_from(code).ok())
