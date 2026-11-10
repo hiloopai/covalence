@@ -12,6 +12,8 @@ to Lake's download protocol fail explicitly and need compatibility tests.
 ```sh
 cov-lake-cache dependencies
 cov-lake-cache get --repository example/proofs
+# On a fresh host that will keep its cache, start from the published seed:
+cov-lake-cache get --seed --repository example/proofs -- MyLibrary
 # Or fetch only what one target needs:
 cov-lake-cache get --repository example/proofs -- MyLibrary.Module
 cov-lake-cache build --repository example/proofs -- MyLibrary
@@ -69,6 +71,8 @@ the scope.
   "targets": [...]}` naming the targets `build` checked; then the pointer
   `lake/src/rev/<owner>/<repo>/<commit>`, in that order. Blobs the nearest
   published first-parent ancestor's tree holds are not checked again.
+- `put` then publishes the commit's seed (below), unless one of the
+  repository's two seed slots already holds it.
 - `get` restores this repository's packages from `HEAD`, else from the
   nearest of its 64 first-parent ancestors with a published build, and
   prints which commit it used.
@@ -100,6 +104,32 @@ Lake then reads `.olean` files from its cache and links only `.ilean` files
 into `.lake/build`; set the package's `restoreAllArtifacts` or
 `LAKE_RESTORE_ARTIFACTS=true` where tools such as `lake env lean` read
 `.lake/build` directly.
+
+## Seeds
+
+A fresh host otherwise has Lake fetch and unpack each module on its own: about
+27,000 requests and archive decodes for one large repository. `put` also
+publishes the recorded build as a seed: for every input `build` checked, Lake's
+local output file, without its archive, and the unpacked artifacts and native
+objects it names, as 16 Zstandard tar streams. Each repository keeps two seeds
+per scope under `lake/<scope>/seed/<owner>/<repo>/{a,b}/`; a publish overwrites
+the older slot, its chunks first and its `manifest.json` (commit, publication
+time, each chunk's SHA-256, length and file count) last. Storage stays at two
+seeds per repository and scope, with nothing to delete; a toolchain change
+leaves its scope's seeds behind with the rest of that scope.
+
+`get --seed` on a host that never installed the repository's mappings
+downloads the seed of the commit it restores, if a slot holds it, while the
+upstream snapshots install. A seed holds the whole recorded build, so pass
+`--seed` where the host keeps its cache or builds most of it, such as a
+developer machine or a full-library check, and not for a one-shot runner that
+needs a few targets. It unpacks the 16 streams at once beside Lake's cache,
+checks each against the manifest, then moves the files in: artifacts the cache
+lacks, and every output file, after the upstream snapshots that would rewrite
+them. The pool's maps then install only the inputs the seed does not map. Lake
+still checks every trace against the sources. A seed that is missing, or fails
+its check because a publish overwrote it mid-read, is reported and the restore
+continues from the pool.
 
 ## Host-wide local layer
 

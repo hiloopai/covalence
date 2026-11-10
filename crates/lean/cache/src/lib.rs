@@ -10,6 +10,7 @@ mod mapping;
 pub mod pool;
 mod project;
 mod restore;
+mod seed;
 mod sources;
 mod sources_tree;
 mod storage;
@@ -44,6 +45,10 @@ struct Cli {
     repository: Option<String>,
     #[arg(long)]
     record: Option<PathBuf>,
+    /// With `get`, fill a host that never installed this repository's
+    /// mappings from the restored commit's seed first.
+    #[arg(long)]
+    seed: bool,
     #[arg(last = true, allow_hyphen_values = true)]
     targets: Vec<String>,
 }
@@ -59,6 +64,9 @@ fn execute(cli: Cli) -> Result<()> {
             .or_else(|| env::var("GITHUB_REPOSITORY").ok())
             .unwrap_or_default(),
     };
+    if cli.seed && !matches!(cli.action, Action::Get) {
+        return Err(invalid("--seed applies to get"));
+    }
     if matches!(cli.action, Action::Put) && !cli.targets.is_empty() {
         return Err(invalid(
             "put publishes a recorded build and accepts no targets",
@@ -86,7 +94,7 @@ fn execute(cli: Cli) -> Result<()> {
         Action::Dependencies => dependencies::fetch(&project, &kv, &cli.targets),
         Action::Build => project.build(&cli.targets),
         Action::Put => storage::publish(&project, &kv),
-        Action::Get => restore::restore(&project, &kv, &cli.targets),
+        Action::Get => restore::restore(&project, &kv, &cli.targets, cli.seed),
     }
 }
 

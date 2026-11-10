@@ -74,6 +74,13 @@ fn collect(value: &Value, files: &mut BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
+/// The artifact file names an output descriptor names.
+pub(crate) fn names(output: &Value) -> Result<Vec<String>> {
+    let mut files = BTreeMap::new();
+    collect(output, &mut files)?;
+    Ok(files.into_values().collect())
+}
+
 /// The schema of the Lake mapping files this tool reads and writes.
 pub(crate) const SCHEMA: &str = "2026-03-17";
 

@@ -1,11 +1,13 @@
 use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc};
 
 use covalence_kv_trait::Kv;
+use covalence_lib_cid::{Bdasl, Cid};
 
 use crate::{
     error::{IoResult, Result},
-    project::{Project, Source, run},
+    project::{Package, Project, Source, run},
     restore::Session,
+    seed::Seeded,
     storage,
 };
 
@@ -24,43 +26,51 @@ pub(crate) fn config(project: &Project) -> PathBuf {
 pub(crate) fn fetch(project: &Project, kv: &Arc<dyn Kv>, targets: &[String]) -> Result<()> {
     run("Lake", project.lake().args(["env", "true"]))?;
     let scope = project.identity()?.scope;
+    let lazy = !targets.is_empty();
     let mut session = Session::new(project, kv, &scope)?;
-    install(project, kv, &mut session, !targets.is_empty())?;
-    if !targets.is_empty() {
+    upstream(project, lazy)?;
+    let installs = pins(project, kv, &session)?;
+    session.install(project, &installs, lazy, &Seeded::new())?;
+    if lazy {
         session.build(project, targets)?;
     }
     Ok(())
 }
 
-/// Install the Mathlib/CSLib snapshot from upstream, then each Git
-/// dependency's map from the pool on top of it.
-pub(crate) fn install(
+/// Install the Mathlib/CSLib snapshot from upstream. A pool map holds only
+/// the closures its publishers built, so upstream's snapshot comes first and
+/// the pool's maps of the [`pins`] go on top of it.
+pub(crate) fn upstream(project: &Project, lazy: bool) -> Result<()> {
+    if !config(project).exists() {
+        return Ok(());
+    }
+    let names = project
+        .packages()?
+        .into_iter()
+        .filter(|package| matches!(package.source, Source::Git { .. }))
+        .map(|package| package.name)
+        .collect();
+    mappings(project, lazy, &names)
+}
+
+/// Each Git dependency with a published build of its pin, and that build's
+/// map root.
+pub(crate) fn pins(
     project: &Project,
     kv: &Arc<dyn Kv>,
-    session: &mut Session,
-    lazy: bool,
-) -> Result<()> {
-    let packages = project.packages()?;
-    // A pool map holds only the closures its publishers built, so upstream's
-    // snapshot comes first and the pool adds to it.
-    if config(project).exists() {
-        let names = packages
-            .iter()
-            .filter(|package| matches!(package.source, Source::Git { .. }))
-            .map(|package| package.name.clone())
-            .collect();
-        mappings(project, lazy, &names)?;
-    }
-    for package in packages {
+    session: &Session,
+) -> Result<Vec<(Package, bool, Cid<Bdasl>)>> {
+    let mut installs = Vec::new();
+    for package in project.packages()? {
         let Source::Git { commit, .. } = &package.source else {
             continue;
         };
         let key = project.revision_key(session.scope(), &package, commit)?;
         if let Some(root) = storage::pointer(&**kv, &key)? {
-            session.install(project, &package, false, root, lazy)?;
+            installs.push((package, false, root));
         }
     }
-    Ok(())
+    Ok(installs)
 }
 
 /// Fetches the Mathlib/CSLib snapshot's mappings for `packages`, and unless

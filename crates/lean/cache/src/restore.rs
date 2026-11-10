@@ -13,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitCode},
     sync::Arc,
+    thread,
 };
 
 use covalence_cas_kv::KvCas;
@@ -29,6 +30,7 @@ use crate::{
     local::{Installed, Local},
     mapping, pool,
     project::{Package, Project, Source, run},
+    seed::{self, Seeded},
     storage,
 };
 
@@ -111,86 +113,99 @@ impl Session {
         Ok(command)
     }
 
-    /// Install the map at `root` for `package`, transferring only what
-    /// differs from the root this host last installed in full. With `lazy`,
-    /// install only mappings; Lake downloads artifacts when a build needs
-    /// them.
+    /// Install the map at each `root` for its package, transferring only
+    /// what differs from the root this host last installed in full, except
+    /// the inputs `seeded` maps by package. With `lazy`, install only
+    /// mappings; Lake downloads artifacts when a build needs them. One Lake
+    /// process per package runs at once.
     pub fn install(
         &mut self,
         project: &Project,
-        package: &Package,
-        root_package: bool,
-        root: Cid<Bdasl>,
+        installs: &[(Package, bool, Cid<Bdasl>)],
         lazy: bool,
+        seeded: &Seeded,
     ) -> Result<()> {
-        let local = &self.local;
-        let nodes = pool::copy_nodes(&self.remote, &*local.nodes(), root)?;
-        let target = Map::open(local.nodes(), root);
         let level = if lazy {
             Installed::Mappings
         } else {
             Installed::Artifacts
         };
-        let installed = local.installed(level, &self.scope, &package.name)?;
-        let base = installed.map(|root| target.at(root));
-        let transfer = pool::transfer(base.as_ref(), &target)?;
-        println!(
-            "Lake cache: {}: {} changed entries naming {} new artifacts, {nodes} map nodes fetched",
-            package.name,
-            transfer.entries.len(),
-            transfer.artifacts.len(),
-        );
-        // A lazy build may fetch any artifact whose mapping an earlier lazy
-        // restore installed, so it may be served the whole map.
-        let served = if lazy {
-            pool::entries(&target)?
-        } else {
-            transfer.entries.clone()
-        };
-        for entry in served.values() {
-            for (name, cid) in &entry.artifacts {
-                self.index.insert(name[..16].to_owned(), cid.to_string());
+        let mut files = Vec::new();
+        for (package, root_package, root) in installs {
+            let local = &self.local;
+            let nodes = pool::copy_nodes(&self.remote, &*local.nodes(), *root)?;
+            let target = Map::open(local.nodes(), *root);
+            let installed = local.installed(level, &self.scope, &package.name)?;
+            let base = installed.map(|root| target.at(root));
+            let transfer = pool::transfer(base.as_ref(), &target)?;
+            println!(
+                "Lake cache: {}: {} changed entries naming {} new artifacts, {nodes} map nodes fetched",
+                package.name,
+                transfer.entries.len(),
+                transfer.artifacts.len(),
+            );
+            // A lazy build may fetch any artifact whose mapping an earlier lazy
+            // restore installed, so it may be served the whole map.
+            let served = if lazy {
+                pool::entries(&target)?
+            } else {
+                transfer.entries.clone()
+            };
+            for entry in served.values() {
+                for (name, cid) in &entry.artifacts {
+                    self.index.insert(name[..16].to_owned(), cid.to_string());
+                }
+            }
+            let mut entries = transfer.entries;
+            // A seed already mapped these to their unpacked outputs.
+            if let Some(inputs) = seeded.get(&package.name) {
+                entries.retain(|input, _| !inputs.contains(input));
+            }
+            if !entries.is_empty() {
+                let file = self
+                    .directory
+                    .path()
+                    .join(format!("{}.jsonl", package.name));
+                let outputs = if lazy {
+                    entries
+                        .iter()
+                        .map(|(input, entry)| (input.clone(), entry.output.clone()))
+                        .collect()
+                } else {
+                    archives::install(
+                        &self.blobs,
+                        &self.local.directory().join("artifacts"),
+                        &entries,
+                    )?
+                };
+                mapping::write(&file, &outputs)?;
+                files.push((package, *root_package, file));
             }
         }
         self.save_index()?;
-        if !transfer.entries.is_empty() {
-            let file = self
-                .directory
-                .path()
-                .join(format!("{}.jsonl", package.name));
-            let outputs = if lazy {
-                transfer
-                    .entries
-                    .iter()
-                    .map(|(input, entry)| (input.clone(), entry.output.clone()))
-                    .collect()
-            } else {
-                archives::install(
-                    &self.blobs,
-                    &self.local.directory().join("artifacts"),
-                    &transfer.entries,
-                )?
-            };
-            mapping::write(&file, &outputs)?;
+        let restore = |(package, root_package, file): &(&Package, bool, PathBuf)| {
             let mut command = self.lake(project)?;
             // Every artifact of an eager restore is in place, so Lake only
             // records the mappings.
             command
                 .args(["cache", "add"])
                 .args(["--service", SERVICE, "--scope", &self.scope]);
-            if !root_package {
+            if !*root_package {
                 command.args(["--package", &package.name]);
             }
-            run("Lake restore", command.arg(&file))?;
-        }
+            run("Lake restore", command.arg(file))
+        };
+        storage::parallel(&files, |_, file| restore(file))?;
         let levels: &[Installed] = if lazy {
             &[Installed::Mappings]
         } else {
             &[Installed::Mappings, Installed::Artifacts]
         };
-        for level in levels {
-            self.local
-                .set_installed(*level, &self.scope, &package.name, root)?;
+        for (package, _, root) in installs {
+            for level in levels {
+                self.local
+                    .set_installed(*level, &self.scope, &package.name, *root)?;
+            }
         }
         Ok(())
     }
@@ -208,47 +223,88 @@ impl Session {
 
 /// Restores this repository's packages from the nearest published commit.
 /// With targets, installs only mappings, for dependencies too, then builds
-/// what the targets need.
-pub(crate) fn restore(project: &Project, kv: &Arc<dyn Kv>, targets: &[String]) -> Result<()> {
+/// what the targets need. With `seed`, a host that never installed this
+/// repository's mappings takes that commit's seed, if one was published,
+/// while upstream snapshots install; pool maps then add what the seed lacks.
+pub(crate) fn restore(
+    project: &Project,
+    kv: &Arc<dyn Kv>,
+    targets: &[String],
+    seed: bool,
+) -> Result<()> {
     let identity = project.identity()?;
     let scope = &identity.scope;
     let packages = project.packages()?;
     let commits = project.ancestors()?;
+    let lazy = !targets.is_empty();
     let mut session = Session::new(project, kv, scope)?;
-    if !targets.is_empty() {
-        dependencies::install(project, kv, &mut session, true)?;
-    }
-    match storage::nearest(&**kv, project, scope, &packages[0], &commits)? {
-        None => {
-            println!(
+    let nearest = storage::nearest(&**kv, project, scope, &packages[0], &commits)?;
+    let fresh = seed
+        && session
+            .local
+            .installed(Installed::Mappings, scope, &packages[0].name)?
+            .is_none();
+    let cache = session.local.directory().to_owned();
+    thread::scope(|threads| {
+        let seeding = nearest.as_ref().filter(|_| fresh).map(|(commit, _)| {
+            let cache = &cache;
+            threads.spawn(move || seed::fetch(kv, scope, &project.repository, commit, cache))
+        });
+        let mut installs = Vec::new();
+        if lazy {
+            dependencies::upstream(project, true)?;
+            installs = dependencies::pins(project, kv, &session)?;
+        }
+        // Upstream installs rewrite their packages' mappings, so the seed's
+        // go in after them.
+        let seeded = seeded(seeding, &cache)?;
+        match &nearest {
+            None => println!(
                 "Lake cache: no published build for this toolchain and platform in {} commits",
                 commits.len()
+            ),
+            Some((commit, _)) => {
+                let behind = commits.iter().position(|c| c == commit).unwrap_or_default();
+                println!("Lake cache: restoring {commit}, {behind} commits behind HEAD");
+                for (index, package) in packages.iter().enumerate() {
+                    if package.source != Source::Repository {
+                        continue;
+                    }
+                    let key = project.revision_key(scope, package, commit)?;
+                    if let Some(root) = storage::pointer(&**kv, &key)? {
+                        installs.push((package.clone(), index == 0, root));
+                    }
+                }
+            }
+        }
+        session.install(project, &installs, lazy, &seeded)?;
+        if lazy {
+            session.build(project, targets)?;
+        }
+        Ok(())
+    })
+}
+
+/// Install a fetched seed into Lake's cache. A seed is only a shortcut: one
+/// that fails to arrive is reported, and Lake fetches from the pool instead.
+fn seeded(
+    seeding: Option<thread::ScopedJoinHandle<'_, Result<Option<seed::Staged>>>>,
+    cache: &Path,
+) -> Result<Seeded> {
+    let Some(seeding) = seeding else {
+        return Ok(Seeded::new());
+    };
+    match seeding.join().unwrap_or(Err(crate::error::Error::Worker)) {
+        Ok(Some(staged)) => staged.install(cache),
+        Ok(None) => Ok(Seeded::new()),
+        Err(error) => {
+            eprintln!(
+                "Lake cache: restoring without the seed: {:?}",
+                covalence_lib_error::miette::Report::new(error)
             );
-            if targets.is_empty() {
-                return Ok(());
-            }
-        }
-        Some((commit, _)) => {
-            let behind = commits
-                .iter()
-                .position(|c| *c == commit)
-                .unwrap_or_default();
-            println!("Lake cache: restoring {commit}, {behind} commits behind HEAD");
-            for (index, package) in packages.iter().enumerate() {
-                if package.source != Source::Repository {
-                    continue;
-                }
-                let key = project.revision_key(scope, package, &commit)?;
-                if let Some(root) = storage::pointer(&**kv, &key)? {
-                    session.install(project, package, index == 0, root, !targets.is_empty())?;
-                }
-            }
+            Ok(Seeded::new())
         }
     }
-    if targets.is_empty() {
-        return Ok(());
-    }
-    session.build(project, targets)
 }
 
 fn key(url: &str, scope: &str) -> Result<String> {

@@ -774,6 +774,42 @@ fn target_restore_fetches_only_the_target_closure_and_then_works_offline() {
 }
 
 #[test]
+fn a_seeded_fresh_host_fetches_no_artifacts_and_unpacks_nothing() {
+    let fixture = Fixture::new();
+    fixture.build();
+    checked(&mut fixture.cli("put"));
+    let report: Value =
+        serde_json::from_slice(&fs::read(fixture.record("publication.json")).unwrap()).unwrap();
+    assert!(report["seed"]["files"].as_u64().unwrap() > 0, "{report}");
+    fixture.reset_local();
+    let start = fixture.server.reads.lock().unwrap().len();
+    let restored = log(&checked(fixture.cli("get").args(["--seed", "--", "Demo"])));
+    assert!(restored.contains("Lake cache: seeded"), "{restored}");
+    assert!(!restored.contains("Built Demo"), "rebuilt: {restored}");
+    let reads = fixture.server.reads.lock().unwrap()[start..].to_vec();
+    assert!(
+        reads.iter().all(|path| !path.contains("/cas/sha2-256/")),
+        "{reads:?}"
+    );
+    // The seed's outputs name unpacked files, so Lake needs no archives.
+    let archives = fs::read_dir(fixture.temporary.path().join("cache/artifacts"))
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".ltar")
+        })
+        .count();
+    assert_eq!(archives, 0);
+    // A warm host already holds the mappings and takes no seed.
+    let again = log(&checked(fixture.cli("get").args(["--seed", "--", "Demo"])));
+    assert!(!again.contains("Lake cache: seeded"), "{again}");
+}
+
+#[test]
 fn toolchain_identity_is_checked_and_missing_pointers_are_misses() {
     let fixture = Fixture::new();
     let miss = log(&checked(&mut fixture.cli("get")));

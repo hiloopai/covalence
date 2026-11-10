@@ -26,10 +26,25 @@ pub(crate) struct Blobs {
 }
 
 /// A writer that hashes everything it passes on.
-struct Hashing<W> {
+pub(crate) struct Hashing<W> {
     inner: W,
     hash: sha2::Sha256,
     bytes: u64,
+}
+
+impl<W> Hashing<W> {
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hash: sha2::Sha256::new(),
+            bytes: 0,
+        }
+    }
+
+    /// The writer, the SHA-256 of what passed through, and its length.
+    pub fn finish(self) -> (W, [u8; 32], u64) {
+        (self.inner, self.hash.finalize().into(), self.bytes)
+    }
 }
 
 impl<W: Write> Write for Hashing<W> {
