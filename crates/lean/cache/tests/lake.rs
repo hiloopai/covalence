@@ -1211,3 +1211,83 @@ fn restores_into_a_workspace_lake_has_not_configured_install_without_lock_failur
         checked(fixture.cli("get").args(["--", "Demo"]));
     }
 }
+
+#[test]
+fn a_dependency_the_pool_already_maps_is_recorded_without_a_replay() {
+    let fixture = Fixture::new();
+    let dependency = fixture.temporary.path().join("dep");
+    fs::create_dir(&dependency).unwrap();
+    fs::write(
+        dependency.join("lakefile.toml"),
+        "name = \"git-dep\"\n[[lean_lib]]\nname = \"Good\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dependency.join("Good.lean"),
+        "module\npublic theorem good : True := trivial\n",
+    )
+    .unwrap();
+    fs::write(dependency.join(".gitignore"), ".lake/\n").unwrap();
+    let git = |directory: &Path, args: &[&str]| {
+        checked(
+            Command::new("git")
+                .current_dir(directory)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args),
+        )
+    };
+    git(&dependency, &["init", "-q"]);
+    git(&dependency, &["add", "."]);
+    git(
+        &dependency,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "dep"],
+    );
+    let config = fixture.root.join("lakefile.toml");
+    fs::write(
+        &config,
+        format!(
+            "{}\n[[require]]\nname = \"git-dep\"\ngit = \"{}\"\nrev = \"HEAD\"\n",
+            fs::read_to_string(&config).unwrap(),
+            dependency.display()
+        ),
+    )
+    .unwrap();
+    checked(fixture.lake().arg("update"));
+    fs::write(
+        fixture.root.join("Demo/A.lean"),
+        "module\npublic import Good\npublic theorem a : True := good\n",
+    )
+    .unwrap();
+    fixture.commit();
+    let first = log(&checked(fixture.cli("build").args(["--", "Demo"])));
+    assert!(!first.contains("without replaying"), "{first}");
+    checked(&mut fixture.cli("put"));
+    let replayed = fs::read_to_string(fixture.record("packages/git-dep.jsonl")).unwrap();
+    // A root-only change: the pin's map in the pool holds everything.
+    fs::write(
+        fixture.root.join("Demo/B.lean"),
+        "module\npublic theorem b (n : Nat) : 0 + n = n := Nat.zero_add n\n",
+    )
+    .unwrap();
+    fixture.commit();
+    let second = log(&checked(fixture.cli("build").args(["--", "Demo"])));
+    assert!(
+        second.contains("recorded 1 dependencies from the pool's maps"),
+        "{second}"
+    );
+    let rows = |text: &str| {
+        let mut rows = text.lines().map(str::to_owned).collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+    assert_eq!(
+        rows(&fs::read_to_string(fixture.record("packages/git-dep.jsonl")).unwrap()),
+        rows(&replayed)
+    );
+    checked(&mut fixture.cli("put"));
+}

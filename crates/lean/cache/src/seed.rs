@@ -768,6 +768,7 @@ mod tests {
             packages: BTreeMap::from([("p".into(), String::new())]),
             artifacts: dir.path().join("cache/artifacts"),
             targets: Vec::new(),
+            pooled: BTreeSet::new(),
         };
         (dir, project, receipt)
     }

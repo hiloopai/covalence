@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, File},
     io::{self, Read},
@@ -36,6 +36,10 @@ pub(crate) struct Receipt {
     pub artifacts: PathBuf,
     /// The Lake targets the build checked.
     pub targets: Vec<String>,
+    /// Git dependencies whose mapping is the pool's map of their pin, which
+    /// already held everything the build used; `put` leaves them as they are.
+    #[serde(default)]
+    pub pooled: BTreeSet<String>,
 }
 
 /// Where a package's sources, and so its revision pointer, come from.
@@ -456,8 +460,22 @@ impl Project {
             nearest.as_ref().map(|(commit, _)| commit.as_str()),
         )?;
         let mut recorded = BTreeMap::new();
+        let mut pooled = BTreeSet::new();
         for (index, package) in packages.iter().enumerate() {
             let mapping = self.mapping(&package.name);
+            let build = self.root.join(&package.dir).join(".lake/build");
+            // The root build checked every package; a dependency's replay
+            // only records its outputs, which the pool may hold already.
+            if index > 0
+                && let Some(rows) =
+                    crate::modules::pooled_mapping(self, kv, &identity.scope, package)?
+            {
+                mapping::write(&mapping, &rows)?;
+                Index::record(&build, &mapping)?.save(&self.modules(&package.name))?;
+                recorded.insert(package.name.clone(), digest(&mapping)?);
+                pooled.insert(package.name.clone());
+                continue;
+            }
             let mut command = self.lake();
             command
                 .args(["build", "--wfail", "-o"])
@@ -469,7 +487,6 @@ impl Project {
                 command.args(["--package", &package.name]);
             }
             run("Lake build", command.args(targets))?;
-            let build = self.root.join(&package.dir).join(".lake/build");
             add_traced_outputs(&mapping, &build, &self.cache_dir()?.join("artifacts"))?;
             Index::record(&build, &mapping)?.save(&self.modules(&package.name))?;
             recorded.insert(package.name.clone(), digest(&mapping)?);
@@ -479,14 +496,21 @@ impl Project {
             return Err(invalid("build identity changed while checking"));
         }
         let artifacts = self.cache_dir()?.join("artifacts");
-        for package in recorded.keys() {
+        for package in recorded.keys().filter(|package| !pooled.contains(*package)) {
             mapping::artifacts(&self.mapping(package), &artifacts)?;
+        }
+        if !pooled.is_empty() {
+            println!(
+                "Lake cache: recorded {} dependencies from the pool's maps of their pins without replaying them",
+                pooled.len()
+            );
         }
         let record = Receipt {
             identity,
             packages: recorded,
             artifacts,
             targets: targets.to_vec(),
+            pooled,
         };
         fs::write(receipt, encode(&record)?).operation("save successful build receipt")
     }

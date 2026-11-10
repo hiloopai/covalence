@@ -67,7 +67,10 @@ the scope.
 - `build` runs `lake build --wfail` once on the given targets (pass every
   target CI builds, such as executables, so they are published), records the root package's outputs,
   then replays the build once per other package, path and Git
-  dependencies alike, to record its outputs too. Lake's records leave out
+  dependencies alike, to record its outputs too. A Git dependency whose
+  pin's map in the pool already holds the input of every trace in its build
+  folder is recorded from that map instead of replayed, and `put` leaves it
+  as it is. Lake's records leave out
   the native objects of a package that sets `platformIndependent`, such as
   Mathlib and Aesop, so `build` adds each one the package's build folder
   traces, and executables that link them need not compile them again. A failed build removes the previous receipt. Recording

@@ -381,6 +381,62 @@ pub(crate) fn prefetch(
     Ok(inputs)
 }
 
+/// The entries of the pool's map of `package` at `commit`, if published.
+fn pool_entries(
+    project: &Project,
+    kv: &Arc<dyn Kv>,
+    remote: &dyn covalence_cas_trait::Cas,
+    local: &crate::local::Local,
+    scope: &str,
+    package: &Package,
+    commit: &str,
+) -> Result<Option<BTreeMap<String, crate::pool::Entry>>> {
+    let key = project.revision_key(scope, package, commit)?;
+    let Some(root) = crate::storage::pointer(&**kv, &key)? else {
+        return Ok(None);
+    };
+    crate::pool::copy_nodes(remote, &*local.nodes(), root)?;
+    crate::pool::entries(&covalence_cas_prolly::Map::open(local.nodes(), root)).map(Some)
+}
+
+/// The mapping a replay of Git dependency `package` would record, when the
+/// pool's map of its pin already holds every output this build used: the
+/// input of each trace in its build folder, which the root build just
+/// checked. `None` when any input is missing from the map, so a replay must
+/// record it; an incomplete map never stands in for a recording.
+pub(crate) fn pooled_mapping(
+    project: &Project,
+    kv: &Arc<dyn Kv>,
+    scope: &str,
+    package: &Package,
+) -> Result<Option<BTreeMap<String, String>>> {
+    let Source::Git { commit, .. } = &package.source else {
+        return Ok(None);
+    };
+    let remote = crate::pool::store(kv.clone(), scope)?;
+    let local = crate::local::Local::open(project)?;
+    let Some(entries) = pool_entries(project, kv, &remote, &local, scope, package, commit)? else {
+        return Ok(None);
+    };
+    let build = project.root.join(&package.dir).join(".lake/build");
+    let mut rows = BTreeMap::new();
+    for trace in crate::project::files(&build, "trace")? {
+        let bytes = fs::read(&trace).operation(format!("read {}", trace.display()))?;
+        // Old trace stubs name no input.
+        let Some(input) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|trace| trace["depHash"].as_str().map(str::to_owned))
+        else {
+            continue;
+        };
+        let Some(entry) = entries.get(&input) else {
+            return Ok(None);
+        };
+        rows.insert(input, entry.output.clone());
+    }
+    Ok(Some(rows))
+}
+
 /// Before `build` records, place for each unchanged module the archive the
 /// pool already holds for it, where Lake looks for a packed archive
 /// (`.lake/build/ir/<A/B>.ltar`) and in its artifact cache. Lake's `-o`
@@ -417,12 +473,10 @@ pub(crate) fn reuse_archives(
         let Some(index) = Index::get(&**kv, &project.modules_key(scope, package, commit)?)? else {
             continue;
         };
-        let key = project.revision_key(scope, package, commit)?;
-        let Some(root) = crate::storage::pointer(&**kv, &key)? else {
+        let Some(entries) = pool_entries(project, kv, &remote, &local, scope, package, commit)?
+        else {
             continue;
         };
-        crate::pool::copy_nodes(&remote, &*local.nodes(), root)?;
-        let entries = crate::pool::entries(&covalence_cas_prolly::Map::open(local.nodes(), root))?;
         let build = project.root.join(&package.dir).join(".lake/build");
         for (module, input) in &index.modules {
             if module.contains(':') {

@@ -88,6 +88,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Changed
 
+- `cov-lake-cache build` records a Git dependency from the pool's map of its
+  pin, without replaying the build, when that map already holds the input of
+  every trace in the dependency's build folder; `put` leaves it unchanged.
+
 - `cov-lake-cache put` leaves executables out of seeds and compresses them at
   Zstandard level 9: moria's seed shrinks from 8.12 GB to 6.24 GB.
 

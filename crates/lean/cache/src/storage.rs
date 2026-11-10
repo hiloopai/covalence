@@ -469,6 +469,7 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>) -> Result<()> {
     let mut published = Vec::new();
     for package in packages {
         if receipt.packages.contains_key(&package.name)
+            && !receipt.pooled.contains(&package.name)
             && let Some(publication) = publish_package(&publisher, &package)?
         {
             published.push(publication);
