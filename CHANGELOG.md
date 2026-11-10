@@ -67,6 +67,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Added
 
+- `covalence-lean-ltar` decodes Lake's `.ltar` module archives in memory, with
+  the same output as the `leantar` that Lake cache releases bundle, including
+  scalar arrays and strings with embedded NULs.
+
 - `cov-lake-cache put` also publishes the commit's source tree under
   `lake/src/`, in the layout `hiloop prove` reads: blobs, the tree, a
   `{tree, targets}` record, then its pointer.
