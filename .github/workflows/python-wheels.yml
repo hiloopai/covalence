@@ -3,14 +3,38 @@ name: Python wheels
 on:
   push:
     branches: [main]
+    paths:
+      - '*'
+      - '.cargo/**'
+      - '.github/workflows/python-wheels.yml'
+      - 'crates/python/**'
+      - 'crates/lib/**'
+      - 'crates/blob/**'
+      - 'crates/cas/**'
+      - 'crates/kv/**'
+      - 'vendor/**'
     # v<version> releases to GitHub, PyPI and crates.io (crates.yml);
     # python-v<version> only attaches the wheels to a GitHub release.
     tags: ["v*", "python-v*"]
   pull_request:
+    paths:
+      - '*'
+      - '.cargo/**'
+      - '.github/workflows/python-wheels.yml'
+      - 'crates/python/**'
+      - 'crates/lib/**'
+      - 'crates/blob/**'
+      - 'crates/cas/**'
+      - 'crates/kv/**'
+      - 'vendor/**'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # The licenses of the Rust crates compiled into the package, which the wheels
