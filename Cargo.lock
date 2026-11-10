@@ -861,6 +861,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "covalence-cas-prolly"
+version = "0.1.0-dev.7"
+dependencies = [
+ "covalence-cas-memory",
+ "covalence-cas-trait",
+ "covalence-lib-cid",
+ "covalence-lib-dasl",
+ "covalence-lib-data",
+ "covalence-lib-error",
+ "hashlink",
+ "proptest",
+]
+
+[[package]]
 name = "covalence-cas-sqlite"
 version = "0.1.0-dev.7"
 dependencies = [
