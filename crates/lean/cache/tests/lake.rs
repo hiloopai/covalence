@@ -229,7 +229,14 @@ fn embedded_nul_strings_survive_publication_and_native_restore() {
     let restored = log(&checked(&mut fixture.cli("get")));
     assert!(restored.contains("unpacked"), "{restored}");
     // The restore decoded every archive, so Lake runs no archiver.
-    let built = log(&checked(fixture.lake().args(["build", "--wfail", "Demo"])));
+    // `lake env lean` below reads `.lake/build`, which a cache hit fills only
+    // when all artifacts are restored.
+    let built = log(&checked(
+        fixture
+            .lake()
+            .env("LAKE_RESTORE_ARTIFACTS", "true")
+            .args(["build", "--wfail", "Demo"]),
+    ));
     assert!(!built.contains("Unpacked"), "{built}");
     assert_restored(&fixture, &expected);
     fs::write(
@@ -326,7 +333,12 @@ initialize listExt : SimplePersistentEnvExtension (List Nat) (Array (List Nat)) 
     fixture.publish();
     fixture.reset_local();
     checked(&mut fixture.cli("get"));
-    let result = checked(fixture.lake().args(["build", "--wfail", "Demo"]));
+    let result = checked(
+        fixture
+            .lake()
+            .env("LAKE_RESTORE_ARTIFACTS", "true")
+            .args(["build", "--wfail", "Demo"]),
+    );
     for log in [&result.stdout, &result.stderr] {
         let log = String::from_utf8_lossy(log);
         assert!(

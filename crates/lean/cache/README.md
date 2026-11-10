@@ -93,7 +93,11 @@ downloads each archive itself, 64 at a time, decodes it in process with
 directory under the names its trace gives them, and installs the trace's
 outputs as the mapping. Lake then finds every file in its cache and runs no
 archiver. Targeted restores and the upstream Mathlib/CSLib snapshot still
-leave archives to Lake.
+leave archives to Lake. As for any cache hit, with `LAKE_ARTIFACT_CACHE=true`
+Lake then reads `.olean` files from its cache and links only `.ilean` files
+into `.lake/build`; set the package's `restoreAllArtifacts` or
+`LAKE_RESTORE_ARTIFACTS=true` where tools such as `lake env lean` read
+`.lake/build` directly.
 
 ## Host-wide local layer
 
