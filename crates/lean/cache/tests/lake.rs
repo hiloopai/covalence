@@ -346,9 +346,16 @@ fn incremental_publish_sends_only_the_difference_and_restore_reuses_proofs() {
     assert_eq!(warm["changed"], 0);
     assert_eq!(warm["uploaded"], 0);
     assert_eq!(warm["nodes"], 0);
+    // Builds: only the revision pointer. Sources: the tree, record and pointer.
     let writes = fixture.server.writes.lock().unwrap();
-    assert_eq!(writes.len() - before, 1);
-    assert!(writes[before].contains("/rev/"));
+    let pool = writes[before..]
+        .iter()
+        .filter(|key| !key.contains("/lake/src/"))
+        .collect::<Vec<_>>();
+    assert_eq!(pool.len(), 1, "{pool:?}");
+    assert!(pool[0].contains("/rev/"));
+    let sources = writes.len() - before - pool.len();
+    assert_eq!(sources, 3, "{:?}", &writes[before..]);
     drop(writes);
     let path = fixture.root.join("Demo/A.lean");
     fs::write(

@@ -63,6 +63,12 @@ the scope.
   this publisher's winning, plus the upstream snapshot Lake fetched for a
   pinned commit, for the artifacts on disk. A pin's map can still lack
   modules no publisher built.
+- `put` then publishes the commit's source tree under `lake/src/`: each
+  tracked Git blob, uncompressed, in a key-value CAS under its raw BLAKE3 CID;
+  the DRISL tree `{"files": {<path>: <link>}}`; the record `{"tree": <link>,
+  "targets": [...]}` naming the targets `build` checked; then the pointer
+  `lake/src/rev/<owner>/<repo>/<commit>`, in that order. Blobs the nearest
+  published first-parent ancestor's tree holds are not checked again.
 - `get` restores this repository's packages from `HEAD`, else from the
   nearest of its 64 first-parent ancestors with a published build, and
   prints which commit it used.

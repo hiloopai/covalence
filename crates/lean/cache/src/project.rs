@@ -30,6 +30,8 @@ pub(crate) struct Receipt {
     /// The SHA-256 of each recorded package's Lake mapping.
     pub packages: BTreeMap<String, String>,
     pub artifacts: PathBuf,
+    /// The Lake targets the build checked.
+    pub targets: Vec<String>,
 }
 
 /// Where a package's sources, and so its revision pointer, come from.
@@ -370,6 +372,7 @@ impl Project {
             identity,
             packages: recorded,
             artifacts,
+            targets: targets.to_vec(),
         };
         fs::write(receipt, encode(&record)?).operation("save successful build receipt")
     }

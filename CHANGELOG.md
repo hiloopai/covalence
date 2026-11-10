@@ -67,6 +67,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Added
 
+- `cov-lake-cache put` also publishes the commit's source tree under
+  `lake/src/`, in the layout `hiloop prove` reads: blobs, the tree, a
+  `{tree, targets}` record, then its pointer.
+
 - `S3Kv::from_aws_with` signs with credentials another store resolved until
   shortly before they expire, then asks the AWS credential chain;
   `S3Kv::credential_lease` returns the credentials and expiry to hand over.
