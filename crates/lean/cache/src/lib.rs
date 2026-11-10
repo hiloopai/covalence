@@ -10,6 +10,7 @@ pub mod pool;
 mod project;
 mod restore;
 mod sources;
+mod sources_tree;
 mod storage;
 
 use std::{env, path::PathBuf, process::ExitCode};

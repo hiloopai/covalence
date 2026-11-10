@@ -26,6 +26,7 @@ use crate::{
     mapping,
     pool::{self, Entry},
     project::{Package, Project, Source},
+    sources_tree,
 };
 
 const WORKERS: usize = 16;
@@ -416,9 +417,13 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>) -> Result<()> {
             published.push(publication);
         }
     }
+    // The source tree goes last: a record says its targets built and were
+    // published at that tree.
+    let sources = sources_tree::publish(project, kv, &receipt.identity.revision, &receipt.targets)?;
     let report = encode(&serde_json::json!({
         "scope": scope,
         "packages": published,
+        "sources": sources,
         "seconds": started.elapsed().as_secs_f64(),
     }))?;
     println!(
