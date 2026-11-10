@@ -15,11 +15,6 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
-### Added
-
-- `cov-lake-cache` checks out Git dependencies from one shallow mirror per
-  repository in the host's Lake cache, so a new checkout no longer clones them.
-
 ### Fixed
 
 - `cov-lake-cache` accepts Lake manifests whose package names Lean quotes,
@@ -62,6 +57,9 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
   old scopes.
 
 ### Added
+
+- `cov-lake-cache` checks out Git dependencies from one shallow mirror per
+  repository in the host's Lake cache, so a new checkout no longer clones them.
 
 - `cov-kernel-checker` replays built Lean modules in the kernel and shares
   their receipts over S3. Releases are Linux x86-64 archives with a SHA-256,
