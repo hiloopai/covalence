@@ -1,10 +1,14 @@
+//! Errors from cache operations, with the errors they inherited.
+
 use std::{io, process::ExitStatus};
 
 use covalence_lib_error::{miette, snafu::Snafu};
 
+/// A failed cache operation, with the error it inherited.
 #[derive(Debug, Snafu, miette::Diagnostic)]
 #[snafu(crate_root(covalence_lib_error::snafu))]
-pub(crate) enum Error {
+#[allow(missing_docs)]
+pub enum Error {
     #[snafu(display("{operation}: {source}"))]
     Io {
         operation: String,
@@ -22,6 +26,26 @@ pub(crate) enum Error {
     },
     #[snafu(display("{source}"))]
     S3 { source: covalence_kv_s3::Error },
+    #[snafu(display("{operation}: {source}"))]
+    Cas {
+        operation: String,
+        source: covalence_cas_trait::Error,
+    },
+    #[snafu(display("{operation}: {source}"))]
+    Map {
+        operation: String,
+        source: covalence_cas_prolly::Error,
+    },
+    #[snafu(display("{operation}: {source}"))]
+    Dasl {
+        operation: String,
+        source: covalence_lib_dasl::Error,
+    },
+    #[snafu(display("{operation}: {source}"))]
+    Cid {
+        operation: String,
+        source: covalence_lib_cid::Error,
+    },
     #[snafu(display("{program} failed with {status}"))]
     Process {
         program: &'static str,
@@ -33,7 +57,8 @@ pub(crate) enum Error {
     Worker,
 }
 
-pub(crate) type Result<T> = std::result::Result<T, Error>;
+/// A result with the cache's [`Error`].
+pub type Result<T> = std::result::Result<T, Error>;
 
 pub(crate) fn invalid(message: impl Into<String>) -> Error {
     Error::Invalid {

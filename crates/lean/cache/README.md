@@ -1,15 +1,16 @@
 # Lake build cache
 
 `cov-lake-cache` shares successful [Lake](https://github.com/leanprover/lean4/tree/master/src/lake)
-builds through S3-compatible storage. It uses Covalence's S3 transport for
-credentials, pooled connections, retries and bounded multipart transfers.
-Lake keeps responsibility for artifact hashes and build dependency validation.
+builds through one S3 pool that every repository, worktree and host reads.
+It uses Covalence's S3 transport for credentials, pooled connections, retries
+and bounded multipart transfers. Lake keeps responsibility for artifact
+hashes and build dependency validation.
 
 This command targets Lean 4.37's `2026-03-17` output mapping format. Changes
 to Lake's download protocol fail explicitly and need compatibility tests.
 
 ```sh
-cov-lake-cache dependencies -- Some.Required.Target
+cov-lake-cache dependencies
 cov-lake-cache get --repository example/proofs
 # Or fetch only what one target needs:
 cov-lake-cache get --repository example/proofs -- MyLibrary.Module
@@ -18,65 +19,97 @@ cov-lake-cache build --repository example/proofs -- MyLibrary
 cov-lake-cache put --repository example/proofs
 ```
 
-- `dependencies` fetches the Mathlib/CSLib snapshot used by a project with
-  those dependencies. Targets select mappings first, then a strict Lake build.
-- `build` runs `lake build --wfail` once, records outputs, and saves a success
-  receipt. It streams each artifact through Zstandard level one into the record
-  directory, so publication does not repeat compression. A failed build removes
-  the previous receipt. Recording requires a clean checkout; put generated output
-  under an ignored directory.
-- `put` requires that receipt from the same revision, pins, platform and CI
-  run. It never builds. It lists the scope, streams missing or wrong-size
-  compressed artifacts, then publishes their length manifest, the full Lake
-  mapping and latest revision pointer.
-- `get` downloads through Lake, which validates each artifact's content hash.
-  A missing pointer is a cache miss. Other failures are errors; callers may
-  explicitly report a failed optional restore and run the full check instead.
-- `get -- <targets>` fetches only mappings, from this cache and, when the
-  project uses Mathlib, from the dependency snapshot. It then runs
-  `lake build --wfail` on the targets. Lake takes each artifact from its local
+## Pool
+
+The pool is shared by platform and toolchain, never by repository. Its scope
+is `<os>-<arch>/<toolchain>`, where `<toolchain>` is the SHA-256 of this
+layout's version (`cov-lake/v1`), `lean --version` and the toolchain's
+`leantar` executable. Under `lake/<scope>/`:
+
+- `cas/sha2-256/<digest>/bytes.zst` holds each artifact as a Zstandard frame,
+  under the SHA-256 CID of its raw bytes, the hash of Covalence receipts and of
+  Lake's planned content hashes. Every read checks it.
+- `cas/blake3/<digest>/bytes.zst` holds map nodes in Covalence's key-value CAS
+  with Zstandard; Prolly names its nodes by BLAKE3.
+- `rev/<owner>/<repo>/<commit>/<package>` holds, as text, the root CID of a
+  Prolly map from Lake input hash to that input's output descriptor and the
+  CID of each artifact it names. That map is the only place Lake artifact IDs
+  meet CIDs. The root and path packages use this repository and commit; a Git
+  dependency uses its own pinned repository and commit.
+
+Lake artifact IDs are 64-bit hashes over outputs, so artifacts from different
+repositories coincide when their bytes do. Input hashes include no checkout
+path. A revision map, not the pool, says which output an input has: two
+builds of one input can differ, for example in logged messages.
+
+Patched and stock `leantar` both write `LTR4` archives and report the same
+version, and stock `leantar` decodes the patched opcodes `0xa0` and `0xb0` as
+constructors instead of rejecting them. The executable is therefore part of
+the scope.
+
+## Commands
+
+- `build` runs `lake build --wfail` once on the given targets (pass every
+  target CI builds, such as executables, so they are published), records the root package's outputs,
+  then replays the build once per other package to record its outputs too:
+  path dependencies always, Git dependencies only when the pool has no build
+  of their pin. A failed build removes the previous receipt. Recording
+  requires a clean checkout; put generated output under an ignored directory.
+- `put` requires that receipt from the same revision, toolchain, platform and
+  CI run. It never builds. For each recorded package it builds the revision
+  map locally, diffs it against the nearest published ancestor's map, uploads
+  the artifacts the diff names that the pool lacks, then the map nodes the
+  pool lacks, children first, and only then the revision pointer. A Git
+  dependency's map also takes in the upstream snapshot Lake fetched for a
+  pinned commit, for the artifacts on disk.
+- `get` restores this repository's packages from `HEAD`, else from the
+  nearest of its 64 first-parent ancestors with a published build, and
+  prints which commit it used.
+- `dependencies` restores each Git dependency's build of its pin from the
+  pool, and the Mathlib/CSLib snapshot from upstream only for packages the
+  pool has no build of.
+- With targets, `get` and `dependencies` install only mappings (`get` also
+  those of the dependencies). `get` then fetches this repository's changed
+  artifacts in parallel, and runs `lake build --wfail` on the targets. Lake takes each artifact from its local
   cache, else downloads it the first time the build needs it, else builds the
-  module. Without a published snapshot it still restores the dependencies and
-  builds the targets. Later builds use the local cache with no remote requests.
+  module.
 
-Set `LAKE_CI_BUCKET` and optionally `LAKE_CI_PREFIX`. Credentials, region and
-endpoint follow the AWS credential chain (`AWS_REGION`, `AWS_ENDPOINT_URL`,
-`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, web identity,
-profiles or machine roles). Do not pass credentials on the command line.
-GitHub publication requires a main push or manual main run in the named
-repository. Bucket permissions remain the actual write authorization boundary.
+A restore diffs the published map against the root this host last installed
+and hands Lake only the changed entries; Lake skips artifacts it
+already has. [`pool::transfer`] is that root-to-root diff for other callers,
+such as a remote builder computing a minimal upload.
 
-Scopes separate repositories, packages, platform, toolchain, archive executable, wire format and dependency
-pins. Lake hashes are 64-bit artifact IDs, not Covalence CIDs. Objects therefore
-use the raw key-value store. Size inventories detect missing and truncated
-objects; they are not remote content audits. Readers check content hashes.
-Use one writer per scope; concurrent listing is not a consistent snapshot.
-Only trusted writers may publish mappings and artifacts.
+## Host-wide local layer
 
-While Lake runs under `get`, this command stands in for `curl`. It serves
-its own cache URLs and passes requests for other services, such as Mathlib's
-cache, to `curl` unchanged. A target build therefore also uses the dependency
-services named in Mathlib's Lake configuration.
+Lake's cache directory is the local layer. It is `LAKE_CACHE_DIR`, which this
+command sets to `$XDG_CACHE_HOME/lake` or `~/.cache/lake` when unset, so CI can
+save one directory: every worktree and checkout on
+a host shares its artifacts and mappings. Beside them, `covalence/nodes.db`
+holds map nodes, `covalence/mapped/` the root whose mappings were last
+installed per scope and package, and `covalence/installed/` the root whose
+artifacts were too. This command enables Lake's artifact cache for its own
+Lake runs. Export the same `LAKE_CACHE_DIR` and `LAKE_ARTIFACT_CACHE=true` for
+every other Lake build on the host: Lake then keeps each archive unpacked in the
+cache after its first use, and later worktrees restore without unpacking. Nothing
+evicts old entries yet.
+
+Set `LAKE_CI_BUCKET`. Credentials, region and endpoint follow the AWS
+credential chain (`AWS_REGION`, `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, web identity, profiles or machine
+roles). Do not pass credentials on the command line. GitHub publication
+requires a main push or manual main run in the named repository. Bucket
+permissions remain the actual write authorization boundary. Only trusted
+writers may publish maps and artifacts.
+
+While Lake runs under this command, it stands in for `curl`. It serves pool
+artifacts named by the maps it installed and passes requests for other
+services, such as Mathlib's cache, to `curl` unchanged.
 
 Sixteen file transfers run at once, with at most two 8 MiB parts each. Upload
 payload buffers are limited to 256 MiB. Native Lake can use additional memory
-while validating and unpacking. Inventories retain only referenced filenames,
-and publication reports bytes, object counts and phase times as JSON.
+while validating and unpacking.
 
-Compression uses the workspace's existing Zstandard dependency. Downloads stream
-directly into temporary Lake artifacts; each decoder has an 8 MiB window limit
-and enforces the manifest's exact decoded length. Lake checks the decoded content
-hash before installing it. The `zstd-v1` scope separates this representation from
-raw artifacts. Prepared bodies occupy extra disk space in the record directory;
-the next successful preparation replaces them. `preparation.json` reports their
-byte count and compression time separately from `publication.json`.
-
-`--root`, `--package` and `--record` select a project, dependency package and
-record directory. `--package` changes which outputs are recorded, preserving
-Lake's default build targets unless targets follow `--`. To build a dependency's
-own defaults, pass `-- @dependency` explicitly. Packages outside the selected
-targets' dependency closure produce an empty snapshot: they have no cached checks.
-`LAKE` selects the Lake executable. Installation should use
+`--root` and `--record` select a project and record directory. `LAKE` selects the Lake executable. Installation should use
 a pinned prebuilt binary; compiling the storage SDK in every proof CI run
 would defeat the setup-time goal.
 
@@ -96,10 +129,8 @@ and all license notices. It combines upstream master with the pinned, unmerged
 embedded NUL strings, scalar arrays, and deeply nested data that older Lean
 distributions cannot safely archive. It changes no Lean sources or kernel checks.
 
-The cache scope hashes the actual `leantar` executable: readers with a different
-archive tool get a cache miss, and replacing the tool invalidates old publication
-receipts. Existing snapshots remain in their old scopes. Source installations
-must supply a compatible archiver themselves. Thomas owns the bundled upstream
+Replacing the archive tool changes the scope and invalidates publication
+receipts. Source installations must supply a compatible archiver themselves. Thomas owns the bundled upstream
 pin; remove it once the supported Lean distribution includes
 [leangz#12](https://github.com/digama0/leangz/pull/12),
 [leangz#15](https://github.com/digama0/leangz/pull/15), and

@@ -10,7 +10,11 @@ use std::{
 use serde_json::Value;
 use support::Server;
 
-const TOOLCHAIN: &str = "leanprover/lean4:nightly-2026-10-30";
+/// The toolchain on `PATH`, which CI sets per tested release.
+fn toolchain() -> String {
+    std::env::var("LAKE_TEST_TOOLCHAIN")
+        .unwrap_or_else(|_| "leanprover/lean4:nightly-2026-10-30".into())
+}
 // s3s-fs base64-encodes the entire key in one metadata filename (NAME_MAX=255).
 const REPOSITORY: &str = "t/p";
 
@@ -36,7 +40,7 @@ impl Fixture {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("project");
         fs::create_dir_all(root.join("Demo")).unwrap();
-        fs::write(root.join("lean-toolchain"), format!("{TOOLCHAIN}\n")).unwrap();
+        fs::write(root.join("lean-toolchain"), format!("{}\n", toolchain())).unwrap();
         fs::write(
             root.join("lakefile.toml"),
             "name = \"demo\"\ndefaultTargets = [\"Demo\"]\n[[lean_lib]]\nname = \"Demo\"\n",
@@ -73,7 +77,7 @@ impl Fixture {
     fn env(&self, command: &mut Command) {
         command
             .current_dir(&self.root)
-            .env("ELAN_TOOLCHAIN", TOOLCHAIN)
+            .env("ELAN_TOOLCHAIN", toolchain())
             .env("LAKE_CACHE_DIR", self.temporary.path().join("cache"))
             .env("LAKE_ARTIFACT_CACHE", "true")
             .env("AWS_REGION", "us-east-1")
@@ -85,7 +89,6 @@ impl Fixture {
             .env_remove("COVALENCE_LAKE_SCOPE")
             .env_remove("CURL")
             .env("LAKE_CI_BUCKET", "bucket")
-            .env("LAKE_CI_PREFIX", "proofs")
             .env("GITHUB_ACTIONS", "true")
             .env("GITHUB_REPOSITORY", REPOSITORY)
             .env("GITHUB_EVENT_NAME", "push")
@@ -132,19 +135,42 @@ impl Fixture {
         checked(self.cli("build").args(["--", "Demo"]));
     }
     fn record(&self, name: &str) -> PathBuf {
-        self.root.join("build/lake-cache/root").join(name)
+        self.root.join("build/lake-cache").join(name)
     }
+    /// The publication report of the root package.
     fn publish(&self) -> Value {
         checked(&mut self.cli("put"));
-        serde_json::from_slice(&fs::read(self.record("publication.json")).unwrap()).unwrap()
+        let report: Value =
+            serde_json::from_slice(&fs::read(self.record("publication.json")).unwrap()).unwrap();
+        report["packages"][0].clone()
     }
     fn scope(&self) -> String {
         let receipt: Value =
             serde_json::from_slice(&fs::read(self.record("success.json")).unwrap()).unwrap();
         receipt["identity"]["scope"].as_str().unwrap().to_owned()
     }
-    fn bucket(&self) -> PathBuf {
-        self.temporary.path().join("s3/bucket/proofs")
+    /// The pool object holding the bytes of a local file.
+    fn pool_object(&self, path: &Path) -> PathBuf {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(fs::read(path).unwrap());
+        let digest = data_encoding::BASE32_NOPAD
+            .encode(&digest)
+            .to_ascii_lowercase();
+        self.temporary
+            .path()
+            .join("s3/bucket/lake")
+            .join(self.scope())
+            .join("cas/sha2-256")
+            .join(digest)
+            .join("bytes.zst")
+    }
+    fn revision(&self) -> String {
+        let output = checked(
+            Command::new("git")
+                .current_dir(&self.root)
+                .args(["rev-parse", "HEAD"]),
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
     fn reset_local(&self) {
         for directory in [
@@ -301,19 +327,28 @@ run_cmd unless listExt.getState (← getEnv) == #[List.range 50000] do
     checked(fixture.lake().args(["env", "lean", "Check.lean"]));
 }
 
+fn log(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
 #[test]
-fn incremental_publish_repairs_missing_objects_and_native_restore_reuses_proofs() {
+fn incremental_publish_sends_only_the_difference_and_restore_reuses_proofs() {
     let fixture = Fixture::new();
     fixture.build();
     let first = fixture.publish();
     assert!(first["uploaded"].as_u64().unwrap() > 2);
     let before = fixture.server.writes.lock().unwrap().len();
     let warm = fixture.publish();
+    assert_eq!(warm["changed"], 0);
     assert_eq!(warm["uploaded"], 0);
-    assert_eq!(warm["artifact_bytes"], 0);
+    assert_eq!(warm["nodes"], 0);
     let writes = fixture.server.writes.lock().unwrap();
-    assert_eq!(writes.len() - before, 3);
-    assert!(writes[before..].iter().all(|s| s.contains("/r/")));
+    assert_eq!(writes.len() - before, 1);
+    assert!(writes[before].contains("/rev/"));
     drop(writes);
     let path = fixture.root.join("Demo/A.lean");
     fs::write(
@@ -327,62 +362,87 @@ fn incremental_publish_repairs_missing_objects_and_native_restore_reuses_proofs(
     fixture.commit();
     fixture.build();
     let changed = fixture.publish();
+    assert!(changed["parent"].is_string());
     assert!(changed["uploaded"].as_u64().unwrap() > 0);
-    assert!(changed["reused"].as_u64().unwrap() > 0);
+    assert!(changed["changed"].as_u64().unwrap() < changed["entries"].as_u64().unwrap());
     assert!(changed["uploaded"].as_u64().unwrap() < first["uploaded"].as_u64().unwrap());
-    let object = fs::read_dir(fixture.bucket().join("a").join(fixture.scope()))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    fs::remove_file(&object).unwrap();
-    assert_eq!(fixture.publish()["uploaded"], 1);
     let expected = oleans(&fixture.root);
+    let mapping = fs::read_to_string(fixture.record("packages/demo.jsonl")).unwrap();
+    let row: Value = serde_json::from_str(mapping.lines().nth(1).unwrap()).unwrap();
+    let artifact = fixture
+        .temporary
+        .path()
+        .join("cache/artifacts")
+        .join(row[1].as_str().unwrap());
+    let object = fixture.pool_object(&artifact);
+    assert!(object.is_file());
     fixture.reset_local();
     checked(&mut fixture.cli("get"));
-    let result = checked(fixture.lake().args(["build", "--wfail", "Demo"]));
-    let log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
+    let result = log(&checked(fixture.lake().args(["build", "--wfail", "Demo"])));
     assert!(
-        !log.contains("Built Demo"),
-        "recompiled restored proofs: {log}"
+        !result.contains("Built Demo"),
+        "recompiled restored proofs: {result}"
     );
     assert_eq!(oleans(&fixture.root), expected);
-    // The same native path must reject corrupted bytes, including same-size data.
-    let bytes = fs::read(&object).unwrap();
-    let mut decoded = zstd::stream::decode_all(bytes.as_slice()).unwrap();
+    // Same-size corruption of a stored artifact fails its CID check.
+    let mut decoded = zstd::stream::decode_all(fs::read(&object).unwrap().as_slice()).unwrap();
     decoded[0] ^= 1;
-    let corrupt = zstd::stream::encode_all(decoded.as_slice(), 1).unwrap();
-    fs::write(&object, &corrupt).unwrap();
-    let revision = checked(
+    fs::write(
+        &object,
+        zstd::stream::encode_all(decoded.as_slice(), 1).unwrap(),
+    )
+    .unwrap();
+    fixture.reset_local();
+    assert!(!fixture.cli("get").output().unwrap().status.success());
+}
+
+#[test]
+fn restore_uses_the_nearest_published_ancestor_and_worktrees_share_one_cache() {
+    let fixture = Fixture::new();
+    fixture.build();
+    fixture.publish();
+    let published = fixture.revision();
+    fs::write(fixture.root.join("NOTES"), "unpublished\n").unwrap();
+    fixture.commit();
+    fixture.reset_local();
+    let restored = log(&checked(&mut fixture.cli("get")));
+    assert!(
+        restored.contains(&format!("restoring {published}, 1 commits behind HEAD")),
+        "{restored}"
+    );
+    let worktree = fixture.temporary.path().join("worktree");
+    checked(
         Command::new("git")
             .current_dir(&fixture.root)
-            .args(["rev-parse", "HEAD"]),
+            .args(["worktree", "add", "-q", "--detach"])
+            .arg(&worktree)
+            .arg("HEAD"),
     );
-    let revision = String::from_utf8(revision.stdout).unwrap();
-    let manifest_path = fixture
-        .bucket()
-        .join("r")
-        .join(fixture.scope())
-        .join(format!("{}.artifacts.json", revision.trim()));
-    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    let name = object
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .strip_suffix(".zst")
-        .unwrap();
-    manifest["artifacts"][name]["encoded_bytes"] = corrupt.len().into();
-    fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    fixture.reset_local();
-    let corrupt = fixture.cli("get").output().unwrap();
-    assert!(!corrupt.status.success());
-    assert!(String::from_utf8_lossy(&corrupt.stderr).contains("hash mismatch"));
+    // The second checkout installs nothing: the host already holds this root.
+    let reads = fixture.server.reads.lock().unwrap().len();
+    let second = log(&checked(
+        fixture
+            .cli("get")
+            .current_dir(&worktree)
+            .arg("--root")
+            .arg(&worktree),
+    ));
+    assert!(second.contains("0 changed entries"), "{second}");
+    let built = log(&checked(
+        fixture
+            .lake()
+            .current_dir(&worktree)
+            .args(["build", "--wfail", "Demo"]),
+    ));
+    assert!(
+        !built.contains("Built Demo"),
+        "rebuilt in a worktree: {built}"
+    );
+    assert!(
+        fixture.server.reads.lock().unwrap()[reads..]
+            .iter()
+            .all(|path| path.contains("/rev/"))
+    );
 }
 
 #[test]
@@ -397,7 +457,7 @@ fn unsuccessful_or_stale_receipts_cannot_publish() {
             .unwrap()
             .success()
     );
-    let mapping = fixture.record("outputs.jsonl");
+    let mapping = fixture.record("packages/demo.jsonl");
     let original = fs::read(&mapping).unwrap();
     fs::write(
         &mapping,
@@ -406,11 +466,6 @@ fn unsuccessful_or_stale_receipts_cannot_publish() {
     .unwrap();
     assert!(!fixture.cli("put").status().unwrap().success());
     fs::write(&mapping, original).unwrap();
-    let manifest = fixture.record("artifacts.json");
-    let original = fs::read(&manifest).unwrap();
-    fs::write(&manifest, [original.as_slice(), b"\n"].concat()).unwrap();
-    assert!(!fixture.cli("put").status().unwrap().success());
-    fs::write(&manifest, original).unwrap();
     assert!(fixture.server.writes.lock().unwrap().is_empty());
     fs::write(
         fixture.root.join("Demo/A.lean"),
@@ -425,7 +480,7 @@ fn unsuccessful_or_stale_receipts_cannot_publish() {
 }
 
 #[test]
-fn package_selection_records_only_the_dependency_closure_of_the_build_targets() {
+fn dependencies_are_recorded_for_the_build_targets_closure_only() {
     let fixture = Fixture::new();
     let dependency = fixture.root.join("Dep");
     fs::create_dir(&dependency).unwrap();
@@ -456,22 +511,21 @@ fn package_selection_records_only_the_dependency_closure_of_the_build_targets() 
     checked(fixture.lake().arg("update"));
     fixture.commit();
 
-    // No import needs this package yet; an empty snapshot proves nothing.
-    checked(fixture.cli("build").args(["--package", "dep"]));
-    checked(fixture.cli("put").args(["--package", "dep"]));
-    let manifest = fixture.root.join("build/lake-cache/dep/artifacts.json");
-    let empty: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
-    assert_eq!(empty["artifacts"], serde_json::json!({}));
-    assert!(
+    // No import needs this package yet; an empty snapshot is not published.
+    fixture.build();
+    checked(&mut fixture.cli("put"));
+    let pointers = || {
         fixture
             .server
             .writes
             .lock()
             .unwrap()
             .iter()
-            .all(|key| !key.contains("/a/"))
-    );
-    checked(fixture.cli("get").args(["--package", "dep"]));
+            .filter(|key| key.contains("/rev/"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(pointers().iter().all(|key| !key.ends_with("/dep")));
 
     fs::write(
         fixture.root.join("Demo/A.lean"),
@@ -479,10 +533,9 @@ fn package_selection_records_only_the_dependency_closure_of_the_build_targets() 
     )
     .unwrap();
     fixture.commit();
-    checked(fixture.cli("build").args(["--package", "dep"]));
-    checked(fixture.cli("put").args(["--package", "dep"]));
-    let used: Value = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
-    assert!(!used["artifacts"].as_object().unwrap().is_empty());
+    fixture.build();
+    checked(&mut fixture.cli("put"));
+    assert!(pointers().iter().any(|key| key.ends_with("/dep")));
     assert!(
         !dependency
             .join(".lake/build/lib/lean/Unused.olean")
@@ -497,29 +550,13 @@ fn package_selection_records_only_the_dependency_closure_of_the_build_targets() 
     )
     .unwrap();
     fixture.commit();
-    assert!(
-        !fixture
-            .cli("build")
-            .args(["--package", "dep"])
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
-    assert!(
-        !fixture
-            .cli("put")
-            .args(["--package", "dep"])
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(!fixture.cli("build").output().unwrap().status.success());
+    assert!(!fixture.cli("put").output().unwrap().status.success());
     assert_eq!(fixture.server.writes.lock().unwrap().len(), writes);
 }
 
 #[test]
-fn transfer_or_inventory_failure_never_publishes_a_pointer() {
+fn transfer_failure_never_publishes_a_pointer() {
     let fixture = Fixture::new();
     fixture.build();
     fixture.server.deny.store(true, Ordering::SeqCst);
@@ -531,14 +568,10 @@ fn transfer_or_inventory_failure_never_publishes_a_pointer() {
             .lock()
             .unwrap()
             .iter()
-            .all(|s| s.contains("/a/"))
+            .all(|s| !s.contains("/rev/"))
     );
     fixture.server.deny.store(false, Ordering::SeqCst);
     fixture.publish();
-    let before = fixture.server.writes.lock().unwrap().len();
-    fixture.server.incomplete.store(true, Ordering::SeqCst);
-    assert!(!fixture.cli("put").status().unwrap().success());
-    assert_eq!(fixture.server.writes.lock().unwrap().len(), before);
 }
 
 #[test]
@@ -614,14 +647,14 @@ fn other_services_reach_curl_without_cache_credentials() {
 }
 
 #[test]
-fn target_restore_fetches_only_the_target_closure_and_then_builds_locally() {
+fn target_restore_builds_only_the_target_closure_and_then_works_offline() {
     let fixture = Fixture::new();
     fixture.build();
     fixture.publish();
     let artifacts = |from: usize| {
         fixture.server.reads.lock().unwrap()[from..]
             .iter()
-            .filter(|path| path.contains("/a/"))
+            .filter(|path| path.contains("/cas/"))
             .count()
     };
     let log = |output: Output| {
@@ -639,14 +672,20 @@ fn target_restore_fetches_only_the_target_closure_and_then_builds_locally() {
     let start = fixture.server.reads.lock().unwrap().len();
     let restored = log(checked(fixture.cli("get").args(["--", "Demo.A"])));
     assert!(!restored.contains("Built Demo.A"), "rebuilt: {restored}");
+    // This repository's changed artifacts are prefetched in one parallel
+    // round; only what the targets need reaches the build directory.
     let fetched = artifacts(start);
     assert!(
-        0 < fetched && fetched < everything,
+        0 < fetched && fetched <= everything,
         "{fetched} of {everything}"
     );
+    assert!(restored.contains("Lake cache: prefetched"), "{restored}");
     let built = fixture.root.join(".lake/build/lib/lean/Demo");
     assert!(built.join("A.olean").exists());
     assert!(!built.join("B.olean").exists());
+    // A second targeted restore installs no mappings again.
+    let again = log(checked(fixture.cli("get").args(["--", "Demo.A"])));
+    assert!(again.contains("demo: 0 changed entries"), "{again}");
     // Once local, a build needs no remote requests.
     let start = fixture.server.reads.lock().unwrap().len();
     let warm = log(checked(fixture.lake().args(["build", "--wfail", "Demo.A"])));
@@ -664,57 +703,95 @@ fn target_restore_fetches_only_the_target_closure_and_then_builds_locally() {
 }
 
 #[test]
-fn package_and_platform_identity_are_checked_and_missing_pointers_are_misses() {
+fn toolchain_identity_is_checked_and_missing_pointers_are_misses() {
     let fixture = Fixture::new();
-    checked(&mut fixture.cli("get"));
-    let vendor = fixture.root.join("vendor");
-    fs::create_dir(&vendor).unwrap();
+    let miss = log(&checked(&mut fixture.cli("get")));
+    assert!(miss.contains("no published build"), "{miss}");
+    fixture.build();
+    let path = fixture.record("success.json");
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    receipt["identity"]["scope"] = Value::String("other-platform/other-toolchain".into());
+    fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    assert!(!fixture.cli("put").status().unwrap().success());
+    assert!(fixture.server.writes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn one_targeted_get_serves_every_package_of_the_workspace() {
+    let fixture = Fixture::new();
+    let dependency = fixture.temporary.path().join("dep");
+    fs::create_dir(&dependency).unwrap();
     fs::write(
-        vendor.join("lakefile.toml"),
-        "name = \"vendor\"\ndefaultTargets = [\"Vendor\"]\n[[lean_lib]]\nname = \"Vendor\"\n",
+        dependency.join("lakefile.toml"),
+        "name = \"dep\"\ndefaultTargets = [\"Good\"]\n[[lean_lib]]\nname = \"Good\"\n",
     )
     .unwrap();
     fs::write(
-        vendor.join("Vendor.lean"),
-        "module\npublic theorem fact : 1 = 1 := rfl\n",
+        dependency.join("Good.lean"),
+        "module\npublic theorem good : True := trivial\n",
     )
     .unwrap();
+    fs::write(dependency.join(".gitignore"), ".lake/\n").unwrap();
+    let git = |directory: &Path, args: &[&str]| {
+        checked(
+            Command::new("git")
+                .current_dir(directory)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args),
+        )
+    };
+    git(&dependency, &["init", "-q"]);
+    git(&dependency, &["add", "."]);
+    git(
+        &dependency,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "dep"],
+    );
     let config = fixture.root.join("lakefile.toml");
     fs::write(
         &config,
         format!(
-            "{}\n[[require]]\nname = \"vendor\"\npath = \"vendor\"\n",
-            fs::read_to_string(&config).unwrap()
+            "{}\n[[require]]\nname = \"dep\"\ngit = \"{}\"\nrev = \"HEAD\"\n",
+            fs::read_to_string(&config).unwrap(),
+            dependency.display()
         ),
     )
     .unwrap();
     checked(fixture.lake().arg("update"));
+    fs::write(
+        fixture.root.join("Demo/A.lean"),
+        "module\npublic import Good\npublic theorem a : True := good\n",
+    )
+    .unwrap();
     fixture.commit();
-    checked(fixture.cli("build").args(["--package", "vendor"]));
-    checked(fixture.cli("put").args(["--package", "vendor"]));
-    let record = fixture.root.join("build/lake-cache/vendor");
+    fixture.build();
+    checked(&mut fixture.cli("put"));
     assert!(
-        !fixture
-            .cli("put")
-            .arg("--record")
-            .arg(&record)
-            .status()
+        fixture
+            .server
+            .writes
+            .lock()
             .unwrap()
-            .success()
+            .iter()
+            .any(|key| key.contains("/rev/") && key.ends_with("/dep"))
     );
-    let path = record.join("success.json");
-    let mut receipt: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    receipt["identity"]["scope"] =
-        Value::String("example/proofs/other-platform/other-pins/vendor".into());
-    fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
-    let before = fixture.server.writes.lock().unwrap().len();
+    fixture.reset_local();
+    let packaged = fixture.root.join(".lake/packages/dep/.lake/build");
+    if packaged.exists() {
+        fs::remove_dir_all(&packaged).unwrap();
+    }
+    let restored = log(&checked(fixture.cli("get").args(["--", "Demo"])));
+    assert!(restored.contains("Lake cache: dep: "), "{restored}");
     assert!(
-        !fixture
-            .cli("put")
-            .args(["--package", "vendor"])
-            .status()
-            .unwrap()
-            .success()
+        !restored.contains("Built Good"),
+        "rebuilt the dependency: {restored}"
     );
-    assert_eq!(fixture.server.writes.lock().unwrap().len(), before);
+    assert!(
+        !restored.contains("Built Demo"),
+        "rebuilt the root: {restored}"
+    );
 }

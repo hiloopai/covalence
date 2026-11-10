@@ -1,44 +1,55 @@
 use std::{
     cmp::Reverse,
-    collections::BTreeSet,
-    env,
-    fs::{self, File},
+    collections::{BTreeMap, BTreeSet},
+    env, fs,
     path::Path,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
     time::Instant,
 };
 
+use covalence_cas_prolly::Map;
+use covalence_cas_trait::Cas;
 use covalence_kv_s3::{AwsOptions, S3Kv, S3Location};
 use covalence_kv_trait::Kv;
+use covalence_lib_cid::{Bdasl, Cid, Sha256};
 use covalence_lib_data::Bytes;
 use covalence_lib_serde::Serialize;
 
 use crate::{
-    artifact::{self, Manifest},
+    blobs::{self, Blobs},
     error::{Error, IoResult, Result, encode, invalid},
+    local::Local,
     mapping,
-    project::Project,
+    pool::{self, Entry},
+    project::{Package, Project, Source},
 };
 
 const WORKERS: usize = 16;
 
-pub(crate) fn store() -> Result<S3Kv> {
+/// The bucket holding the pool, from `LAKE_CI_BUCKET`.
+pub(crate) fn store() -> Result<Arc<dyn Kv>> {
     let bucket = env::var("LAKE_CI_BUCKET").map_err(|_| invalid("LAKE_CI_BUCKET is required"))?;
-    let prefix = env::var("LAKE_CI_PREFIX").unwrap_or_default();
-    let location = S3Location::new(&bucket, &prefix).map_err(|source| Error::S3 { source })?;
+    let location = S3Location::new(&bucket, "").map_err(|source| Error::S3 { source })?;
     // Sixteen files, each with up to two 8 MiB parts, bound payload buffers
     // to 256 MiB. The transport supplies retries and connection reuse.
     S3Kv::from_aws(location, &AwsOptions::default())
         .map(|s| {
-            s.concurrency(2)
-                .max_idle_connections(WORKERS * 2)
-                .part_size(8 * 1024 * 1024)
-                .upload_buffer_bytes(256 * 1024 * 1024)
+            Arc::new(
+                s.concurrency(2)
+                    .max_idle_connections(WORKERS * 2)
+                    .part_size(8 * 1024 * 1024)
+                    .upload_buffer_bytes(256 * 1024 * 1024),
+            ) as Arc<dyn Kv>
         })
         .map_err(|source| Error::S3 { source })
 }
 
+/// `work` on every item, sixteen at a time; results keep the items' order.
+/// The first failure stops further work.
 pub(crate) fn parallel<T: Sync, R: Send>(
     items: &[T],
     work: impl Fn(usize, &T) -> Result<R> + Sync,
@@ -59,7 +70,7 @@ pub(crate) fn parallel<T: Sync, R: Send>(
                                 break;
                             };
                             match work(index, item) {
-                                Ok(result) => results.push(result),
+                                Ok(result) => results.push((index, result)),
                                 Err(error) => {
                                     stop.store(true, Ordering::Relaxed);
                                     return Err(error);
@@ -81,143 +92,296 @@ pub(crate) fn parallel<T: Sync, R: Send>(
                 }
             }
         }
-        failure.map_or(Ok(results), Err)
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        results.sort_unstable_by_key(|(index, _)| *index);
+        Ok(results.into_iter().map(|(_, result)| result).collect())
     })
 }
 
-pub(crate) fn put_file(store: &S3Kv, key: &str, path: &Path) -> Result<u64> {
-    let mut file = File::open(path).operation(format!("open upload {}", path.display()))?;
-    let size = file.metadata().operation("read upload size")?.len();
-    store
-        .put_from(key.as_bytes(), &mut file, size)
-        .map_err(|source| Error::Store {
-            operation: format!("upload {key}"),
-            source,
-        })?;
-    Ok(size)
+fn store_error(operation: impl Into<String>) -> impl FnOnce(covalence_kv_trait::Error) -> Error {
+    move |source| Error::Store {
+        operation: operation.into(),
+        source,
+    }
+}
+
+/// The root a revision pointer names, or `None` if it is unpublished.
+pub(crate) fn pointer(kv: &dyn Kv, key: &str) -> Result<Option<Cid<Bdasl>>> {
+    let Some(bytes) = kv
+        .get(key.as_bytes())
+        .map_err(store_error("read revision pointer"))?
+    else {
+        return Ok(None);
+    };
+    str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .map(Some)
+        .ok_or_else(|| invalid(format!("invalid revision pointer {key}")))
+}
+
+/// The nearest of `commits` with a published build of `package`, and its
+/// root: one parallel round of pointer reads.
+pub(crate) fn nearest(
+    kv: &dyn Kv,
+    project: &Project,
+    scope: &str,
+    package: &Package,
+    commits: &[String],
+) -> Result<Option<(String, Cid<Bdasl>)>> {
+    let roots = parallel(commits, |_, commit| {
+        pointer(kv, &project.revision_key(scope, package, commit)?)
+    })?;
+    Ok(commits
+        .iter()
+        .cloned()
+        .zip(roots)
+        .find_map(|(commit, root)| root.map(|root| (commit, root))))
+}
+
+/// The CID of each file, hashed in parallel.
+fn hash_files(files: &[(String, std::path::PathBuf)]) -> Result<BTreeMap<String, (Sha256, u64)>> {
+    Ok(files
+        .iter()
+        .map(|(name, _)| name.clone())
+        .zip(parallel(files, |_, (_, path)| blobs::hash_file(path))?)
+        .collect())
+}
+
+/// The entries of a Lake mapping, with each artifact's CID, from files in
+/// `directory`. With `complete`, entries naming a missing artifact fail;
+/// without, they are left out.
+fn mapped_entries(
+    mapping_path: &Path,
+    directory: &Path,
+    complete: bool,
+) -> Result<BTreeMap<String, Entry>> {
+    let rows = mapping::rows(mapping_path)?;
+    let mut files = BTreeMap::new();
+    for (_, names) in rows.values() {
+        for name in names {
+            let path = directory.join(name);
+            if path.is_file() {
+                files.insert(name.clone(), path);
+            } else if complete {
+                return Err(invalid(format!("artifact {} is missing", path.display())));
+            }
+        }
+    }
+    let files = files.into_iter().collect::<Vec<_>>();
+    let hashes = hash_files(&files)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(input, (output, names))| {
+            let artifacts = names
+                .iter()
+                .map(|name| hashes.get(name).map(|(cid, _)| (name.clone(), *cid)))
+                .collect::<Option<BTreeMap<_, _>>>()?;
+            Some((input, Entry { output, artifacts }))
+        })
+        .collect())
 }
 
 #[derive(Serialize)]
 #[serde(crate = "covalence_lib_serde::serde")]
 struct Publication {
+    package: String,
+    commit: String,
+    root: String,
+    parent: Option<String>,
+    entries: usize,
+    changed: usize,
     artifacts: usize,
-    reused: usize,
     uploaded: usize,
     artifact_bytes: u64,
-    metadata_bytes: u64,
-    inventory_seconds: f64,
-    transfer_seconds: f64,
+    nodes: usize,
     seconds: f64,
 }
 
-pub(crate) fn publish(project: &Project, store: &S3Kv) -> Result<()> {
+struct Publisher<'a> {
+    project: &'a Project,
+    kv: &'a dyn Kv,
+    remote: &'a dyn Cas,
+    blobs: &'a Blobs,
+    local: &'a Local,
+    scope: &'a str,
+    /// Every commit the manifest pins.
+    pins: BTreeSet<String>,
+    artifacts: &'a Path,
+}
+
+/// Publish one recorded package; `None` if there is nothing to publish.
+fn publish_package(publisher: &Publisher, package: &Package) -> Result<Option<Publication>> {
+    let Publisher {
+        project,
+        kv,
+        remote,
+        blobs,
+        local,
+        scope,
+        ref pins,
+        artifacts,
+    } = *publisher;
     let started = Instant::now();
-    let receipt = project.receipt()?;
-    let mapping = project.record.join("outputs.jsonl");
-    let files = mapping::artifacts(&mapping, &receipt.artifacts)?;
-    let manifest_path = project.record.join(artifact::MANIFEST);
-    let manifest =
-        Manifest::parse(&fs::read(&manifest_path).operation("read prepared artifact manifest")?)?;
-    if !files.keys().eq(manifest.artifacts.keys()) {
-        return Err(invalid("prepared artifacts do not match the Lake mapping"));
-    }
-    let mut prepared = std::collections::BTreeMap::new();
-    for (name, info) in &manifest.artifacts {
-        let name_on_wire = artifact::filename(name);
-        let path = project.record.join(artifact::DIRECTORY).join(&name_on_wire);
-        if path
-            .metadata()
-            .operation("read prepared artifact length")?
-            .len()
-            != info.encoded_bytes
-        {
-            return Err(invalid("prepared artifact length changed after checking"));
-        }
-        prepared.insert(name_on_wire, (path, info.encoded_bytes));
-    }
-    let prefix = format!("a/{}/", receipt.identity.scope);
-    let inventory_started = Instant::now();
-    let mut present = BTreeSet::new();
-    let mut tokens = BTreeSet::new();
-    let mut continuation = None;
-    loop {
-        let page = store
-            .list(&prefix, continuation.as_deref())
-            .map_err(|source| Error::S3 { source })?;
-        for object in page.objects {
-            let name = object
-                .key
-                .strip_prefix(&prefix)
-                .ok_or_else(|| invalid("inventory escaped artifact scope"))?;
-            if let Some((_, bytes)) = prepared.get(name)
-                && *bytes == object.size
-                && !present.insert(name.to_owned())
-            {
-                return Err(invalid("inventory repeated an artifact"));
+    let commit = match &package.source {
+        Source::Repository => project.git(&["rev-parse", "HEAD"])?,
+        Source::Git { commit, .. } => commit.clone(),
+    };
+    let key = project.revision_key(scope, package, &commit)?;
+    let (parent, mut entries) = match &package.source {
+        Source::Repository => (
+            nearest(kv, project, scope, package, &project.ancestors()?)?,
+            BTreeMap::new(),
+        ),
+        Source::Git { .. } => {
+            if pointer(kv, &key)?.is_some() {
+                return Ok(None);
             }
+            // Fold in the upstream snapshots Lake fetched for this package, so
+            // the pool covers at least what upstream does. Upstream services
+            // name snapshots by a pinned commit, not always the package's own.
+            let mut upstream = BTreeMap::new();
+            for pin in pins {
+                let path = local
+                    .directory()
+                    .join("revisions")
+                    .join(&package.name)
+                    .join(format!("{pin}.jsonl"));
+                if path.is_file() {
+                    upstream.extend(mapped_entries(&path, artifacts, false)?);
+                }
+            }
+            (None, upstream)
         }
-        let Some(next) = page.next else {
-            break;
-        };
-        if !tokens.insert(next.clone()) {
-            return Err(invalid("inventory repeated a continuation token"));
-        }
-        continuation = Some(next);
+    };
+    entries.extend(mapped_entries(
+        &project.mapping(&package.name),
+        artifacts,
+        true,
+    )?);
+    if entries.is_empty() {
+        return Ok(None);
     }
-    let inventory_seconds = inventory_started.elapsed().as_secs_f64();
-    let mut missing = prepared
+    let map = pool::build(local.nodes(), &entries)?;
+    let parent_map = match &parent {
+        Some((_, root)) => {
+            pool::copy_nodes(remote, &*local.nodes(), *root)?;
+            Some(Map::open(local.nodes(), *root))
+        }
+        None => None,
+    };
+    let transfer = pool::transfer(parent_map.as_ref(), &map)?;
+    let wanted = transfer
+        .artifacts
         .iter()
-        .filter(|(key, _)| !present.contains(*key))
+        .map(|(name, cid)| (name.clone(), *cid))
         .collect::<Vec<_>>();
-    // Start large multipart bodies before small files can leave them at the tail.
-    missing.sort_unstable_by_key(|(_, (_, bytes))| Reverse(*bytes));
-    let transfer_started = Instant::now();
-    let artifact_bytes = parallel(&missing, |_, (key, (path, _))| {
-        put_file(store, &format!("{prefix}{key}"), path)
+    let present = parallel(&wanted, |_, (_, cid)| blobs.has(cid))?;
+    let mut missing = wanted
+        .into_iter()
+        .zip(present)
+        .filter(|(_, present)| !present)
+        .map(|((name, cid), _)| {
+            let path = artifacts.join(&name);
+            let bytes = path.metadata().operation("read artifact length")?.len();
+            Ok((path, cid, bytes))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Start large bodies before small files can leave them at the tail.
+    missing.sort_unstable_by_key(|(_, _, bytes)| Reverse(*bytes));
+    let artifact_bytes = parallel(&missing, |_, (path, cid, bytes)| {
+        blobs.put_file(cid, path)?;
+        Ok(*bytes)
     })?
     .into_iter()
     .sum();
-    let transfer_seconds = transfer_started.elapsed().as_secs_f64();
-    // The mapping and pointer become visible only after every body succeeds.
-    let manifest_bytes = put_file(
-        store,
-        &format!(
-            "r/{}/{}.artifacts.json",
-            receipt.identity.scope, receipt.identity.revision
-        ),
-        &manifest_path,
-    )?;
-    let metadata_bytes = manifest_bytes
-        + put_file(
-            store,
-            &format!(
-                "r/{}/{}.jsonl",
-                receipt.identity.scope, receipt.identity.revision
-            ),
-            &mapping,
-        )?;
-    let pointer = format!("{}\n", receipt.identity.revision);
-    let key = format!("r/{}/main-latest", receipt.identity.scope);
-    store
-        .put(key.as_bytes(), Bytes::copy_from_slice(pointer.as_bytes()))
-        .map_err(|source| Error::Store {
-            operation: "publish revision pointer".into(),
-            source,
-        })?;
-    let report = Publication {
-        artifacts: files.len(),
-        reused: present.len(),
+    // Artifacts, then nodes children first, then the pointer: a pointer
+    // never names an incomplete map.
+    let nodes = pool::copy_nodes(&*local.nodes(), remote, map.root())?;
+    kv.put(
+        key.as_bytes(),
+        Bytes::copy_from_slice(format!("{}\n", map.root()).as_bytes()),
+    )
+    .map_err(store_error("publish revision pointer"))?;
+    Ok(Some(Publication {
+        package: package.name.clone(),
+        commit,
+        root: map.root().to_string(),
+        parent: parent.map(|(commit, _)| commit),
+        entries: entries.len(),
+        changed: transfer.entries.len(),
+        artifacts: transfer.artifacts.len(),
         uploaded: missing.len(),
         artifact_bytes,
-        metadata_bytes: metadata_bytes + pointer.len() as u64,
-        inventory_seconds,
-        transfer_seconds,
+        nodes,
         seconds: started.elapsed().as_secs_f64(),
+    }))
+}
+
+pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>) -> Result<()> {
+    let started = Instant::now();
+    let receipt = project.receipt()?;
+    let scope = &receipt.identity.scope;
+    let remote = pool::store(kv.clone(), scope)?;
+    let local = Local::open(project)?;
+    let packages = project.packages()?;
+    let pins = packages
+        .iter()
+        .filter_map(|package| match &package.source {
+            Source::Git { commit, .. } => Some(commit.clone()),
+            Source::Repository => None,
+        })
+        .collect();
+    let publisher = Publisher {
+        project,
+        kv: &**kv,
+        remote: &remote,
+        blobs: &pool::blobs(kv.clone(), scope)?,
+        local: &local,
+        scope,
+        pins,
+        artifacts: &receipt.artifacts,
     };
-    let report = encode(&report)?;
+    let mut published = Vec::new();
+    for package in packages {
+        if receipt.packages.contains_key(&package.name)
+            && let Some(publication) = publish_package(&publisher, &package)?
+        {
+            published.push(publication);
+        }
+    }
+    let report = encode(&serde_json::json!({
+        "scope": scope,
+        "packages": published,
+        "seconds": started.elapsed().as_secs_f64(),
+    }))?;
     println!(
         "Lake cache publication: {}",
         String::from_utf8_lossy(&report)
     );
     fs::write(project.record.join("publication.json"), report).operation("write publication report")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_results_keep_input_order() {
+        let items = (0..1000u64).collect::<Vec<_>>();
+        let results = parallel(&items, |index, item| {
+            // Uneven work so workers finish out of order.
+            thread::sleep(std::time::Duration::from_micros((item * 7919) % 50));
+            Ok((index, *item))
+        })
+        .unwrap();
+        assert!(
+            results
+                .iter()
+                .enumerate()
+                .all(|(i, (index, item))| *index == i && *item == i as u64)
+        );
+    }
 }
