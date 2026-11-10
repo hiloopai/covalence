@@ -81,6 +81,13 @@ such as a remote builder computing a minimal upload.
 
 ## Host-wide local layer
 
+Before any Lake run, `dependencies`, `build` and `get` check out each Git
+dependency missing from the packages directory from a shallow bare mirror in
+`covalence/git/` under Lake's cache directory. The mirror fetches only pinned
+commits it lacks, at depth one; checkouts borrow its objects through Git
+alternates. Lake then finds each package at its pinned revision and clones
+nothing. Local-path Git URLs are left to Lake.
+
 Lake's cache directory is the local layer. It is `LAKE_CACHE_DIR`, which this
 command sets to `$XDG_CACHE_HOME/lake` or `~/.cache/lake` when unset, so CI can
 save one directory: every worktree and checkout on

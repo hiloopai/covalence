@@ -53,6 +53,21 @@ pub(crate) struct Project {
     pub record: PathBuf,
 }
 
+/// `LAKE_CACHE_DIR`, else `$XDG_CACHE_HOME/lake`, else `~/.cache/lake`.
+pub(crate) fn host_cache_dir() -> Option<PathBuf> {
+    env::var_os("LAKE_CACHE_DIR")
+        .filter(|directory| !directory.is_empty())
+        .map(PathBuf::from)
+        .or_else(default_cache_dir)
+}
+
+fn default_cache_dir() -> Option<PathBuf> {
+    env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .map(|home| home.join("lake"))
+}
+
 /// A manifest package name as Lake's `--package` and cache directories spell
 /// it: without the `«»` quotes Lean puts around names that are not identifiers.
 pub(crate) fn package_name(name: &str) -> &str {
@@ -130,13 +145,10 @@ impl Project {
     pub fn lake(&self) -> Command {
         let mut command = Command::new(env::var_os("LAKE").unwrap_or_else(|| "lake".into()));
         command.current_dir(&self.root);
-        if env::var_os("LAKE_CACHE_DIR").is_none() {
-            let home = env::var_os("XDG_CACHE_HOME")
-                .map(PathBuf::from)
-                .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
-            if let Some(home) = home {
-                command.env("LAKE_CACHE_DIR", home.join("lake"));
-            }
+        if env::var_os("LAKE_CACHE_DIR").is_none()
+            && let Some(directory) = default_cache_dir()
+        {
+            command.env("LAKE_CACHE_DIR", directory);
         }
         command
     }

@@ -9,6 +9,7 @@ mod mapping;
 pub mod pool;
 mod project;
 mod restore;
+mod sources;
 mod storage;
 
 use std::{env, path::PathBuf, process::ExitCode};
@@ -76,6 +77,9 @@ fn execute(cli: Cli) -> Result<()> {
         return Err(invalid("--repository or GITHUB_REPOSITORY is required"));
     }
     let kv = storage::store()?;
+    if !matches!(cli.action, Action::Put) {
+        sources::materialize(&project)?;
+    }
     match cli.action {
         Action::Dependencies => dependencies::fetch(&project, &kv, &cli.targets),
         Action::Build => {
