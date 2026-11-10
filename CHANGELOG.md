@@ -44,6 +44,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Changed
 
+- Eager `cov-lake-cache get` and `dependencies` decode the module archives
+  they restore from the pool in process, in parallel, into Lake's artifact
+  cache, so the next `lake build` runs no `leantar` for them.
+
 - **Breaking:** `cov-lake-cache` publishes to one pool per platform and
   toolchain, shared by every repository, under `lake/` in the bucket.
   Artifacts are stored under CIDs in the key-value CAS, and each published

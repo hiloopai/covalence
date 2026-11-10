@@ -86,6 +86,15 @@ and hands Lake only the changed entries; Lake skips artifacts it
 already has. [`pool::transfer`] is that root-to-root diff for other callers,
 such as a remote builder computing a minimal upload.
 
+Lake restores a module whose output is only its `.ltar` archive by running
+`leantar` once per module. An eager restore (without targets) instead
+downloads each archive itself, sixteen at a time, decodes it in process with
+`covalence-lean-ltar`, writes its files into Lake's artifact
+directory under the names its trace gives them, and installs the trace's
+outputs as the mapping. Lake then finds every file in its cache and runs no
+archiver. Targeted restores and the upstream Mathlib/CSLib snapshot still
+leave archives to Lake.
+
 ## Host-wide local layer
 
 Before any Lake run, `dependencies`, `build` and `get` check out each Git

@@ -209,8 +209,11 @@ fn embedded_nul_strings_survive_publication_and_native_restore() {
     let expected = oleans(&fixture.root);
     fixture.publish();
     fixture.reset_local();
-    checked(&mut fixture.cli("get"));
-    checked(fixture.lake().args(["build", "--wfail", "Demo"]));
+    let restored = log(&checked(&mut fixture.cli("get")));
+    assert!(restored.contains("unpacked"), "{restored}");
+    // The restore decoded every archive, so Lake runs no archiver.
+    let built = log(&checked(fixture.lake().args(["build", "--wfail", "Demo"])));
+    assert!(!built.contains("Unpacked"), "{built}");
     assert_eq!(oleans(&fixture.root), expected);
     fs::write(
         fixture.root.join("Check.lean"),
