@@ -10,6 +10,7 @@ mod gc;
 mod local;
 mod mapping;
 mod modules;
+mod overlay;
 pub mod pool;
 mod project;
 mod restore;
@@ -103,6 +104,9 @@ fn execute(cli: Cli) -> Result<()> {
         .then(|| gc::in_use(&cache))
         .transpose()?;
     let store = || {
+        if !matches!(cli.action, Action::Put) {
+            overlay::apply(&project)?;
+        }
         let kv = storage::store()?;
         // A restore checks the dependencies out while its seed downloads.
         if !matches!(cli.action, Action::Put | Action::Get) {

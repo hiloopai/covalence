@@ -32,5 +32,5 @@ jobs:
           set -euo pipefail
           gh release create "lake-cache-$GITHUB_SHA" --target "$GITHUB_SHA" \
             --title "Lake cache $GITHUB_SHA" --prerelease \
-            --notes 'Linux x86-64 binary, tested with Lean nightly-2026-10-30 and nightly-2026-11-05. Consumers must pin the revision and archive SHA-256.' \
+            --notes 'Linux x86-64 binary and Lake overlays, tested with Lean nightly-2026-10-30 and nightly-2026-11-05. Consumers must pin the revision and archive SHA-256.' \
             dist/cov-lake-cache-x86_64-unknown-linux-gnu.tar.gz dist/SHA256SUMS

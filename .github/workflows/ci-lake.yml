@@ -63,10 +63,31 @@ jobs:
           cargo test --locked --manifest-path "$RUNNER_TEMP/lake-archiver/Cargo.toml"
           cargo build --locked --release --manifest-path "$RUNNER_TEMP/lake-archiver/Cargo.toml" --bin leantar
           install -m 755 "$RUNNER_TEMP/lake-archiver/target/release/leantar" "$RUNNER_TEMP/lean/bin/leantar"
+      # The Lake overlays sit beside the binary the tests run, as in the archive,
+      # so every test installs this toolchain's overlay and runs its Lake.
+      - name: Unpack the pinned Lake overlays
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -v '^#' crates/lean/cache/lake-overlays | while read -r githash url sha256; do
+            curl --fail --location --silent --show-error --retry 3 "$url" --output "$RUNNER_TEMP/overlay.tar.zst"
+            echo "$sha256  $RUNNER_TEMP/overlay.tar.zst" | sha256sum --check
+            mkdir -p "target/release/lake-overlay/$githash"
+            tar --zstd -xf "$RUNNER_TEMP/overlay.tar.zst" -C "target/release/lake-overlay/$githash"
+          done
+          test -d "target/release/lake-overlay/$(lean --githash)"
       - name: Check and test the native Lake protocol
         run: |
           cargo clippy --locked -p covalence-lean-cache --all-targets --features lake-tests -- -D warnings
           cargo test --locked --release -p covalence-lean-cache --features lake-tests
+      - name: Check that the tests ran the overlay's Lake
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "target/release/lake-overlay/$(lean --githash)"
+          find . -type f -print0 | while IFS= read -r -d '' file; do
+            cmp "$file" "$RUNNER_TEMP/lean/$file"
+          done
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         if: matrix.lean.package
         with:
@@ -84,6 +105,9 @@ jobs:
             -c crates/python/about.toml -o dist/LEANTAR-THIRD-PARTY-LICENSES.md \
             crates/lean/cache/licenses.md.hbs
           cp target/release/cov-lake-cache LICENSE-* dist/
+          cp -a target/release/lake-overlay dist/
+          cp crates/lean/cache/lake-overlays dist/LAKE-OVERLAYS
+          cp "$RUNNER_TEMP/lean/LICENSE" dist/LAKE-OVERLAY-LICENSE
           cp "$RUNNER_TEMP/lake-archiver/target/release/leantar" dist/
           cp "$RUNNER_TEMP/lake-archiver/LICENSE" dist/LEANTAR-LICENSE
           git -C "$RUNNER_TEMP/lake-archiver" rev-parse HEAD MERGE_HEAD > dist/LEANTAR-REVISIONS
@@ -91,7 +115,7 @@ jobs:
           strip dist/cov-lake-cache dist/leantar
           cd dist
           tar -czf cov-lake-cache-x86_64-unknown-linux-gnu.tar.gz cov-lake-cache leantar \
-            LICENSE-* THIRD-PARTY-LICENSES.md LEANTAR-*
+            lake-overlay LICENSE-* THIRD-PARTY-LICENSES.md LEANTAR-* LAKE-OVERLAY*
           sha256sum cov-lake-cache-x86_64-unknown-linux-gnu.tar.gz > SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: matrix.lean.package

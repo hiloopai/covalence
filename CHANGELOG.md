@@ -122,6 +122,12 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Added
 
+- The `cov-lake-cache` release archive bundles Lake overlays, and the command
+  installs the one built for the project's Lean toolchain before it runs
+  Lake. A no-op build of a 55,645-job workspace takes 9.3 s instead of
+  11.5 s, with the same traces and outputs. `LAKE_POOL_STOCK_LAKE=1` restores
+  the toolchain's own Lake.
+
 - `cov-lake-cache put` publishes each pinned Git dependency the pool lacks as
   one Git pack, and host mirrors take pins from those packs before asking
   the Git host, so a fresh host checks dependencies out from S3.

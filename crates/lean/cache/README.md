@@ -262,6 +262,20 @@ and all license notices. It combines upstream master with the pinned, unmerged
 embedded NUL strings, scalar arrays, and deeply nested data that older Lean
 distributions cannot safely archive. It changes no Lean sources or kernel checks.
 
+The archive also carries Lake overlays under `lake-overlay/<githash>/`: the
+Lake files of a toolchain, rebuilt from a Lake that walks a no-op build faster
+([lean4-lake-parallel](https://github.com/hiloopai/lean4-lake-parallel),
+branches `lake-overlay/<nightly>`), at their paths under `lean --print-prefix`.
+`LAKE-OVERLAYS` names each one's release and SHA-256. Every command that runs Lake
+first installs the overlay whose `<githash>` is the project
+toolchain's `lean --githash`; other toolchains keep their own Lake. The first
+install keeps each replaced file under `lib/lean/.lake-overlay-stock/`, and
+`LAKE_POOL_STOCK_LAKE=1` puts those back instead of installing. The overlay
+changes how Lake walks a build, not its traces or outputs, so it is not part of
+the scope: patched and stock hosts share the pool. A toolchain that already
+holds the overlay's files is left unwritten, so an image can unpack the overlay
+into a read-only toolchain.
+
 Replacing the archive tool changes the scope and invalidates publication
 receipts. Source installations must supply a compatible archiver themselves. Thomas owns the bundled upstream
 pin; remove it once the supported Lean distribution includes
