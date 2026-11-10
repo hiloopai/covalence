@@ -42,27 +42,11 @@ jobs:
           mkdir lean
           tar --zstd -xf lean.tar.zst --strip-components=1 -C lean
           echo "$RUNNER_TEMP/lean/bin" >> "$GITHUB_PATH"
-      # Thomas owns these pins until Lean ships the scalar-array, NUL-string,
-      # and explicit-stack fixes (leangz#12, #15, and #22).
-      - name: Prepare the pinned archive codec
-        shell: bash
+      # Lake packs and unpacks module archives with the toolchain's leantar.
+      - name: Install this workspace's archive codec
         run: |
-          set -euo pipefail
-          git init "$RUNNER_TEMP/lake-archiver"
-          cd "$RUNNER_TEMP/lake-archiver"
-          git fetch --depth 16 https://github.com/digama0/leangz.git \
-            33570f263222fe8aa4e071f4a30b1b69bfc0f4e3 \
-            b15180b547e17bda933b7c7706db1a1ca611fcc8
-          git checkout --detach 33570f263222fe8aa4e071f4a30b1b69bfc0f4e3
-          # PR #22 is not merged upstream and predates the NUL-string fix.
-          git -c user.name=build -c user.email=build@example.invalid merge --no-commit --no-ff \
-            b15180b547e17bda933b7c7706db1a1ca611fcc8
-          test "$(git write-tree)" = df689da9d52269452b562ef19b25bdcb7de7b47d
-      - name: Build and test the pinned archive codec
-        run: |
-          cargo test --locked --manifest-path "$RUNNER_TEMP/lake-archiver/Cargo.toml"
-          cargo build --locked --release --manifest-path "$RUNNER_TEMP/lake-archiver/Cargo.toml" --bin leantar
-          install -m 755 "$RUNNER_TEMP/lake-archiver/target/release/leantar" "$RUNNER_TEMP/lean/bin/leantar"
+          cargo build --locked --release -p covalence-lean-ltar --bin leantar
+          install -m 755 target/release/leantar "$RUNNER_TEMP/lean/bin/leantar"
       - name: Check and test the native Lake protocol
         run: |
           cargo clippy --locked -p covalence-lean-cache --all-targets --features lake-tests -- -D warnings
@@ -80,18 +64,12 @@ jobs:
           cargo about generate --locked --manifest-path crates/lean/cache/Cargo.toml \
             -c crates/python/about.toml -o dist/THIRD-PARTY-LICENSES.md \
             crates/lean/cache/licenses.md.hbs
-          cargo about generate --locked --manifest-path "$RUNNER_TEMP/lake-archiver/Cargo.toml" \
-            -c crates/python/about.toml -o dist/LEANTAR-THIRD-PARTY-LICENSES.md \
-            crates/lean/cache/licenses.md.hbs
-          cp target/release/cov-lake-cache LICENSE-* dist/
-          cp "$RUNNER_TEMP/lake-archiver/target/release/leantar" dist/
-          cp "$RUNNER_TEMP/lake-archiver/LICENSE" dist/LEANTAR-LICENSE
-          git -C "$RUNNER_TEMP/lake-archiver" rev-parse HEAD MERGE_HEAD > dist/LEANTAR-REVISIONS
-          git -C "$RUNNER_TEMP/lake-archiver" write-tree > dist/LEANTAR-TREE
+          cp target/release/cov-lake-cache target/release/leantar LICENSE-* \
+            crates/lean/ltar/LICENSE-leangz dist/
           strip dist/cov-lake-cache dist/leantar
           cd dist
           tar -czf cov-lake-cache-x86_64-unknown-linux-gnu.tar.gz cov-lake-cache leantar \
-            LICENSE-* THIRD-PARTY-LICENSES.md LEANTAR-*
+            LICENSE-* THIRD-PARTY-LICENSES.md
           sha256sum cov-lake-cache-x86_64-unknown-linux-gnu.tar.gz > SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: matrix.lean.package

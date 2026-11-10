@@ -36,7 +36,7 @@ use crate::{
 };
 
 /// The version of this layout, mixed into every toolchain scope.
-pub const FORMAT: &str = "cov-lake/v1";
+pub const FORMAT: &str = "cov-lake/v2";
 
 /// The content-addressed store of a scope's map nodes.
 pub fn store(kv: Arc<dyn Kv>, scope: &str) -> Result<KvCas> {

@@ -11,7 +11,7 @@
 //! - `logged.ltar`: a trace with a log, so the trace is Zstandard JSON.
 //! - `patched.ltar`: written by hand; its olean uses opcodes `0xa0` and `0xb0`.
 
-use covalence_lean_ltar::{Archive, Dir, Error, unpack};
+use covalence_lean_ltar::{Archive, Dir, Error, pack, unpack};
 use sha2::{Digest, Sha256};
 
 const HASH: u64 = 0x0123_4567_89ab_cdef;
@@ -167,4 +167,23 @@ fn malformed_archives_fail() {
         unpack(&escape, HASH),
         Err(Error::Malformed { .. })
     ));
+}
+
+#[test]
+fn packing_gives_back_leantars_archives() {
+    // `leantar -s` packed these from the files they unpack to.
+    for name in ["module.ltar", "logged.ltar"] {
+        let original = fixture(name);
+        let packed = pack(&unpack(&original, HASH).unwrap()).unwrap();
+        assert!(packed == original, "{name} packs to different bytes");
+    }
+}
+
+#[test]
+fn packed_archives_unpack_to_their_files() {
+    for name in ["module.ltar", "logged.ltar", "patched.ltar"] {
+        let archive = unpack(&fixture(name), HASH).unwrap();
+        let again = unpack(&pack(&archive).unwrap(), HASH).unwrap();
+        assert_eq!(again, archive, "{name}");
+    }
 }

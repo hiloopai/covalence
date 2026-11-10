@@ -17,6 +17,14 @@
 #![deny(missing_docs)]
 
 mod lgz;
+mod pack;
+
+pub use pack::pack;
+
+/// The codec `leantar --version` reports for this crate's `leantar`:
+/// `leantar <VERSION>`. It changes only when the archives it writes or reads
+/// change, never for a release alone.
+pub const VERSION: &str = "covalence-lean-ltar/1";
 
 use std::{
     io::{self, Read},
@@ -47,8 +55,11 @@ const OUTPUT_LTAR: u8 = 5;
 const OUTPUT_MODULE_NO: u8 = 6;
 const OUTPUT_MODULE_YES: u8 = 7;
 
+/// leangz's Zstandard dictionary for `lgz` streams.
+const DICTIONARY_BYTES: &[u8] = include_bytes!("v1.dict");
+
 static DICTIONARY: LazyLock<DecoderDictionary<'static>> =
-    LazyLock::new(|| DecoderDictionary::copy(include_bytes!("v1.dict")));
+    LazyLock::new(|| DecoderDictionary::copy(DICTIONARY_BYTES));
 
 /// A malformed or unsupported archive.
 #[derive(Debug, Snafu)]

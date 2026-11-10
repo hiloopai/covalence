@@ -44,6 +44,13 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Changed
 
+- **Breaking:** Lake cache releases bundle the `leantar` built from
+  `covalence-lean-ltar` instead of a patched upstream build, and the pool
+  scope hashes its codec version, `cov-lake/v2`, instead of the executable.
+  Every command fails unless the toolchain's `leantar` is that codec. The
+  scope is new, so each repository publishes once again; until then restores
+  find nothing and build.
+
 - **Breaking:** `cov-lake-cache` publishes to one pool per platform and
   toolchain, shared by every repository, under `lake/` in the bucket.
   Artifacts are stored under CIDs in the key-value CAS, and each published
@@ -67,9 +74,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Added
 
-- `covalence-lean-ltar` decodes Lake's `.ltar` module archives in memory, with
-  the same output as the `leantar` that Lake cache releases bundle, including
-  scalar arrays and strings with embedded NULs.
+- `covalence-lean-ltar` packs and decodes Lake's `.ltar` module archives in
+  memory, with the same output as the patched `leantar` that earlier Lake cache
+  releases bundled, including scalar arrays and strings with embedded NULs. Its
+  `leantar` binary serves Lake's pack and unpack commands.
 
 - `cov-lake-cache put` also publishes the commit's source tree under
   `lake/src/`, in the layout `hiloop prove` reads: blobs, the tree, a

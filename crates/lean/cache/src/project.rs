@@ -292,16 +292,23 @@ impl Project {
                 .arg(empty.path())
                 .args(["env", "lean", "--print-prefix"]),
         )?;
-        // Patched and stock leantar both write `LTR4` and report the same
-        // version, and stock leantar decodes the patched opcodes 0xa0 and
-        // 0xb0 as constructors instead of rejecting them. Only the
-        // executable identifies the codec.
-        hash.update(b"\0leantar\0");
-        hash.update(digest(
-            &Path::new(&sysroot)
-                .join("bin/leantar")
-                .with_extension(env::consts::EXE_EXTENSION),
-        )?);
+        // Lake packs and unpacks with the toolchain's leantar. Only this
+        // release's codec may: stock leantar reads the scalar-array and
+        // sized-string opcodes as constructors instead of rejecting them.
+        let leantar = Path::new(&sysroot)
+            .join("bin/leantar")
+            .with_extension(env::consts::EXE_EXTENSION);
+        let codec = format!("leantar {}", covalence_lean_ltar::VERSION);
+        let found = output("leantar", Command::new(&leantar).arg("--version"))?;
+        if found != codec {
+            return Err(invalid(format!(
+                "{} reports {found:?}, not this release's archive codec {codec:?}; install the \
+                 leantar released with cov-lake-cache into the Lean toolchain",
+                leantar.display()
+            )));
+        }
+        hash.update(b"\0");
+        hash.update(codec.as_bytes());
         let revision = self.git(&["rev-parse", "HEAD"])?;
         if !mapping::hex(&revision, 40) {
             return Err(invalid("expected a 40-digit Git revision"));
