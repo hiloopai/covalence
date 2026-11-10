@@ -8,12 +8,12 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
 
 use covalence_cas_prolly::Map;
 use covalence_cas_trait::Cas;
-use covalence_kv_s3::{AwsOptions, S3Kv, S3Location};
+use covalence_kv_s3::{AwsOptions, Credentials, S3Kv, S3Location};
 use covalence_kv_trait::Kv;
 use covalence_lib_cid::{Bdasl, Cid, Sha256};
 use covalence_lib_data::Bytes;
@@ -32,21 +32,76 @@ const WORKERS: usize = 16;
 
 /// The bucket holding the pool, from `LAKE_CI_BUCKET`.
 pub(crate) fn store() -> Result<Arc<dyn Kv>> {
-    let bucket = env::var("LAKE_CI_BUCKET").map_err(|_| invalid("LAKE_CI_BUCKET is required"))?;
-    let location = S3Location::new(&bucket, "").map_err(|source| Error::S3 { source })?;
     // Sixteen files, each with up to two 8 MiB parts, bound payload buffers
     // to 256 MiB. The transport supplies retries and connection reuse.
-    S3Kv::from_aws(location, &AwsOptions::default())
-        .map(|s| {
-            Arc::new(
-                s.concurrency(2)
-                    .max_idle_connections(WORKERS * 2)
-                    .part_size(8 * 1024 * 1024)
-                    .upload_buffer_bytes(256 * 1024 * 1024),
-            ) as Arc<dyn Kv>
-        })
-        .map_err(|source| Error::S3 { source })
+    Ok(Arc::new(
+        s3()?
+            .concurrency(2)
+            .max_idle_connections(WORKERS * 2)
+            .part_size(8 * 1024 * 1024)
+            .upload_buffer_bytes(256 * 1024 * 1024),
+    ))
 }
+
+/// The environment that hands resolved credentials to a download process.
+const LEASE: [&str; 4] = [
+    "COVALENCE_LAKE_AWS_ACCESS_KEY_ID",
+    "COVALENCE_LAKE_AWS_SECRET_ACCESS_KEY",
+    "COVALENCE_LAKE_AWS_SESSION_TOKEN",
+    "COVALENCE_LAKE_AWS_EXPIRY",
+];
+
+/// The pool bucket, signing with leased credentials while they last.
+fn s3() -> Result<S3Kv> {
+    let bucket = env::var("LAKE_CI_BUCKET").map_err(|_| invalid("LAKE_CI_BUCKET is required"))?;
+    let location = S3Location::new(&bucket, "").map_err(|source| Error::S3 { source })?;
+    let options = AwsOptions::default();
+    let lease = LEASE.map(|name| env::var(name).ok());
+    match lease {
+        [Some(key), Some(secret), Some(token), Some(expiry)] => {
+            let expiry = expiry
+                .parse::<u64>()
+                .map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+                .map_err(|_| invalid("invalid leased credential expiry"))?;
+            S3Kv::from_aws_with(
+                location,
+                &options,
+                Credentials::new_with_token(key, secret, token),
+                expiry,
+            )
+        }
+        _ => S3Kv::from_aws(location, &options),
+    }
+    .map_err(|source| Error::S3 { source })
+}
+
+/// Credentials to hand to download processes, resolved once, so each does
+/// not ask the credential chain again: empty for credentials that do not
+/// expire, which the chain finds cheaply.
+pub(crate) fn lease() -> Result<Vec<(&'static str, String)>> {
+    let (credentials, expiry) = s3()?
+        .credential_lease()
+        .map_err(|source| Error::S3 { source })?;
+    let (Some(expiry), Some(token)) = (expiry, credentials.token()) else {
+        return Ok(Vec::new());
+    };
+    let expiry = expiry
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| invalid("credential expiry precedes the epoch"))?
+        .as_secs();
+    Ok(LEASE
+        .into_iter()
+        .zip([
+            credentials.key().to_owned(),
+            credentials.secret().to_owned(),
+            token.to_owned(),
+            expiry.to_string(),
+        ])
+        .collect())
+}
+
+/// The leased-credential variables, which other services must not see.
+pub(crate) const LEASED: [&str; 4] = LEASE;
 
 /// `work` on every item, sixteen at a time; results keep the items' order.
 /// The first failure stops further work.

@@ -414,11 +414,15 @@ struct Cached {
 }
 
 impl Cached {
-    fn new(runtime: Runtime, provider: SharedCredentialsProvider) -> Self {
+    fn new(
+        runtime: Runtime,
+        provider: SharedCredentialsProvider,
+        seed: Option<(Credentials, Option<SystemTime>)>,
+    ) -> Self {
         Self {
             runtime,
             provider,
-            last: Mutex::new(None),
+            last: Mutex::new(seed),
         }
     }
 
@@ -677,6 +681,47 @@ impl S3Kv {
     /// metadata, which takes a moment off EC2 unless a region is set. This
     /// may be called inside an async runtime, though it blocks.
     pub fn from_aws(location: S3Location, options: &AwsOptions) -> Result<Self, Error> {
+        Self::from_aws_seeded(location, options, None)
+    }
+
+    /// As [`S3Kv::from_aws`], but sign with `credentials`, which another
+    /// store resolved, until shortly before `expiry`; then ask the AWS
+    /// credential chain as `from_aws` does.
+    ///
+    /// A process that starts many short-lived readers can resolve credentials
+    /// once, with [`S3Kv::credential_lease`], and hand them to each reader.
+    pub fn from_aws_with(
+        location: S3Location,
+        options: &AwsOptions,
+        credentials: Credentials,
+        expiry: SystemTime,
+    ) -> Result<Self, Error> {
+        Self::from_aws_seeded(location, options, Some((credentials, Some(expiry))))
+    }
+
+    /// The credentials the next request signs with, and when they expire:
+    /// `None` for credentials that do not.
+    pub fn credential_lease(&self) -> Result<(Credentials, Option<SystemTime>), Error> {
+        match &self.credentials {
+            Source::Static(credentials) => Ok((credentials.clone(), None)),
+            Source::Provider(cached) => {
+                let credentials = cached.get()?;
+                let expiry = cached
+                    .last
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .as_ref()
+                    .and_then(|(_, expiry)| *expiry);
+                Ok((credentials, expiry))
+            }
+        }
+    }
+
+    fn from_aws_seeded(
+        location: S3Location,
+        options: &AwsOptions,
+        seed: Option<(Credentials, Option<SystemTime>)>,
+    ) -> Result<Self, Error> {
         let runtime = Runtime::new()?;
         let http = aws_smithy_http_client::Builder::new()
             .tls_provider(Provider::Rustls(CryptoMode::Ring))
@@ -708,7 +753,7 @@ impl S3Kv {
             .ok_or_else(|| Error::Credentials {
                 source: CredentialsError::not_loaded("no credential provider configured"),
             })?;
-        let source = Source::Provider(Box::new(Cached::new(runtime, provider)));
+        let source = Source::Provider(Box::new(Cached::new(runtime, provider, seed)));
         Self::with_source(&endpoint, &region, location, source)
     }
 
@@ -1068,6 +1113,7 @@ mod tests {
         let cached = Cached::new(
             Runtime::new().unwrap(),
             SharedCredentialsProvider::new(provider),
+            None,
         );
         let keys = (0..times)
             .map(|_| {
@@ -1087,6 +1133,27 @@ mod tests {
         let expiring = Some(REFRESH / 2);
         let keys = vec!["key0".into(), "key1".into(), "key2".into()];
         assert_eq!(fetch(expiring, 3), (keys, 3));
+    }
+
+    #[test]
+    fn seeded_credentials_are_used_until_near_expiry() {
+        let seeded = |lifetime: Duration| {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Counting {
+                calls: calls.clone(),
+                lifetime: None,
+            };
+            let seed = super::Credentials::new_with_token("seed", "secret", "token");
+            let cached = Cached::new(
+                Runtime::new().unwrap(),
+                SharedCredentialsProvider::new(provider),
+                Some((seed, Some(SystemTime::now() + lifetime))),
+            );
+            let key = cached.get().unwrap().key().to_owned();
+            (key, calls.load(Ordering::SeqCst))
+        };
+        assert_eq!(seeded(REFRESH * 2), ("seed".into(), 0));
+        assert_eq!(seeded(REFRESH / 2), ("key0".into(), 1));
     }
 
     #[test]

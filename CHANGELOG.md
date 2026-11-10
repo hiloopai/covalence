@@ -58,6 +58,12 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Added
 
+- `S3Kv::from_aws_with` signs with credentials another store resolved until
+  shortly before they expire, then asks the AWS credential chain;
+  `S3Kv::credential_lease` returns the credentials and expiry to hand over.
+  `cov-lake-cache` uses them so Lake's download processes skip the credential
+  chain.
+
 - `cov-lake-cache` checks out Git dependencies from one shallow mirror per
   repository in the host's Lake cache, so a new checkout no longer clones them.
 
