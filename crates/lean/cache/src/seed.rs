@@ -16,11 +16,11 @@
 //! races an overwrite fails the check and restores without the seed.
 
 use std::{
+    cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
-    sync::Arc,
     thread,
     time::{Instant, SystemTime},
 };
@@ -33,9 +33,10 @@ use serde_json::Value;
 use crate::{
     archives,
     blobs::Hashing,
+    dependencies::{self, Snapshot},
     error::{Error, IoResult, Result, encode, invalid, json},
     mapping,
-    project::{Project, Receipt},
+    project::{Project, Receipt, package_name},
     storage::parallel,
 };
 
@@ -43,7 +44,9 @@ use crate::{
 const SLOTS: [&str; 2] = ["a", "b"];
 /// Streams per seed, which a restore downloads and unpacks at once.
 const CHUNKS: usize = 16;
-const LEVEL: i32 = 3;
+/// Higher levels and long-distance windows shrink a seed by under 1% more,
+/// and a 2 GiB window takes 25 GB of memory to decode.
+const LEVEL: i32 = 9;
 
 #[derive(Deserialize, Serialize)]
 #[serde(crate = "covalence_lib_serde::serde", deny_unknown_fields)]
@@ -119,98 +122,178 @@ struct Member {
 
 /// What a seed of `receipt` holds: each recorded input's local output, with
 /// the artifacts it names (unpacked modules, native objects), when all of
-/// them exist. Other inputs are left to the pool. As in an eager restore, an
-/// output drops its archive: the unpacked files are all Lake needs.
+/// them exist. Other inputs are left to the pool, and so are executables: a
+/// library restore needs none, and each is one pool request for a build that
+/// does. As in an eager restore, an output drops its archive: the unpacked
+/// files are all Lake needs.
 ///
 /// A module Lake restored from its archive alone can keep that archive as
 /// its local output, as on a publisher whose build folder was already up to
 /// date; every host the seed fills would then unpack it again. Such an
 /// archive is decoded here and its files stand in its place.
-fn contents(project: &Project, receipt: &Receipt, cache: &Path) -> Result<Vec<Member>> {
-    let mut outputs = Vec::new();
-    let mut artifacts = BTreeSet::new();
-    let mut archived = BTreeMap::new();
+///
+/// The seed also holds every mapping of each upstream snapshot Lake fetched
+/// here, its artifacts when they are local, and returns those snapshots: a
+/// restore it fills need not ask upstream for them. A snapshot one of whose
+/// mappings is not local is left out, as an incomplete map must never stand
+/// in for upstream's.
+fn contents(
+    project: &Project,
+    receipt: &Receipt,
+    snapshots: Vec<Snapshot>,
+    cache: &Path,
+) -> Result<(Vec<Member>, Vec<Snapshot>)> {
+    let mut seed = Contents {
+        cache,
+        members: Vec::new(),
+        outputs: BTreeSet::new(),
+        artifacts: BTreeSet::new(),
+        archived: BTreeMap::new(),
+    };
     for package in receipt.packages.keys() {
         for input in mapping::rows(&project.mapping(package))?.keys() {
-            let name = format!("outputs/{package}/{input}.json");
-            let bytes = match fs::read(cache.join(&name)) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(source) => {
-                    return Err(Error::Io {
-                        operation: format!("read {name}"),
-                        source,
-                    });
-                }
-            };
-            let mut output: Value = json(&bytes)?;
-            if let Some(data) = output["data"].as_object_mut() {
-                data.remove("l");
+            seed.add(format!("outputs/{package}/{input}.json"), false)?;
+        }
+    }
+    let mut covered = Vec::new();
+    for snapshot in snapshots {
+        let path = snapshot.revisions(cache);
+        if !path.is_file() {
+            continue;
+        }
+        let package = package_name(&snapshot.package);
+        let mut complete = true;
+        for input in mapping::rows(&path)?.keys() {
+            complete &= seed.add(format!("outputs/{package}/{input}.json"), true)?;
+        }
+        if complete {
+            covered.push(snapshot);
+        }
+    }
+    Ok((seed.finish()?, covered))
+}
+
+/// A seed's members as [`contents`] collects them.
+struct Contents<'a> {
+    cache: &'a Path,
+    members: Vec<Member>,
+    /// The output files added or awaiting their archive's files.
+    outputs: BTreeSet<String>,
+    artifacts: BTreeSet<String>,
+    /// Outputs that are only an archive in the cache, by output file.
+    archived: BTreeMap<String, Value>,
+}
+
+impl Contents<'_> {
+    /// Add the output file `name` and the artifacts it names, if they are
+    /// all in the cache; with `mapping`, the output file alone otherwise, as
+    /// Lake fetches its artifacts from the service it names. Whether the
+    /// seed holds it.
+    fn add(&mut self, name: String, mapping: bool) -> Result<bool> {
+        if self.outputs.contains(&name) {
+            return Ok(true);
+        }
+        let bytes = match fs::read(self.cache.join(&name)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(Error::Io {
+                    operation: format!("read {name}"),
+                    source,
+                });
             }
-            if output["data"]
+        };
+        let mut output: Value = json(&bytes)?;
+        if let Some(data) = output["data"].as_object_mut() {
+            data.remove("l");
+        }
+        let names = mapping::names(&output["data"])?;
+        let local = !names.iter().any(|artifact| executable(artifact))
+            && names
+                .iter()
+                .all(|artifact| self.cache.join("artifacts").join(artifact).is_file());
+        if local
+            && output["data"]
                 .as_str()
                 .is_some_and(|data| data.ends_with(".ltar"))
-            {
-                archived.insert(name, output);
-                continue;
-            }
-            add_output(cache, name, &output, &mut outputs, &mut artifacts)?;
+        {
+            self.outputs.insert(name.clone());
+            self.archived.insert(name, output);
+            return Ok(true);
         }
-    }
-    let rows = archived
-        .iter()
-        .map(|(name, output)| Ok((name.clone(), encode(&output["data"]).and_then(utf8)?)))
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let unpacked = archives::expand(&cache.join("artifacts"), &rows)?;
-    for (name, mut output) in archived {
-        // An archive missing from the cache leaves its input to the pool.
-        if let Some(descriptor) = unpacked.get(&name) {
-            output["data"] = json(descriptor.as_bytes())?;
-            add_output(cache, name, &output, &mut outputs, &mut artifacts)?;
+        if !(local || mapping) {
+            return Ok(false);
         }
+        if local {
+            self.artifacts.extend(
+                names
+                    .into_iter()
+                    .map(|artifact| format!("artifacts/{artifact}")),
+            );
+        }
+        self.push(name, &output)?;
+        Ok(true)
     }
-    for name in artifacts {
-        let bytes = cache
-            .join(&name)
-            .metadata()
-            .operation(format!("read {name}"))?
-            .len();
-        outputs.push(Member {
-            name,
-            bytes,
-            inline: None,
-        });
-    }
-    Ok(outputs)
-}
 
-fn utf8(bytes: Vec<u8>) -> Result<String> {
-    String::from_utf8(bytes).map_err(|_| invalid("output descriptor is not UTF-8"))
-}
-
-/// Add the output file `name` holding `output`, and the artifacts it names,
-/// when every one is in `cache`.
-fn add_output(
-    cache: &Path,
-    name: String,
-    output: &Value,
-    outputs: &mut Vec<Member>,
-    artifacts: &mut BTreeSet<String>,
-) -> Result<()> {
-    let names = mapping::names(&output["data"])?
-        .into_iter()
-        .map(|name| format!("artifacts/{name}"))
-        .collect::<Vec<_>>();
-    if names.iter().all(|name| cache.join(name).is_file()) {
+    fn push(&mut self, name: String, output: &Value) -> Result<()> {
         let bytes = encode(output)?;
-        outputs.push(Member {
+        self.outputs.insert(name.clone());
+        self.members.push(Member {
             name,
             bytes: bytes.len() as u64,
             inline: Some(bytes),
         });
-        artifacts.extend(names);
+        Ok(())
     }
-    Ok(())
+
+    /// The members, once every archived output's files are in the cache.
+    fn finish(mut self) -> Result<Vec<Member>> {
+        let archived = std::mem::take(&mut self.archived);
+        let rows = archived
+            .iter()
+            .map(|(name, output)| Ok((name.clone(), encode(&output["data"]).and_then(utf8)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let unpacked = archives::expand(&self.cache.join("artifacts"), &rows)?;
+        for (name, mut output) in archived {
+            let descriptor = unpacked
+                .get(&name)
+                .ok_or_else(|| invalid(format!("{name} names an archive that did not unpack")))?;
+            output["data"] = json(descriptor.as_bytes())?;
+            self.artifacts.extend(
+                mapping::names(&output["data"])?
+                    .into_iter()
+                    .map(|artifact| format!("artifacts/{artifact}")),
+            );
+            self.push(name, &output)?;
+        }
+        for name in std::mem::take(&mut self.artifacts) {
+            let bytes = self
+                .cache
+                .join(&name)
+                .metadata()
+                .operation(format!("read {name}"))?
+                .len();
+            self.members.push(Member {
+                name,
+                bytes,
+                inline: None,
+            });
+        }
+        Ok(self.members)
+    }
+}
+
+/// Whether Lake named the artifact `name` as an executable: it gives them
+/// the platform's executable extension, none on Unix, and nothing else.
+fn executable(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .map_or("", |extension| extension.to_str().unwrap_or_default())
+        == std::env::consts::EXE_EXTENSION
+}
+
+fn utf8(bytes: Vec<u8>) -> Result<String> {
+    String::from_utf8(bytes).map_err(|_| invalid("output descriptor is not UTF-8"))
 }
 
 /// Spread `members` over [`CHUNKS`] by size, largest first.
@@ -274,24 +357,38 @@ pub(crate) fn publish(
     cache: &Path,
 ) -> Result<Value> {
     let identity = &receipt.identity;
-    let files = contents(project, receipt, cache)?;
+    let snapshots = dependencies::snapshots(project)?;
+    let (files, upstream) = contents(project, receipt, snapshots, cache)?;
     put(
         kv,
         &identity.scope,
         &project.repository,
         &identity.revision,
         files,
+        &upstream,
         cache,
     )
 }
 
-/// Publish `members` of `cache` as the seed of `commit`.
+/// The upstream snapshots a seed holds every mapping of. It is written
+/// before its slot's manifest and names the commit, so a reader that races
+/// a publish finds another commit and asks upstream as before.
+#[derive(Deserialize, Serialize)]
+#[serde(crate = "covalence_lib_serde::serde", deny_unknown_fields)]
+struct Upstream {
+    commit: String,
+    snapshots: Vec<Snapshot>,
+}
+
+/// Publish `members` of `cache` as the seed of `commit`, holding every
+/// mapping of the `upstream` snapshots.
 fn put(
     kv: &dyn Kv,
     scope: &str,
     repository: &str,
     commit: &str,
     members: Vec<Member>,
+    upstream: &[Snapshot],
     cache: &Path,
 ) -> Result<Value> {
     let started = Instant::now();
@@ -319,6 +416,15 @@ fn put(
         .map_err(store_error("upload seed chunk"))?;
         Ok(chunk)
     })?;
+    let record = Upstream {
+        commit: commit.to_owned(),
+        snapshots: upstream.to_vec(),
+    };
+    kv.put(
+        format!("{prefix}/upstream.json").as_bytes(),
+        Bytes::from(encode(&record)?),
+    )
+    .map_err(store_error("publish seed upstream snapshots"))?;
     let manifest = Manifest {
         commit: commit.to_owned(),
         published: SystemTime::now()
@@ -336,6 +442,7 @@ fn put(
         "slot": slot,
         "files": manifest.chunks.iter().map(|c| c.files).sum::<usize>(),
         "bytes": manifest.chunks.iter().map(|c| c.bytes).sum::<u64>(),
+        "upstream": upstream.len(),
         "seconds": started.elapsed().as_secs_f64(),
     }))
 }
@@ -415,40 +522,108 @@ fn fetch_chunk(kv: &dyn Kv, key: &str, chunk: &Chunk, directory: &Path) -> Resul
     })
 }
 
-/// Download and unpack the seed of `commit` beside Lake's cache in `cache`,
-/// if a slot holds one.
-pub(crate) fn fetch(
-    kv: &Arc<dyn Kv>,
+/// The seed for a restore that searched `commits`, nearest first: the
+/// nearest of them that has one, else the newest. A seed of any commit is
+/// sound, since Lake checks every trace and the pool's maps add each input
+/// it lacks; the nearer, the fewer they are. Slots turn over on every
+/// publish, so an older checkout often has no seeded commit in its history.
+fn choose(
+    slots: Vec<(&'static str, Option<Manifest>)>,
+    commits: &[String],
+) -> Option<(&'static str, Manifest)> {
+    slots
+        .into_iter()
+        .filter_map(|(slot, manifest)| manifest.map(|manifest| (slot, manifest)))
+        .min_by_key(|(_, manifest)| {
+            (
+                commits
+                    .iter()
+                    .position(|commit| *commit == manifest.commit)
+                    .unwrap_or(usize::MAX),
+                Reverse(manifest.published),
+            )
+        })
+}
+
+/// A published seed a restore chose.
+pub(crate) struct Remote {
+    slot: &'static str,
+    manifest: Manifest,
+    /// The upstream snapshots it holds every mapping of.
+    pub upstream: BTreeSet<Snapshot>,
+}
+
+/// The seed for restoring `commit`, searching `commits`: its own, else
+/// another's (see [`choose`]). Says which, or that the repository has none.
+pub(crate) fn find(
+    kv: &dyn Kv,
     scope: &str,
     repository: &str,
     commit: &str,
-    cache: &Path,
-) -> Result<Option<Staged>> {
-    let started = Instant::now();
-    let Some((slot, manifest)) = manifests(&**kv, scope, repository)?
-        .into_iter()
-        .find_map(|(slot, manifest)| manifest.filter(|m| m.commit == commit).map(|m| (slot, m)))
-    else {
+    commits: &[String],
+) -> Result<Option<Remote>> {
+    let Some((slot, manifest)) = choose(manifests(kv, scope, repository)?, commits) else {
+        println!("Lake cache: no seed for {commit}; falling back to per-artifact restore");
         return Ok(None);
     };
-    let state = cache.join("covalence");
-    fs::create_dir_all(&state).operation("create local pool directory")?;
-    let directory = tempfile::tempdir_in(&state).operation("create seed directory")?;
-    let prefix = prefix(scope, repository, slot)?;
-    let files = parallel(&manifest.chunks, |index, chunk| {
-        fetch_chunk(
-            &**kv,
-            &format!("{prefix}/{index}.tar.zst"),
-            chunk,
-            directory.path(),
-        )
-    })?;
-    Ok(Some(Staged {
-        directory,
-        files: files.into_iter().sum(),
-        bytes: manifest.chunks.iter().map(|c| c.bytes).sum(),
-        seconds: started.elapsed().as_secs_f64(),
+    if manifest.commit != commit {
+        let distance = commits
+            .iter()
+            .position(|c| *c == manifest.commit)
+            .map_or_else(
+                || "not an ancestor".to_owned(),
+                |n| format!("{n} commits behind HEAD"),
+            );
+        println!(
+            "Lake cache: no seed for {commit}; seeding from {} ({distance}), then the pool's maps",
+            manifest.commit
+        );
+    }
+    let key = format!("{}/upstream.json", prefix(scope, repository, slot)?);
+    let upstream = kv
+        .get(key.as_bytes())
+        .map_err(store_error("read seed upstream snapshots"))?
+        .map(|bytes| json::<Upstream>(&bytes))
+        .transpose()?
+        .filter(|record| record.commit == manifest.commit)
+        .map(|record| record.snapshots.into_iter().collect())
+        .unwrap_or_default();
+    Ok(Some(Remote {
+        slot,
+        manifest,
+        upstream,
     }))
+}
+
+impl Remote {
+    /// Download and unpack the seed beside Lake's cache in `cache`.
+    pub fn fetch(
+        &self,
+        kv: &dyn Kv,
+        scope: &str,
+        repository: &str,
+        cache: &Path,
+    ) -> Result<Staged> {
+        let started = Instant::now();
+        let state = cache.join("covalence");
+        fs::create_dir_all(&state).operation("create local pool directory")?;
+        let directory = tempfile::tempdir_in(&state).operation("create seed directory")?;
+        let prefix = prefix(scope, repository, self.slot)?;
+        let files = parallel(&self.manifest.chunks, |index, chunk| {
+            fetch_chunk(
+                kv,
+                &format!("{prefix}/{index}.tar.zst"),
+                chunk,
+                directory.path(),
+            )
+        })?;
+        Ok(Staged {
+            directory,
+            files: files.into_iter().sum(),
+            bytes: self.manifest.chunks.iter().map(|c| c.bytes).sum(),
+            seconds: started.elapsed().as_secs_f64(),
+        })
+    }
 }
 
 impl Staged {
@@ -523,7 +698,22 @@ mod tests {
     use crate::project::Identity;
     use covalence_kv_memory::MemoryKv;
 
+    use std::sync::Arc;
+
     const SCOPE: &str = "linux-x86_64/t";
+
+    fn fetch(
+        kv: &Arc<dyn Kv>,
+        scope: &str,
+        repository: &str,
+        commit: &str,
+        commits: &[String],
+        cache: &Path,
+    ) -> Result<Option<Staged>> {
+        find(&**kv, scope, repository, commit, commits)?
+            .map(|remote| remote.fetch(&**kv, scope, repository, cache))
+            .transpose()
+    }
     const REPOSITORY: &str = "o/r";
     const OUTPUT: &str = "outputs/p/00000000000000aa.json";
 
@@ -535,7 +725,7 @@ mod tests {
     /// native object, and the receipt of the build that checked them.
     fn publisher() -> (tempfile::TempDir, Project, Receipt) {
         let dir = tempfile::tempdir().unwrap();
-        let files: [(&str, &[u8]); 7] = [
+        let files: [(&str, &[u8]); 9] = [
             ("cache/artifacts/0000000000000001.olean", &[1; 300_000]),
             ("cache/artifacts/0000000000000002.ilean", b"ilean"),
             ("cache/artifacts/0000000000000003.ltar", &[3; 70_000]),
@@ -548,9 +738,14 @@ mod tests {
                 "cache/outputs/p/00000000000000bb.json",
                 br#"{"service": null, "data": "0000000000000004.o"}"#,
             ),
+            ("cache/artifacts/0000000000000005", b"executable"),
+            (
+                "cache/outputs/p/00000000000000cc.json",
+                br#"{"service": null, "data": "0000000000000005"}"#,
+            ),
             (
                 "record/packages/p.jsonl",
-                b"\"2026-03-17\"\n[\"00000000000000aa\",\"0000000000000003.ltar\"]\n[\"00000000000000bb\",\"0000000000000004.o\"]\n",
+                b"\"2026-03-17\"\n[\"00000000000000aa\",\"0000000000000003.ltar\"]\n[\"00000000000000bb\",\"0000000000000004.o\"]\n[\"00000000000000cc\",\"0000000000000005\"]\n",
             ),
         ];
         for (name, bytes) in files {
@@ -576,6 +771,104 @@ mod tests {
         (dir, project, receipt)
     }
 
+    #[test]
+    fn a_seed_holds_every_mapping_of_a_complete_upstream_snapshot() {
+        let (dir, project, receipt) = publisher();
+        let cache = dir.path().join("cache");
+        let snapshot = |package: &str| Snapshot {
+            package: package.into(),
+            revision: "1".repeat(40),
+            scope: "t/upstream".into(),
+        };
+        let files: [(&str, &[u8]); 6] = [
+            // Lake fetched only one artifact of the snapshot.
+            ("artifacts/00000000000000f2.o", b"object"),
+            (
+                "outputs/mathlib/00000000000000e1.json",
+                br#"{"service": "upstream", "data": "00000000000000f1.ltar"}"#,
+            ),
+            (
+                "outputs/mathlib/00000000000000e2.json",
+                br#"{"service": "upstream", "data": "00000000000000f2.o"}"#,
+            ),
+            (
+                "revisions/mathlib/1111111111111111111111111111111111111111.jsonl",
+                b"\"2026-03-17\"\n[\"00000000000000e1\",\"00000000000000f1.ltar\"]\n[\"00000000000000e2\",\"00000000000000f2.o\"]\n",
+            ),
+            // A snapshot one of whose mappings is not here is not a seed's.
+            (
+                "outputs/cslib/00000000000000e3.json",
+                br#"{"service": "upstream", "data": "00000000000000f3.ltar"}"#,
+            ),
+            (
+                "revisions/cslib/1111111111111111111111111111111111111111.jsonl",
+                b"\"2026-03-17\"\n[\"00000000000000e3\",\"00000000000000f3.ltar\"]\n[\"00000000000000e4\",\"00000000000000f4.ltar\"]\n",
+            ),
+        ];
+        for (name, bytes) in files {
+            let path = cache.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        let (members, covered) = contents(
+            &project,
+            &receipt,
+            vec![snapshot("mathlib"), snapshot("cslib")],
+            &cache,
+        )
+        .unwrap();
+        assert_eq!(covered, [snapshot("mathlib")]);
+        let names = members
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<BTreeSet<_>>();
+        for name in [
+            "outputs/mathlib/00000000000000e1.json",
+            "outputs/mathlib/00000000000000e2.json",
+            "artifacts/00000000000000f2.o",
+        ] {
+            assert!(names.contains(name), "{name}");
+        }
+        assert!(!names.contains("artifacts/00000000000000f1.ltar"));
+        let kv = MemoryKv::default().into_dyn();
+        put(
+            &*kv,
+            SCOPE,
+            REPOSITORY,
+            &commit(1),
+            members,
+            &covered,
+            &cache,
+        )
+        .unwrap();
+        let remote = find(&*kv, SCOPE, REPOSITORY, &commit(1), &[commit(1)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.upstream, BTreeSet::from([snapshot("mathlib")]));
+        let host = tempfile::tempdir().unwrap();
+        let seeded = remote
+            .fetch(&*kv, SCOPE, REPOSITORY, host.path())
+            .unwrap()
+            .install(host.path())
+            .unwrap();
+        assert_eq!(seeded["mathlib"].len(), 2);
+        // A publish racing the reader leaves another commit's record.
+        let key = format!(
+            "{}/upstream.json",
+            prefix(SCOPE, REPOSITORY, remote.slot).unwrap()
+        );
+        let record = Upstream {
+            commit: commit(2),
+            snapshots: vec![snapshot("mathlib")],
+        };
+        kv.put(key.as_bytes(), Bytes::from(encode(&record).unwrap()))
+            .unwrap();
+        let raced = find(&*kv, SCOPE, REPOSITORY, &commit(1), &[commit(1)])
+            .unwrap()
+            .unwrap();
+        assert!(raced.upstream.is_empty());
+    }
+
     fn publish_at(kv: &dyn Kv, n: u8) -> Value {
         let (dir, project, mut receipt) = publisher();
         receipt.identity.revision = commit(n);
@@ -588,16 +881,18 @@ mod tests {
         assert_eq!(publish_at(&*kv, 1)["files"], 5);
         assert_eq!(publish_at(&*kv, 1)["skipped"], "already seeded");
         let host = tempfile::tempdir().unwrap();
-        assert!(
-            fetch(&kv, SCOPE, REPOSITORY, &commit(2), host.path())
-                .unwrap()
-                .is_none()
-        );
-        let seeded = fetch(&kv, SCOPE, REPOSITORY, &commit(1), host.path())
-            .unwrap()
-            .unwrap()
-            .install(host.path())
-            .unwrap();
+        let seeded = fetch(
+            &kv,
+            SCOPE,
+            REPOSITORY,
+            &commit(1),
+            &[commit(1)],
+            host.path(),
+        )
+        .unwrap()
+        .unwrap()
+        .install(host.path())
+        .unwrap();
         assert_eq!(
             seeded,
             Seeded::from([(
@@ -618,6 +913,9 @@ mod tests {
             );
         }
         assert!(!host.path().join("artifacts/0000000000000003.ltar").exists());
+        // Executables stay in the pool.
+        assert!(!host.path().join("artifacts/0000000000000005").exists());
+        assert!(!host.path().join("outputs/p/00000000000000cc.json").exists());
         let output: Value = json(&fs::read(host.path().join(OUTPUT)).unwrap()).unwrap();
         assert_eq!(
             output["data"],
@@ -648,11 +946,18 @@ mod tests {
         let kv = MemoryKv::default().into_dyn();
         publish(&project, &*kv, &receipt, &cache).unwrap();
         let host = tempfile::tempdir().unwrap();
-        let seeded = fetch(&kv, SCOPE, REPOSITORY, &commit(1), host.path())
-            .unwrap()
-            .unwrap()
-            .install(host.path())
-            .unwrap();
+        let seeded = fetch(
+            &kv,
+            SCOPE,
+            REPOSITORY,
+            &commit(1),
+            &[commit(1)],
+            host.path(),
+        )
+        .unwrap()
+        .unwrap()
+        .install(host.path())
+        .unwrap();
         assert!(seeded["p"].contains("00000000000000dd"));
         let output: Value =
             json(&fs::read(host.path().join("outputs/p/00000000000000dd.json")).unwrap()).unwrap();
@@ -679,11 +984,6 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(kept, BTreeSet::from([commit(2), commit(3)]));
         let host = tempfile::tempdir().unwrap();
-        assert!(
-            fetch(&kv, SCOPE, REPOSITORY, &commit(1), host.path())
-                .unwrap()
-                .is_none()
-        );
         // A chunk overwritten under a reader no longer matches its manifest.
         let (slot, _) = manifests(&*kv, SCOPE, REPOSITORY)
             .unwrap()
@@ -697,7 +997,77 @@ mod tests {
             .unwrap();
         kv.put(format!("{prefix}/0.tar.zst").as_bytes(), other)
             .unwrap();
-        assert!(fetch(&kv, SCOPE, REPOSITORY, &commit(3), host.path()).is_err());
+        assert!(
+            fetch(
+                &kv,
+                SCOPE,
+                REPOSITORY,
+                &commit(3),
+                &[commit(3)],
+                host.path()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_restore_takes_the_nearest_seed_in_its_history_else_the_newest() {
+        let slots = |seeds: &[(u8, u64)]| {
+            seeds
+                .iter()
+                .zip(SLOTS)
+                .map(|((n, published), slot)| {
+                    let manifest = Manifest {
+                        commit: commit(*n),
+                        published: *published,
+                        chunks: Vec::new(),
+                    };
+                    (slot, Some(manifest))
+                })
+                .collect::<Vec<_>>()
+        };
+        let chosen = |seeds: &[(u8, u64)], commits: &[u8]| {
+            let commits = commits.iter().map(|n| commit(*n)).collect::<Vec<_>>();
+            choose(slots(seeds), &commits).map(|(_, manifest)| manifest.commit)
+        };
+        let seeds = [(3, 30), (5, 50)];
+        // Its own seed, else the nearest seeded ancestor, though older.
+        assert_eq!(chosen(&seeds, &[5, 4, 3]), Some(commit(5)));
+        assert_eq!(chosen(&seeds, &[4, 3]), Some(commit(3)));
+        assert_eq!(chosen(&seeds, &[6, 5, 3]), Some(commit(5)));
+        // No seeded ancestor: the newest seed, of a later commit.
+        assert_eq!(chosen(&seeds, &[2, 1]), Some(commit(5)));
+        assert_eq!(chosen(&[(5, 50), (3, 30)], &[2, 1]), Some(commit(5)));
+        assert_eq!(chosen(&[], &[2, 1]), None);
+
+        let kv = MemoryKv::default().into_dyn();
+        let host = tempfile::tempdir().unwrap();
+        assert!(
+            fetch(
+                &kv,
+                SCOPE,
+                REPOSITORY,
+                &commit(2),
+                &[commit(2)],
+                host.path()
+            )
+            .unwrap()
+            .is_none()
+        );
+        publish_at(&*kv, 3);
+        let seeded = fetch(
+            &kv,
+            SCOPE,
+            REPOSITORY,
+            &commit(2),
+            &[commit(2)],
+            host.path(),
+        )
+        .unwrap()
+        .unwrap()
+        .install(host.path())
+        .unwrap();
+        assert_eq!(seeded["p"].len(), 2);
     }
 
     #[test]

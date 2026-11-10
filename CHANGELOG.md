@@ -25,6 +25,11 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
   output was only its archive, as on a publisher whose build folder was
   already up to date, so a seeded host no longer unpacks those archives.
 
+- `cov-lake-cache get --seed` seeds a checkout whose restored commit has no
+  seed from the nearest seeded commit it searched, else the repository's
+  newest seed, then installs the pool's maps for the rest. With no seed it
+  says so instead of silently fetching every artifact.
+
 - Restored dependency outputs reach each package's `.lake/build` again, so
   tools that run `lean` there, such as `lake env lean`, find their `.olean`
   files. Every Lake run of `cov-lake-cache`, and every later step of the
@@ -63,6 +68,17 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
   `S3Kv::max_idle_connections` configures connection reuse independently.
 
 ### Changed
+
+- `cov-lake-cache put` leaves executables out of seeds and compresses them at
+  Zstandard level 9: moria's seed shrinks from 8.12 GB to 6.24 GB.
+
+- A seed holds every mapping of the upstream Mathlib/CSLib snapshots its
+  publisher fetched, so `cov-lake-cache get --seed -- <targets>` asks
+  upstream only for the snapshots it lacks.
+
+- `cov-lake-cache get` downloads its seed while the Git dependencies check
+  out, fetches different dependency mirrors at once, and logs how long each
+  restore phase took.
 
 - Restores no longer refetch an upstream Mathlib/CSLib snapshot this host
   already installed, which overwrote Lake's unpacked outputs with archives on

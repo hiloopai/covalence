@@ -123,8 +123,14 @@ A fresh host otherwise has Lake fetch and unpack each module on its own: about
 27,000 requests and archive decodes for one large repository. `put` also
 publishes the recorded build as a seed: for every input `build` checked, Lake's
 local output file, without its archive, and the unpacked artifacts and native
-objects it names, as 16 Zstandard tar streams. An output Lake kept as its
-archive alone is decoded first, so no host the seed fills unpacks it. Each repository keeps two seeds
+objects it names, as 16 Zstandard tar streams. Executables stay in the pool:
+a library restore needs none, and a build that does fetches each in one
+request. An output Lake kept as its
+archive alone is decoded first, so no host the seed fills unpacks it. The seed
+also holds every mapping of each upstream Mathlib/CSLib snapshot the
+publisher fetched, with the artifacts it has, and its slot's `upstream.json`
+names those snapshots; a targeted restore it fills does not fetch them from
+upstream. A snapshot with any mapping missing is left out. Each repository keeps two seeds
 per scope under `lake/<scope>/seed/<owner>/<repo>/{a,b}/`; a publish overwrites
 the older slot, its chunks first and its `manifest.json` (commit, publication
 time, each chunk's SHA-256, length and file count) last. Storage stays at two
@@ -132,8 +138,12 @@ seeds per repository and scope, with nothing to delete; a toolchain change
 leaves its scope's seeds behind with the rest of that scope.
 
 `get --seed` on a host that never installed the repository's mappings
-downloads the seed of the commit it restores, if a slot holds it, while the
-upstream snapshots install. A seed holds the whole recorded build, so pass
+downloads a seed while the Git dependencies check out and the upstream
+snapshots install: the restored commit's,
+else the nearest seeded commit it searched, else the newest seed, since the
+slots turn over with every publish and an older checkout rarely has a seeded
+ancestor. Any seed is sound: Lake checks every trace, and the pool's maps add
+the inputs it lacks. Without one, it says so and restores from the pool. A seed holds the whole recorded build, so pass
 `--seed` where the host keeps its cache or builds most of it, such as a
 developer machine or a full-library check, and not for a one-shot runner that
 needs a few targets. It unpacks the 16 streams at once beside Lake's cache,
@@ -149,8 +159,8 @@ continues from the pool.
 Before any Lake run, `dependencies`, `build` and `get` check out each Git
 dependency missing from the packages directory from a shallow bare mirror in
 `covalence/git/` under Lake's cache directory. The mirror fetches only pinned
-commits it lacks, at depth one; checkouts borrow its objects through Git
-alternates. Lake then finds each package at its pinned revision and clones
+commits it lacks, at depth one, and different mirrors fetch at once;
+checkouts borrow its objects through Git alternates. Lake then finds each package at its pinned revision and clones
 nothing. Local-path Git URLs are left to Lake.
 
 Lake's cache directory is the local layer. It is `LAKE_CACHE_DIR`, which this

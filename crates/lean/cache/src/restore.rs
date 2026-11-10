@@ -6,7 +6,7 @@
 //! services go to `curl` unchanged.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, File},
     io::{self, Write},
@@ -14,6 +14,7 @@ use std::{
     process::{Command, ExitCode},
     sync::Arc,
     thread,
+    time::Instant,
 };
 
 use covalence_cas_kv::KvCas;
@@ -31,7 +32,7 @@ use crate::{
     mapping, pool,
     project::{Package, Project, Source, run},
     seed::{self, Seeded},
-    storage,
+    sources, storage,
 };
 
 const BASE: &str = "https://covalence-lake.invalid";
@@ -52,8 +53,7 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub fn new(project: &Project, kv: &Arc<dyn Kv>, scope: &str) -> Result<Self> {
-        let local = Local::open(project)?;
+    pub fn new(project: &Project, kv: &Arc<dyn Kv>, scope: &str, local: Local) -> Result<Self> {
         let directory = tempfile::tempdir().operation("create Lake cache configuration")?;
         let mut settings = String::new();
         if dependencies::config(project).exists() {
@@ -229,40 +229,91 @@ impl Session {
 /// Restores this repository's packages from the nearest published commit.
 /// With targets, installs only mappings, for dependencies too, then builds
 /// what the targets need. With `seed`, a host that never installed this
-/// repository's mappings takes that commit's seed, if one was published,
-/// while upstream snapshots install; pool maps then add what the seed lacks.
+/// repository's mappings takes a seed, that commit's or else the nearest
+/// (see [`seed::fetch`]), while the Git dependencies check out and upstream
+/// snapshots install; pool maps then add what the seed lacks.
 pub(crate) fn restore(
     project: &Project,
     kv: &Arc<dyn Kv>,
     targets: &[String],
     seed: bool,
+    started: Instant,
 ) -> Result<()> {
-    let identity = project.identity()?;
-    let scope = &identity.scope;
     let packages = project.packages()?;
     let commits = project.ancestors()?;
     let lazy = !targets.is_empty();
-    let mut session = Session::new(project, kv, scope)?;
-    let nearest = storage::nearest(&**kv, project, scope, &packages[0], &commits)?;
-    let fresh = seed
-        && session
-            .local
-            .installed(Installed::Mappings, scope, &packages[0].name)?
-            .is_none();
-    let cache = session.local.directory().to_owned();
+    let local = Local::open(project)?;
+    let cache = local.directory().to_owned();
     thread::scope(|threads| {
-        let seeding = nearest.as_ref().filter(|_| fresh).map(|(commit, _)| {
-            let cache = &cache;
-            threads.spawn(move || seed::fetch(kv, scope, &project.repository, commit, cache))
+        // The seed needs only the toolchain and the pool, so it downloads
+        // while the dependencies check out.
+        let mirrors = threads.spawn(|| sources::materialize(project));
+        let identity = project.identity()?;
+        let scope = identity.scope.as_str();
+        let identified = started.elapsed();
+        let nearest = storage::nearest(&**kv, project, scope, &packages[0], &commits)?;
+        let looked_up = started.elapsed();
+        let fresh = seed
+            && local
+                .installed(Installed::Mappings, scope, &packages[0].name)?
+                .is_none();
+        let remote = match nearest.as_ref().filter(|_| fresh) {
+            Some((commit, _)) => seed::find(&**kv, scope, &project.repository, commit, &commits)?,
+            None => None,
+        };
+        let covered = remote
+            .as_ref()
+            .map(|remote| remote.upstream.clone())
+            .unwrap_or_default();
+        let seeding = remote.map(|remote| {
+            let (cache, scope) = (&cache, scope.to_owned());
+            threads.spawn(move || remote.fetch(&**kv, &scope, &project.repository, cache))
         });
+        mirrors.join().unwrap_or(Err(crate::error::Error::Worker))?;
+        let checked_out = started.elapsed();
+        let mut session = Session::new(project, kv, scope, local)?;
+        println!(
+            "Lake cache: started in {:.1} s: toolchain at {:.1} s, published build at {:.1} s, Git dependencies at {:.1} s",
+            started.elapsed().as_secs_f64(),
+            identified.as_secs_f64(),
+            looked_up.as_secs_f64(),
+            checked_out.as_secs_f64(),
+        );
         let mut installs = Vec::new();
         if lazy {
-            dependencies::upstream(project, &session.local, true)?;
+            let phase = Instant::now();
+            if !covered.is_empty() {
+                println!(
+                    "Lake cache: the seed holds {} upstream snapshots, which upstream need not send",
+                    covered.len()
+                );
+            }
+            dependencies::upstream(project, &session.local, true, &covered)?;
             installs = dependencies::pins(project, kv, &session)?;
+            println!(
+                "Lake cache: upstream snapshots and dependency pins in {:.1} s",
+                phase.elapsed().as_secs_f64()
+            );
         }
         // Upstream installs rewrite their packages' mappings, so the seed's
         // go in after them.
-        let seeded = seeded(seeding, &cache)?;
+        let seeded = match seeded(seeding, &cache)? {
+            Some(seeded) => {
+                for snapshot in &covered {
+                    session
+                        .local
+                        .set_upstream_installed(Installed::Mappings, &snapshot.request())?;
+                }
+                seeded
+            }
+            None => {
+                // Without the seed, upstream sends the snapshots it held.
+                if lazy && !covered.is_empty() {
+                    dependencies::upstream(project, &session.local, true, &BTreeSet::new())?;
+                }
+                Seeded::new()
+            }
+        };
         match &nearest {
             None => println!(
                 "Lake cache: no published build for this toolchain and platform in {} commits",
@@ -282,32 +333,43 @@ pub(crate) fn restore(
                 }
             }
         }
+        let phase = Instant::now();
         session.install(project, &installs, lazy, &seeded)?;
+        println!(
+            "Lake cache: installed {} pool maps in {:.1} s",
+            installs.len(),
+            phase.elapsed().as_secs_f64()
+        );
         if lazy {
+            let phase = Instant::now();
             session.build(project, targets)?;
+            println!(
+                "Lake cache: built the targets in {:.1} s",
+                phase.elapsed().as_secs_f64()
+            );
         }
         Ok(())
     })
 }
 
-/// Install a fetched seed into Lake's cache. A seed is only a shortcut: one
-/// that fails to arrive is reported, and Lake fetches from the pool instead.
+/// Install a fetched seed into Lake's cache; `None` without one. A seed is
+/// only a shortcut: one that fails to arrive is reported, and Lake fetches
+/// from upstream and the pool instead.
 fn seeded(
-    seeding: Option<thread::ScopedJoinHandle<'_, Result<Option<seed::Staged>>>>,
+    seeding: Option<thread::ScopedJoinHandle<'_, Result<seed::Staged>>>,
     cache: &Path,
-) -> Result<Seeded> {
+) -> Result<Option<Seeded>> {
     let Some(seeding) = seeding else {
-        return Ok(Seeded::new());
+        return Ok(None);
     };
     match seeding.join().unwrap_or(Err(crate::error::Error::Worker)) {
-        Ok(Some(staged)) => staged.install(cache),
-        Ok(None) => Ok(Seeded::new()),
+        Ok(staged) => staged.install(cache).map(Some),
         Err(error) => {
             eprintln!(
                 "Lake cache: restoring without the seed: {:?}",
                 covalence_lib_error::miette::Report::new(error)
             );
-            Ok(Seeded::new())
+            Ok(None)
         }
     }
 }

@@ -8,9 +8,11 @@
 //! with the manifest's remote URL and fetches nothing.
 
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     path::Path,
     process::Command,
+    time::Instant,
 };
 
 use crate::{
@@ -70,14 +72,40 @@ fn materialize_in(project: &Project, cache: &Path) -> Result<()> {
             continue;
         }
         let mirror = mirrors.join(format!("{}.git", repository_of(url)?));
-        // Several packages can share a mirror, so fetches run one at a time.
-        fetch(&mirror, url, commit)?;
         checkouts.push((name, url, commit, destination, mirror));
     }
+    if checkouts.is_empty() {
+        return Ok(());
+    }
+    let started = Instant::now();
+    // Several packages can share a mirror, so each mirror's fetches run one
+    // at a time; different mirrors fetch at once.
+    let mut by_mirror = BTreeMap::<&Path, BTreeMap<&str, &str>>::new();
+    for (_, url, commit, _, mirror) in &checkouts {
+        by_mirror.entry(mirror).or_default().insert(commit, url);
+    }
+    let by_mirror = by_mirror.into_iter().collect::<Vec<_>>();
+    let fetched = storage::parallel(&by_mirror, |_, (mirror, commits)| {
+        let mut fetched = 0;
+        for (commit, url) in commits {
+            fetched += usize::from(fetch(mirror, url, commit)?);
+        }
+        Ok(fetched)
+    })?
+    .into_iter()
+    .sum::<usize>();
+    let mirrored = started.elapsed();
     // Checkouts write disjoint directories and only read their mirrors.
     storage::parallel(&checkouts, |_, (name, url, commit, destination, mirror)| {
         check_out(name, url, commit, destination, mirror)
     })?;
+    println!(
+        "Lake cache: checked out {} Git dependencies in {:.1} s, after fetching {fetched} commits into {} host mirrors in {:.1} s",
+        checkouts.len(),
+        started.elapsed().as_secs_f64(),
+        by_mirror.len(),
+        mirrored.as_secs_f64(),
+    );
     Ok(())
 }
 
@@ -110,8 +138,9 @@ fn check_out(name: &str, url: &str, commit: &str, destination: &Path, mirror: &P
     Ok(())
 }
 
-/// Make `mirror` hold `commit`, fetching only that commit from `url`.
-fn fetch(mirror: &Path, url: &str, commit: &str) -> Result<()> {
+/// Make `mirror` hold `commit`, fetching only that commit from `url`;
+/// whether it fetched.
+fn fetch(mirror: &Path, url: &str, commit: &str) -> Result<bool> {
     fs::create_dir_all(mirror).operation("create Git mirror")?;
     // Worktrees on one host may restore at once; Git's own ref and shallow
     // locks fail rather than wait.
@@ -138,7 +167,7 @@ fn fetch(mirror: &Path, url: &str, commit: &str) -> Result<()> {
             git(mirror).args(["rev-parse", "--verify", &format!("{commit}^{{commit}}")]),
         )?;
     }
-    Ok(())
+    Ok(!present)
 }
 
 #[cfg(test)]

@@ -55,6 +55,7 @@ struct Cli {
 }
 
 fn execute(cli: Cli) -> Result<()> {
+    let started = std::time::Instant::now();
     let root = cli.root.canonicalize().operation("locate project root")?;
     let record = cli.record.unwrap_or_else(|| root.join("build/lake-cache"));
     let project = Project {
@@ -88,14 +89,15 @@ fn execute(cli: Cli) -> Result<()> {
         return Err(invalid("--repository or GITHUB_REPOSITORY is required"));
     }
     let kv = storage::store()?;
-    if !matches!(cli.action, Action::Put) {
+    // A restore checks the dependencies out while its seed downloads.
+    if !matches!(cli.action, Action::Put | Action::Get) {
         sources::materialize(&project)?;
     }
     match cli.action {
         Action::Dependencies => dependencies::fetch(&project, &kv, &cli.targets),
         Action::Build => project.build(&cli.targets),
         Action::Put => storage::publish(&project, &kv),
-        Action::Get => restore::restore(&project, &kv, &cli.targets, cli.seed),
+        Action::Get => restore::restore(&project, &kv, &cli.targets, cli.seed, started),
     }
 }
 

@@ -1061,3 +1061,38 @@ fn native_objects_of_platform_independent_dependencies_are_published() {
         "compiled the dependency's object: {restored}"
     );
 }
+
+#[test]
+fn an_older_checkout_seeds_from_a_later_commit_and_takes_the_rest_from_the_pool() {
+    let fixture = Fixture::new();
+    let old = fixture.revision();
+    fixture.build();
+    checked(&mut fixture.cli("put"));
+    // Two later publishes take both seed slots.
+    for proof in ["Nat.zero_add n", "by omega"] {
+        fs::write(
+            fixture.root.join("Demo/B.lean"),
+            format!("module\npublic theorem b (n : Nat) : 0 + n = n := {proof}\n"),
+        )
+        .unwrap();
+        fixture.commit();
+        fixture.build();
+        checked(&mut fixture.cli("put"));
+    }
+    let newest = fixture.revision();
+    checked(
+        Command::new("git")
+            .current_dir(&fixture.root)
+            .args(["checkout", "-q", "--detach", &old]),
+    );
+    fixture.reset_local();
+    let restored = log(&checked(fixture.cli("get").args(["--seed", "--", "Demo"])));
+    assert!(
+        restored.contains(&format!(
+            "no seed for {old}; seeding from {newest} (not an ancestor)"
+        )),
+        "{restored}"
+    );
+    assert!(restored.contains("Lake cache: seeded"), "{restored}");
+    assert!(!restored.contains("Built Demo"), "rebuilt: {restored}");
+}
