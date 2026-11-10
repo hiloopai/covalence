@@ -27,6 +27,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
   configuration lock" on a workspace Lake has not configured: the first
   mapping install loads the workspace alone, then the rest run at once.
 
+- A seed published by a host that itself restored from a seed holds the
+  upstream snapshots again: seeds carry the upstream mapping lists
+  (`revisions.json.zst` in the slot), and a seeded host keeps them.
+
 - A Lake workspace below its repository's root keeps its own revision maps,
   module indexes and seed slots under `<owner>/<repo>/<folder>`, so
   publishing it no longer overwrites the root workspace's map of a shared

@@ -380,6 +380,18 @@ struct Upstream {
     snapshots: Vec<Snapshot>,
 }
 
+/// The mapping lists Lake kept for a seed's upstream snapshots
+/// (`revisions/<package>/<revision>.jsonl`), so a host the seed fills keeps
+/// them as `lake cache get` would, and a seed it publishes in turn still holds
+/// those snapshots. A separate object, which older readers never read.
+#[derive(Deserialize, Serialize)]
+#[serde(crate = "covalence_lib_serde::serde", deny_unknown_fields)]
+struct Revisions {
+    commit: String,
+    /// Each file's text, by its path under `revisions/`.
+    files: BTreeMap<String, String>,
+}
+
 /// Publish `members` of `cache` as the seed of `commit`, holding every
 /// mapping of the `upstream` snapshots.
 fn put(
@@ -416,6 +428,32 @@ fn put(
         .map_err(store_error("upload seed chunk"))?;
         Ok(chunk)
     })?;
+    let files = upstream
+        .iter()
+        .map(|snapshot| {
+            let path = snapshot.revisions(cache);
+            let relative = path
+                .strip_prefix(cache.join("revisions"))
+                .ok()
+                .and_then(Path::to_str)
+                .ok_or_else(|| invalid("upstream mapping list outside the cache"))?
+                .to_owned();
+            let text = fs::read_to_string(&path).operation(format!("read {}", path.display()))?;
+            Ok((relative, text))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let revisions = Revisions {
+        commit: commit.to_owned(),
+        files,
+    };
+    kv.put(
+        format!("{prefix}/revisions.json.zst").as_bytes(),
+        Bytes::from(
+            zstd::encode_all(&encode(&revisions)?[..], LEVEL)
+                .operation("compress upstream mapping lists")?,
+        ),
+    )
+    .map_err(store_error("publish seed upstream mapping lists"))?;
     let record = Upstream {
         commit: commit.to_owned(),
         snapshots: upstream.to_vec(),
@@ -453,6 +491,8 @@ pub(crate) type Seeded = BTreeMap<String, BTreeSet<String>>;
 /// A seed unpacked beside Lake's cache.
 pub(crate) struct Staged {
     directory: tempfile::TempDir,
+    /// The seed's upstream mapping lists, by path under `revisions/`.
+    revisions: BTreeMap<String, String>,
     files: usize,
     bytes: u64,
     seconds: f64,
@@ -617,8 +657,26 @@ impl Remote {
                 directory.path(),
             )
         })?;
+        let revisions = if self.upstream.is_empty() {
+            BTreeMap::new()
+        } else {
+            let key = format!("{prefix}/revisions.json.zst");
+            kv.get(key.as_bytes())
+                .map_err(store_error("read seed upstream mapping lists"))?
+                .map(|bytes| {
+                    let raw =
+                        zstd::decode_all(&bytes[..]).operation("decode upstream mapping lists")?;
+                    json::<Revisions>(&raw)
+                })
+                .transpose()?
+                // Another commit's lists raced the reader: leave them out.
+                .filter(|lists| lists.commit == self.manifest.commit)
+                .map(|lists| lists.files)
+                .unwrap_or_default()
+        };
         Ok(Staged {
             directory,
+            revisions,
             files: files.into_iter().sum(),
             bytes: self.manifest.chunks.iter().map(|c| c.bytes).sum(),
             seconds: started.elapsed().as_secs_f64(),
@@ -631,6 +689,26 @@ impl Staged {
     /// output file. Returns the inputs it mapped.
     pub fn install(self, cache: &Path) -> Result<Seeded> {
         let started = Instant::now();
+        for (relative, text) in &self.revisions {
+            let mut parts = relative.split('/');
+            let (Some(package), Some(file), None) = (parts.next(), parts.next(), parts.next())
+            else {
+                return Err(invalid("invalid upstream mapping list path"));
+            };
+            mapping::segment_path(package)?;
+            if !file
+                .strip_suffix(".jsonl")
+                .is_some_and(|revision| mapping::hex(revision, 40))
+            {
+                return Err(invalid("invalid upstream mapping list name"));
+            }
+            let path = cache.join("revisions").join(package).join(file);
+            if !path.exists() {
+                fs::create_dir_all(cache.join("revisions").join(package))
+                    .operation("create upstream mapping directory")?;
+                fs::write(&path, text).operation("write upstream mapping list")?;
+            }
+        }
         let mut seeded = Seeded::new();
         let mut moved = 0;
         for kind in ["artifacts", "outputs"] {
@@ -854,6 +932,14 @@ mod tests {
             .install(host.path())
             .unwrap();
         assert_eq!(seeded["mathlib"].len(), 2);
+        // The host keeps the snapshot's mapping list, so a seed it publishes
+        // still holds the snapshot.
+        let list = "revisions/mathlib/1111111111111111111111111111111111111111.jsonl";
+        assert_eq!(
+            fs::read(host.path().join(list)).unwrap(),
+            fs::read(cache.join(list)).unwrap()
+        );
+        assert!(!host.path().join("revisions/cslib").exists());
         // A publish racing the reader leaves another commit's record.
         let key = format!(
             "{}/upstream.json",
