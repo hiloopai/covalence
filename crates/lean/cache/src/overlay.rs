@@ -100,6 +100,10 @@ fn restore(sysroot: &Path) -> Result<()> {
         return Ok(());
     }
     let _lock = lock(sysroot)?;
+    // Another process may have restored while this one waited for the lock.
+    if !kept.exists() {
+        return Ok(());
+    }
     let mut files = Vec::new();
     collect(&kept, Path::new(""), &mut files)?;
     for file in &files {
@@ -175,11 +179,14 @@ fn replace(source: &Path, target: &Path) -> Result<()> {
         .as_file()
         .set_permissions(mode)
         .operation(format!("set the mode of {}", target.display()))?;
+    // Close the staged file before the rename: a Lake or Lean that a concurrent
+    // process executes from `target` must never find it open for writing, or
+    // `execve` fails with ETXTBSY.
     staged
+        .into_temp_path()
         .persist(target)
         .map_err(|e| e.error)
-        .operation(format!("replace {}", target.display()))?;
-    Ok(())
+        .operation(format!("replace {}", target.display()))
 }
 
 #[cfg(test)]
@@ -258,5 +265,76 @@ mod tests {
         write(overlay.path(), "lib/lean/Lake/New.olean", "new");
         let error = install(overlay.path(), sysroot.path()).unwrap_err();
         assert!(error.to_string().contains("adds lib/lean/Lake/New.olean"));
+    }
+
+    const CHILD: &str = "COV_LAKE_OVERLAY_TEST_CHILD";
+
+    /// In a child process of `concurrent_installs_never_break_exec`: install
+    /// and restore again and again, then install.
+    #[test]
+    fn concurrent_install_child() {
+        let Some(roots) = env::var_os(CHILD) else {
+            return;
+        };
+        let roots = PathBuf::from(roots);
+        let (overlay, sysroot) = (roots.join("overlay"), roots.join("sysroot"));
+        for _ in 0..200 {
+            install(&overlay, &sysroot).unwrap();
+            restore(&sysroot).unwrap();
+        }
+        install(&overlay, &sysroot).unwrap();
+    }
+
+    /// Two processes install into one toolchain while a third keeps executing
+    /// its `bin/lake`: every exec starts, and both installs end in the same state.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_installs_never_break_exec() {
+        let roots = tempfile::tempdir().unwrap();
+        let (overlay, sysroot) = (roots.path().join("overlay"), roots.path().join("sysroot"));
+        for (root, binary) in [(&sysroot, "/bin/true"), (&overlay, "/bin/false")] {
+            fs::create_dir_all(root.join("bin")).unwrap();
+            fs::copy(binary, root.join("bin/lake")).unwrap();
+        }
+        fs::create_dir_all(sysroot.join("lib/lean")).unwrap();
+        let mut children: Vec<_> = (0..2)
+            .map(|_| {
+                Command::new(env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "overlay::tests::concurrent_install_child",
+                        "--quiet",
+                    ])
+                    .env(CHILD, roots.path())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let (mut execs, mut running) = (0, children.len());
+        while running > 0 {
+            if let Err(error) = Command::new(sysroot.join("bin/lake")).status() {
+                panic!(
+                    "exec {} failed after {execs} execs: {error}",
+                    sysroot.join("bin/lake").display()
+                );
+            }
+            execs += 1;
+            running = children
+                .iter_mut()
+                .map(|child| usize::from(child.try_wait().unwrap().is_none()))
+                .sum();
+        }
+        for child in &mut children {
+            assert!(child.wait().unwrap().success());
+        }
+        assert!(execs > 0);
+        assert!(same(&overlay.join("bin/lake"), &sysroot.join("bin/lake")).unwrap());
+        assert!(
+            same(
+                Path::new("/bin/true"),
+                &sysroot.join(STOCK).join("bin/lake")
+            )
+            .unwrap()
+        );
     }
 }

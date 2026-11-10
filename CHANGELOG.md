@@ -19,6 +19,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Fixed
 
+- Installing the Lake overlay no longer makes a concurrent Lake or Lean fail
+  to start with "Text file busy": each file is closed before it is renamed
+  into the toolchain. Two installs that race on one toolchain both succeed.
+
 - `cov-lake-cache get` no longer fails with "could not acquire an exclusive
   configuration lock" on a workspace Lake has not configured: the first
   mapping install loads the workspace alone, then the rest run at once.
