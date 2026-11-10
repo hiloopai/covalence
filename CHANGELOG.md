@@ -113,6 +113,12 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Added
 
+- `cov-lake-cache gc` deletes from a host's Lake cache what only toolchain
+  scopes unused for `COVALENCE_LAKE_GC_DAYS` days (14 by default) hold,
+  keeping the most recent scope and any scope in use. `get` runs it when the
+  cache's disk has less than `COVALENCE_LAKE_GC_FREE_PERCENT` (10) percent
+  free.
+
 - `AwsOptions::accelerate` sends `S3Kv` requests to the bucket's Transfer
   Acceleration endpoint. **Breaking:** construct `AwsOptions` with
   `..AwsOptions::default()` to pick up the new field.

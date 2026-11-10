@@ -48,7 +48,11 @@ pub(crate) struct Local {
 
 impl Local {
     pub fn open(project: &Project) -> Result<Self> {
-        let directory = project.cache_dir()?;
+        Self::at(project.cache_dir()?)
+    }
+
+    /// The layer in the Lake cache `directory`.
+    pub fn at(directory: PathBuf) -> Result<Self> {
         let state = directory.join("covalence");
         fs::create_dir_all(&state).operation("create local pool directory")?;
         let nodes = SqliteCas::open(state.join("nodes.db")).map_err(|source| Error::Cas {

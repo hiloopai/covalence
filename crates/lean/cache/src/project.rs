@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     error::{Error, IoResult, Result, encode, invalid, json},
-    mapping, pool,
+    gc, mapping, pool,
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -336,11 +336,27 @@ impl Project {
             "macos" => "darwin",
             os => os,
         };
+        let scope = format!(
+            "{os}-{arch}/{}",
+            data_encoding::HEXLOWER.encode(&hash.finalize())
+        );
+        let toolchain = match fs::read_to_string(self.root.join("lean-toolchain")) {
+            Ok(toolchain) => Some(toolchain),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(Error::Io {
+                    operation: "read Lean toolchain".into(),
+                    source,
+                });
+            }
+        };
+        gc::record_use(
+            &self.cache_dir()?,
+            &scope,
+            toolchain.as_deref().map(str::trim),
+        )?;
         Ok(Identity {
-            scope: format!(
-                "{os}-{arch}/{}",
-                data_encoding::HEXLOWER.encode(&hash.finalize())
-            ),
+            scope,
             revision,
             run: [
                 env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".into()),

@@ -6,6 +6,7 @@ mod archives;
 mod blobs;
 mod dependencies;
 pub mod error;
+mod gc;
 mod local;
 mod mapping;
 pub mod pool;
@@ -30,6 +31,8 @@ enum Action {
     Build,
     Put,
     Get,
+    /// Delete what only scopes unused for `COVALENCE_LAKE_GC_DAYS` hold.
+    Gc,
 }
 
 #[derive(Parser)]
@@ -66,6 +69,9 @@ fn execute(cli: Cli) -> Result<()> {
             .or_else(|| env::var("GITHUB_REPOSITORY").ok())
             .unwrap_or_default(),
     };
+    if matches!(cli.action, Action::Gc) && !cli.targets.is_empty() {
+        return Err(invalid("gc accepts no targets"));
+    }
     if cli.seed && !matches!(cli.action, Action::Get) {
         return Err(invalid("--seed applies to get"));
     }
@@ -85,19 +91,32 @@ fn execute(cli: Cli) -> Result<()> {
     {
         return Err(invalid("publication requires a trusted main CI run"));
     }
-    if project.repository.is_empty() && !matches!(cli.action, Action::Dependencies) {
+    if project.repository.is_empty() && !matches!(cli.action, Action::Dependencies | Action::Gc) {
         return Err(invalid("--repository or GITHUB_REPOSITORY is required"));
     }
-    let kv = storage::store()?;
-    // A restore checks the dependencies out while its seed downloads.
-    if !matches!(cli.action, Action::Put | Action::Get) {
-        sources::materialize(&project)?;
-    }
+    let cache = project.cache_dir()?;
+    // gc itself takes the lock exclusively.
+    let in_use = (!matches!(cli.action, Action::Gc))
+        .then(|| gc::in_use(&cache))
+        .transpose()?;
+    let store = || {
+        let kv = storage::store()?;
+        // A restore checks the dependencies out while its seed downloads.
+        if !matches!(cli.action, Action::Put | Action::Get) {
+            sources::materialize(&project)?;
+        }
+        Ok::<_, error::Error>(kv)
+    };
     match cli.action {
-        Action::Dependencies => dependencies::fetch(&project, &kv, &cli.targets),
-        Action::Build => project.build(&cli.targets),
-        Action::Put => storage::publish(&project, &kv),
-        Action::Get => restore::restore(&project, &kv, &cli.targets, cli.seed, started),
+        Action::Dependencies => dependencies::fetch(&project, &store()?, &cli.targets),
+        Action::Build => store().and_then(|_| project.build(&cli.targets)),
+        Action::Put => storage::publish(&project, &store()?),
+        Action::Get => {
+            restore::restore(&project, &store()?, &cli.targets, cli.seed, started)?;
+            drop(in_use);
+            gc::after_restore(&cache)
+        }
+        Action::Gc => gc::collect(&cache),
     }
 }
 

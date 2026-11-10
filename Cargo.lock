@@ -968,6 +968,7 @@ dependencies = [
  "data-encoding",
  "hyper",
  "hyper-util",
+ "rustix",
  "s3s",
  "s3s-fs",
  "serde_json",

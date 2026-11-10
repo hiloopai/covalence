@@ -38,6 +38,7 @@ covalence-lib-data.workspace = true
 covalence-lib-error = { workspace = true, features = ["fancy"] }
 covalence-lib-serde.workspace = true
 data-encoding = "2.11.1"
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 serde_json = "1"
 sha2.workspace = true
 tar = "0.4"

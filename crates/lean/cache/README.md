@@ -85,6 +85,7 @@ the scope.
 - `dependencies` restores the Mathlib/CSLib snapshot from upstream, then
   each Git dependency's build of its pin from the pool on top of it, so a
   partial pool map never hides upstream's artifacts.
+- `gc` frees the host's cache of toolchain scopes it stopped using (below).
 - With targets, `get` and `dependencies` install only mappings (`get` also
   those of the dependencies). `get` then runs `lake build --wfail` on the
   targets, which fetches only the artifacts they need. Lake takes each artifact from its local
@@ -173,8 +174,22 @@ artifacts were too. Restores read Lake's artifact cache without writing to it,
 so a one-shot runner does not copy every unpacked artifact. On a host that keeps
 its cache, export the same `LAKE_CACHE_DIR`, `LAKE_ARTIFACT_CACHE=true` and
 `LAKE_RESTORE_ARTIFACTS=true` for every Lake run, this command's included: Lake then keeps each archive unpacked
-in the cache after its first use, and later worktrees restore without unpacking. Nothing
-evicts old entries yet.
+in the cache after its first use, and later worktrees restore without unpacking.
+
+Every toolchain bump starts a new scope, and Lake keeps every scope's files in
+the one cache directory. Each command records the scope it uses, with the
+project's `lean-toolchain`, under `covalence/scopes/`. `cov-lake-cache gc`
+keeps the scopes used within `COVALENCE_LAKE_GC_DAYS` days (14 unless set),
+the most recently used one, and every other scope of their toolchains. For
+the rest it deletes the output records that only their installed maps, or the
+upstream snapshots of their toolchains, name. It also deletes the artifacts
+those name that no remaining record, kept map or kept snapshot names, along
+with the scopes' own state. Records of local builds belong to no map and stay.
+`gc` runs only while no other `cov-lake-cache` command holds the cache, so it
+never deletes the scope in use. After every `get`, `gc` runs by itself when
+the cache's file system has less than `COVALENCE_LAKE_GC_FREE_PERCENT` percent
+free (10 unless set; 0 turns this off). A scope that a host used before these
+records existed counts as used at its first `gc`.
 
 Set `LAKE_CI_BUCKET`. Credentials, region and endpoint follow the AWS
 credential chain (`AWS_REGION`, `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`,
