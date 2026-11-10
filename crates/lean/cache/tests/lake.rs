@@ -1138,3 +1138,23 @@ fn module_traces_name_the_recorded_inputs_and_targeted_restores_prefetch_them() 
         "unpacked: {restored}"
     );
 }
+
+#[test]
+fn recording_after_a_seeded_restore_reuses_the_pools_archives() {
+    let fixture = Fixture::new();
+    fixture.build();
+    checked(&mut fixture.cli("put"));
+    let published = fs::read_to_string(fixture.record("packages/demo.jsonl")).unwrap();
+    fixture.reset_local();
+    checked(fixture.cli("get").args(["--seed", "--", "Demo"]));
+    // The seed holds unpacked files only; Lake would pack every archive.
+    let recorded = log(&checked(fixture.cli("build").args(["--", "Demo"])));
+    assert!(
+        recorded.contains("placed the pool's archives of 3 unchanged modules"),
+        "{recorded}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.record("packages/demo.jsonl")).unwrap(),
+        published
+    );
+}

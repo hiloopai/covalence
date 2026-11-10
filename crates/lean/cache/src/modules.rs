@@ -17,6 +17,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs, io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use covalence_kv_trait::Kv;
@@ -26,7 +27,7 @@ use covalence_lib_serde::{Deserialize, Serialize};
 use crate::{
     error::{Error, IoResult, Result, encode, json},
     mapping,
-    project::{Package, Project},
+    project::{Package, Project, Source},
 };
 
 /// A package revision's modules, by name, and the input each had.
@@ -378,6 +379,115 @@ pub(crate) fn prefetch(
     }
     println!("Lake cache: prefetching {found} of the {total} workspace modules the targets import");
     Ok(inputs)
+}
+
+/// Before `build` records, place for each unchanged module the archive the
+/// pool already holds for it, where Lake looks for a packed archive
+/// (`.lake/build/ir/<A/B>.ltar`) and in its artifact cache. Lake's `-o`
+/// records an archive per module and packs one for every module that lacks
+/// it, as every module a seed restored does, which took most of a
+/// recording's time (1,255 s for moria after a seed, 231 s after an archive
+/// restore).
+///
+/// A module counts as unchanged when the input of its trace in the build
+/// folder, which the restore just wrote, equals the input the module index
+/// of the revision restored (`commit`, or a dependency's pin) names; its
+/// archive is that input's in the revision map. Lake packs the rest.
+pub(crate) fn reuse_archives(
+    project: &Project,
+    kv: &Arc<dyn Kv>,
+    scope: &str,
+    packages: &[Package],
+    commit: Option<&str>,
+) -> Result<usize> {
+    let started = std::time::Instant::now();
+    let remote = crate::pool::store(kv.clone(), scope)?;
+    let blobs = crate::pool::blobs(kv.clone(), scope)?;
+    let local = crate::local::Local::open(project)?;
+    let artifacts = local.directory().join("artifacts");
+    let mut jobs = Vec::new();
+    for package in packages {
+        let commit = match &package.source {
+            Source::Repository => match commit {
+                Some(commit) => commit,
+                None => continue,
+            },
+            Source::Git { commit, .. } => commit.as_str(),
+        };
+        let Some(index) = Index::get(&**kv, &project.modules_key(scope, package, commit)?)? else {
+            continue;
+        };
+        let key = project.revision_key(scope, package, commit)?;
+        let Some(root) = crate::storage::pointer(&**kv, &key)? else {
+            continue;
+        };
+        crate::pool::copy_nodes(&remote, &*local.nodes(), root)?;
+        let entries = crate::pool::entries(&covalence_cas_prolly::Map::open(local.nodes(), root))?;
+        let build = project.root.join(&package.dir).join(".lake/build");
+        for (module, input) in &index.modules {
+            if module.contains(':') {
+                continue;
+            }
+            let path = module.replace('.', "/");
+            let trace = build.join(format!("lib/lean/{path}.trace"));
+            let Ok(bytes) = fs::read(&trace) else {
+                continue;
+            };
+            let current = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|trace| trace["depHash"].as_str().map(str::to_owned));
+            let Some(entry) = entries
+                .get(input)
+                .filter(|_| current.as_deref() == Some(input))
+            else {
+                continue;
+            };
+            let Ok(serde_json::Value::String(name)) = serde_json::from_str(&entry.output) else {
+                continue;
+            };
+            let (Some(cid), true) = (entry.artifacts.get(&name), name.ends_with(".ltar")) else {
+                continue;
+            };
+            let placed = build.join(format!("ir/{path}.ltar"));
+            if !placed.exists() {
+                jobs.push((*cid, artifacts.join(&name), placed));
+            }
+        }
+    }
+    crate::storage::parallel_with(
+        crate::storage::ARCHIVE_WORKERS,
+        &jobs,
+        |_, (cid, cached, placed)| {
+            if !cached.exists() {
+                let mut file =
+                    tempfile::NamedTempFile::new_in(&artifacts).operation("stage archive")?;
+                blobs.get_to(cid, &mut file)?.ok_or_else(|| {
+                    crate::error::invalid(format!("{cid} is missing from the pool"))
+                })?;
+                file.persist_noclobber(cached)
+                    .map(|_| ())
+                    .or_else(|error| {
+                        if cached.exists() {
+                            Ok(())
+                        } else {
+                            Err(error.error)
+                        }
+                    })
+                    .operation("save archive")?;
+            }
+            if let Some(parent) = placed.parent() {
+                fs::create_dir_all(parent).operation("create build folder")?;
+            }
+            fs::copy(cached, placed).operation("place archive")?;
+            Ok(())
+        },
+    )?;
+    println!(
+        "Lake cache: placed the pool's archives of {} unchanged modules in {:.1} s",
+        jobs.len(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(jobs.len())
 }
 
 /// The quoted strings in `text`.

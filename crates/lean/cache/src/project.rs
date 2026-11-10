@@ -5,8 +5,10 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
 };
 
+use covalence_kv_trait::Kv;
 use covalence_lib_serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -392,7 +394,7 @@ impl Project {
     /// Run one strict build, then record each package's outputs: the
     /// repository's own packages always, and Git dependencies that `skip`
     /// does not exclude.
-    pub fn build(&self, targets: &[String]) -> Result<()> {
+    pub fn build(&self, kv: &Arc<dyn Kv>, targets: &[String]) -> Result<()> {
         let receipt = self.record.join("success.json");
         remove(&receipt)?;
         let packages_dir = self.record.join("packages");
@@ -405,6 +407,20 @@ impl Project {
         self.clean()?;
         let identity = self.identity()?;
         let packages = self.packages()?;
+        let nearest = crate::storage::nearest(
+            &**kv,
+            self,
+            &identity.scope,
+            &packages[0],
+            &self.ancestors()?,
+        )?;
+        crate::modules::reuse_archives(
+            self,
+            kv,
+            &identity.scope,
+            &packages,
+            nearest.as_ref().map(|(commit, _)| commit.as_str()),
+        )?;
         let mut recorded = BTreeMap::new();
         for (index, package) in packages.iter().enumerate() {
             let mapping = self.mapping(&package.name);

@@ -110,7 +110,7 @@ fn execute(cli: Cli) -> Result<()> {
     };
     match cli.action {
         Action::Dependencies => dependencies::fetch(&project, &store()?, &cli.targets),
-        Action::Build => store().and_then(|_| project.build(&cli.targets)),
+        Action::Build => project.build(&store()?, &cli.targets),
         Action::Put => storage::publish(&project, &store()?),
         Action::Get => {
             restore::restore(&project, &store()?, &cli.targets, cli.seed, started)?;
