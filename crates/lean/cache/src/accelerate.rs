@@ -3,12 +3,15 @@
 //! endpoint is cheaper and acceleration would only add its per-GB fee.
 
 use std::{
-    env,
+    env, fs,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
+    path::Path,
     sync::OnceLock,
     time::{Duration, Instant},
 };
+
+use data_encoding::BASE64URL_NOPAD;
 
 use crate::error::{Result, invalid};
 
@@ -28,7 +31,9 @@ pub(crate) fn enabled() -> Result<bool> {
             return Ok(*in_aws);
         }
         let lookup = |name: &str| env::var(name).ok();
-        let in_aws = aws_runtime(lookup) || metadata(lookup)?.is_some_and(|at| imds(at, PROBE));
+        let in_aws = aws_runtime(lookup)
+            || eks_identity(lookup, |path| fs::read(path).ok())
+            || metadata(lookup)?.is_some_and(|at| imds(at, PROBE));
         Ok(*IN_AWS.get_or_init(|| in_aws))
     })
 }
@@ -47,8 +52,8 @@ fn choose(setting: Option<&str>, in_aws: impl FnOnce() -> Result<bool>) -> Resul
 
 /// Whether variables that only AWS's own runtimes set are present: Lambda,
 /// ECS and CodeBuild (`AWS_EXECUTION_ENV`), ECS task metadata and roles, and
-/// the EKS Pod Identity agent. Web identity variables do not count: CI and
-/// other clouds federate into AWS that way too.
+/// the EKS Pod Identity agent. Web identity variables alone do not count: CI
+/// and other clouds federate into AWS that way too (see [`eks_identity`]).
 fn aws_runtime(var: impl Fn(&str) -> Option<String>) -> bool {
     let set = |name| var(name).is_some_and(|value| !value.is_empty());
     set("AWS_EXECUTION_ENV")
@@ -58,6 +63,38 @@ fn aws_runtime(var: impl Fn(&str) -> Option<String>) -> bool {
         || var("AWS_CONTAINER_CREDENTIALS_FULL_URI").is_some_and(|uri| {
             uri.starts_with("http://169.254.170.23/") || uri.starts_with("http://[fd00:ec2::23]/")
         })
+}
+
+/// Whether the web identity token the SDKs would use was issued by an EKS
+/// cluster, whose issuers are `https://oidc.eks.<region>.amazonaws.com/...`:
+/// its pods run in AWS. A token is not proof of where it is used, but pods on
+/// other clusters federate into AWS with their own issuers, such as the
+/// fleet's tenant issuers or GitHub Actions'. Pods often cannot reach
+/// instance metadata, so this does not ask it. An unreadable or malformed
+/// token says nothing.
+fn eks_identity(
+    var: impl Fn(&str) -> Option<String>,
+    read: impl Fn(&Path) -> Option<Vec<u8>>,
+) -> bool {
+    let Some(token) = var("AWS_WEB_IDENTITY_TOKEN_FILE").and_then(|path| read(Path::new(&path)))
+    else {
+        return false;
+    };
+    let payload = token
+        .split(|byte| *byte == b'.')
+        .nth(1)
+        .and_then(|payload| BASE64URL_NOPAD.decode(payload.trim_ascii()).ok());
+    let issuer = payload
+        .and_then(|payload| serde_json::from_slice::<serde_json::Value>(&payload).ok())
+        .and_then(|claims| claims["iss"].as_str().map(str::to_owned));
+    issuer.is_some_and(|issuer| {
+        issuer
+            .strip_prefix("https://oidc.eks.")
+            .and_then(|rest| rest.split('/').next())
+            .is_some_and(|host| {
+                host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn")
+            })
+    })
 }
 
 /// The instance metadata address, as the AWS SDKs configure it, or `None`
@@ -157,6 +194,68 @@ mod tests {
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect::<BTreeMap<_, _>>();
         move |name| map.get(name).cloned()
+    }
+
+    /// A web identity token whose payload names `issuer`.
+    fn token(issuer: &str) -> Vec<u8> {
+        let payload = serde_json::json!({ "iss": issuer, "aud": "sts.amazonaws.com" });
+        format!(
+            "eyJhbGciOiJSUzI1NiJ9.{}.c2lnbmF0dXJl\n",
+            BASE64URL_NOPAD.encode(payload.to_string().as_bytes())
+        )
+        .into_bytes()
+    }
+
+    fn identity(path: &str, contents: Option<Vec<u8>>) -> bool {
+        let wanted = path.to_owned();
+        eks_identity(
+            vars(&[
+                ("AWS_WEB_IDENTITY_TOKEN_FILE", path),
+                ("AWS_ROLE_ARN", "arn:aws:iam::607856468300:role/r"),
+                ("AWS_EC2_METADATA_DISABLED", "true"),
+            ]),
+            move |at| {
+                (at == Path::new(&wanted))
+                    .then(|| contents.clone())
+                    .flatten()
+            },
+        )
+    }
+
+    #[test]
+    fn eks_web_identity_tokens_are_inside_aws() {
+        let eks = "https://oidc.eks.us-east-1.amazonaws.com/id/47256878856A149D22585B9E83473729";
+        // A projected token at the job specs' path, and EKS's webhook path.
+        assert!(identity("/var/run/secrets/aws/token", Some(token(eks))));
+        assert!(identity(
+            "/var/run/secrets/eks.amazonaws.com/serviceaccount/token",
+            Some(token(eks))
+        ));
+        let china = "https://oidc.eks.cn-north-1.amazonaws.com.cn/id/ABC";
+        assert!(identity("/var/run/secrets/aws/token", Some(token(china))));
+    }
+
+    #[test]
+    fn other_web_identities_are_outside_aws() {
+        // The fleet's Ubicloud and Hetzner tenants use the same path and role,
+        // with their own issuers; GitHub Actions has its own.
+        for issuer in [
+            "https://hiloop-fleet-oidc-607856468300-us-east-1.s3.us-east-1.amazonaws.com/ubicloud-sfbay-production",
+            "https://hiloop-fleet-oidc-607856468300-us-east-1.s3.us-east-1.amazonaws.com/hetzner-nbg1-production",
+            "https://token.actions.githubusercontent.com",
+            "https://oidc.eks.example.com/id/ABC",
+        ] {
+            assert!(
+                !identity("/var/run/secrets/aws/token", Some(token(issuer))),
+                "{issuer}"
+            );
+        }
+        assert!(!identity("/var/run/secrets/aws/token", None));
+        assert!(!identity(
+            "/var/run/secrets/aws/token",
+            Some(b"not a jwt".to_vec())
+        ));
+        assert!(!eks_identity(vars(&[]), |_| panic!("no token to read")));
     }
 
     #[test]

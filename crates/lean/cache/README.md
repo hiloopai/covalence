@@ -215,8 +215,9 @@ bucket. Inside AWS they keep the regional endpoint, where acceleration would
 only add its fee. `COVALENCE_S3_ACCELERATE` is `auto` (the default), `on` or
 `off`. `auto` counts a host as in AWS when an AWS runtime's variables are set
 (`AWS_EXECUTION_ENV`, ECS task metadata or roles, EKS Pod Identity) or when
-instance metadata answers as EC2's does within 40 ms. Web identity alone does
-not count, since CI and other clouds use it too. An `AWS_ENDPOINT_URL` or
+instance metadata answers as EC2's does within 40 ms. A web identity token
+counts only when an EKS cluster issued it (`https://oidc.eks.<region>.amazonaws.com`),
+since CI and clusters elsewhere federate into AWS with their own issuers. An `AWS_ENDPOINT_URL` or
 profile `endpoint_url` overrides acceleration. GitHub publication
 requires a main push or manual main run in the named repository. Bucket
 permissions remain the actual write authorization boundary. Only trusted

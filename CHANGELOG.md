@@ -17,6 +17,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Fixed
 
+- `cov-lake-cache` counts pods whose web identity token an EKS cluster
+  issued as inside AWS, so EKS jobs with instance metadata disabled no longer
+  use Transfer Acceleration, which failed against buckets without it.
+
 - `cov-lake-cache build` records the native objects of dependencies that set
   `platformIndependent`, such as Mathlib and Aesop, which Lake's own records
   leave out, so a restore of an executable no longer compiles them.
