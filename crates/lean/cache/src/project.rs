@@ -331,7 +331,7 @@ impl Project {
     /// Run one strict build, then record each package's outputs: the
     /// repository's own packages always, and Git dependencies that `skip`
     /// does not exclude.
-    pub fn build(&self, targets: &[String], skip: impl Fn(&Package) -> Result<bool>) -> Result<()> {
+    pub fn build(&self, targets: &[String]) -> Result<()> {
         let receipt = self.record.join("success.json");
         remove(&receipt)?;
         let packages_dir = self.record.join("packages");
@@ -344,9 +344,6 @@ impl Project {
         let packages = self.packages()?;
         let mut recorded = BTreeMap::new();
         for (index, package) in packages.iter().enumerate() {
-            if index > 0 && skip(package)? {
-                continue;
-            }
             let mapping = self.mapping(&package.name);
             let mut command = self.lake();
             command

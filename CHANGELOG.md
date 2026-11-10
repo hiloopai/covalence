@@ -17,6 +17,11 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Fixed
 
+- `cov-lake-cache dependencies` and targeted `get` always restore the upstream
+  Mathlib/CSLib snapshot first; a pool map, which holds only what its
+  publishers built, adds to it. `build` records every Git dependency and `put`
+  publishes the union of every publisher's entries for a pin.
+
 - `cov-lake-cache get -- <targets>` again fetches only the targets' closure,
   and restores no longer force Lake to copy every unpacked artifact into its
   cache; set `LAKE_ARTIFACT_CACHE=true` on hosts that keep the cache.

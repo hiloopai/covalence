@@ -32,29 +32,33 @@ pub(crate) fn fetch(project: &Project, kv: &Arc<dyn Kv>, targets: &[String]) -> 
     Ok(())
 }
 
-/// Install each Git dependency's map from the pool, and the Mathlib/CSLib
-/// snapshot from upstream for packages the pool has no build of.
+/// Install the Mathlib/CSLib snapshot from upstream, then each Git
+/// dependency's map from the pool on top of it.
 pub(crate) fn install(
     project: &Project,
     kv: &Arc<dyn Kv>,
     session: &mut Session,
     lazy: bool,
 ) -> Result<()> {
-    let mut missing = BTreeSet::new();
-    for package in project.packages()? {
+    let packages = project.packages()?;
+    // A pool map holds only the closures its publishers built, so upstream's
+    // snapshot comes first and the pool adds to it.
+    if config(project).exists() {
+        let names = packages
+            .iter()
+            .filter(|package| matches!(package.source, Source::Git { .. }))
+            .map(|package| package.name.clone())
+            .collect();
+        mappings(project, lazy, &names)?;
+    }
+    for package in packages {
         let Source::Git { commit, .. } = &package.source else {
             continue;
         };
         let key = project.revision_key(session.scope(), &package, commit)?;
-        match storage::pointer(&**kv, &key)? {
-            Some(root) => session.install(project, &package, false, root, lazy)?,
-            None => {
-                missing.insert(package.name);
-            }
+        if let Some(root) = storage::pointer(&**kv, &key)? {
+            session.install(project, &package, false, root, lazy)?;
         }
-    }
-    if config(project).exists() {
-        mappings(project, lazy, &missing)?;
     }
     Ok(())
 }

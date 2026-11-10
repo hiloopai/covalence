@@ -291,13 +291,17 @@ fn publish_package(publisher: &Publisher, package: &Package) -> Result<Option<Pu
             BTreeMap::new(),
         ),
         Source::Git { .. } => {
-            if pointer(kv, &key)?.is_some() {
-                return Ok(None);
+            // Publishers of one pin record different closures; the pool keeps
+            // their union, this publisher's outputs winning.
+            let existing = pointer(kv, &key)?;
+            let mut upstream = BTreeMap::new();
+            if let Some(root) = existing {
+                pool::copy_nodes(remote, &*local.nodes(), root)?;
+                upstream = pool::entries(&Map::open(local.nodes(), root))?;
             }
             // Fold in the upstream snapshots Lake fetched for this package, so
             // the pool covers at least what upstream does. Upstream services
             // name snapshots by a pinned commit, not always the package's own.
-            let mut upstream = BTreeMap::new();
             for pin in pins {
                 let path = local
                     .directory()
@@ -308,7 +312,7 @@ fn publish_package(publisher: &Publisher, package: &Package) -> Result<Option<Pu
                     upstream.extend(mapped_entries(&path, artifacts, false)?);
                 }
             }
-            (None, upstream)
+            (existing.map(|root| (commit.clone(), root)), upstream)
         }
     };
     entries.extend(mapped_entries(
@@ -320,6 +324,11 @@ fn publish_package(publisher: &Publisher, package: &Package) -> Result<Option<Pu
         return Ok(None);
     }
     let map = pool::build(local.nodes(), &entries)?;
+    if parent.as_ref().is_some_and(|(_, root)| *root == map.root())
+        && package.source != Source::Repository
+    {
+        return Ok(None);
+    }
     let parent_map = match &parent {
         Some((_, root)) => {
             pool::copy_nodes(remote, &*local.nodes(), *root)?;
