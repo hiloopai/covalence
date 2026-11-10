@@ -123,7 +123,8 @@ A fresh host otherwise has Lake fetch and unpack each module on its own: about
 27,000 requests and archive decodes for one large repository. `put` also
 publishes the recorded build as a seed: for every input `build` checked, Lake's
 local output file, without its archive, and the unpacked artifacts and native
-objects it names, as 16 Zstandard tar streams. Each repository keeps two seeds
+objects it names, as 16 Zstandard tar streams. An output Lake kept as its
+archive alone is decoded first, so no host the seed fills unpacks it. Each repository keeps two seeds
 per scope under `lake/<scope>/seed/<owner>/<repo>/{a,b}/`; a publish overwrites
 the older slot, its chunks first and its `manifest.json` (commit, publication
 time, each chunk's SHA-256, length and file count) last. Storage stays at two

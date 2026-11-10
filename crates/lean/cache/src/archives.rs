@@ -133,9 +133,10 @@ fn unpack_one(blobs: &Blobs, artifacts: &Path, cid: &Sha256) -> Result<String> {
     place(artifacts, &bytes, &cid.to_string())
 }
 
-/// Lake's output descriptor for each row of an upstream snapshot's mapping
-/// whose output is an archive Lake already downloaded into `artifacts`, after
-/// placing that archive's files there. Other rows are left out.
+/// Lake's output descriptor for each row of `rows`, such as an upstream
+/// snapshot's mapping, whose output is an archive Lake already downloaded
+/// into `artifacts`, after placing that archive's files there. Other rows
+/// are left out.
 ///
 /// Lake unpacks such an archive on every build that finds only it, and its
 /// `cache get` downloads only archives, so the snapshot is decoded here.
@@ -157,7 +158,7 @@ pub(crate) fn expand(
     let descriptors: BTreeMap<_, _> = archives.into_iter().zip(descriptors).collect();
     if !descriptors.is_empty() {
         println!(
-            "Lake cache: placed {} upstream archives in {:.1} s",
+            "Lake cache: placed the files of {} archives in {:.1} s",
             descriptors.len(),
             started.elapsed().as_secs_f64()
         );

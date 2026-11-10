@@ -21,6 +21,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
   `platformIndependent`, such as Mathlib and Aesop, which Lake's own records
   leave out, so a restore of an executable no longer compiles them.
 
+- `cov-lake-cache put` seeds hold the files of every module whose local
+  output was only its archive, as on a publisher whose build folder was
+  already up to date, so a seeded host no longer unpacks those archives.
+
 - Restored dependency outputs reach each package's `.lake/build` again, so
   tools that run `lean` there, such as `lake env lean`, find their `.olean`
   files. Every Lake run of `cov-lake-cache`, and every later step of the

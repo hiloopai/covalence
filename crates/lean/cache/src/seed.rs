@@ -31,6 +31,7 @@ use covalence_lib_serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    archives,
     blobs::Hashing,
     error::{Error, IoResult, Result, encode, invalid, json},
     mapping,
@@ -120,9 +121,15 @@ struct Member {
 /// the artifacts it names (unpacked modules, native objects), when all of
 /// them exist. Other inputs are left to the pool. As in an eager restore, an
 /// output drops its archive: the unpacked files are all Lake needs.
+///
+/// A module Lake restored from its archive alone can keep that archive as
+/// its local output, as on a publisher whose build folder was already up to
+/// date; every host the seed fills would then unpack it again. Such an
+/// archive is decoded here and its files stand in its place.
 fn contents(project: &Project, receipt: &Receipt, cache: &Path) -> Result<Vec<Member>> {
     let mut outputs = Vec::new();
     let mut artifacts = BTreeSet::new();
+    let mut archived = BTreeMap::new();
     for package in receipt.packages.keys() {
         for input in mapping::rows(&project.mapping(package))?.keys() {
             let name = format!("outputs/{package}/{input}.json");
@@ -140,19 +147,26 @@ fn contents(project: &Project, receipt: &Receipt, cache: &Path) -> Result<Vec<Me
             if let Some(data) = output["data"].as_object_mut() {
                 data.remove("l");
             }
-            let names = mapping::names(&output["data"])?
-                .into_iter()
-                .map(|name| format!("artifacts/{name}"))
-                .collect::<Vec<_>>();
-            if names.iter().all(|name| cache.join(name).is_file()) {
-                let bytes = encode(&output)?;
-                outputs.push(Member {
-                    name,
-                    bytes: bytes.len() as u64,
-                    inline: Some(bytes),
-                });
-                artifacts.extend(names);
+            if output["data"]
+                .as_str()
+                .is_some_and(|data| data.ends_with(".ltar"))
+            {
+                archived.insert(name, output);
+                continue;
             }
+            add_output(cache, name, &output, &mut outputs, &mut artifacts)?;
+        }
+    }
+    let rows = archived
+        .iter()
+        .map(|(name, output)| Ok((name.clone(), encode(&output["data"]).and_then(utf8)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let unpacked = archives::expand(&cache.join("artifacts"), &rows)?;
+    for (name, mut output) in archived {
+        // An archive missing from the cache leaves its input to the pool.
+        if let Some(descriptor) = unpacked.get(&name) {
+            output["data"] = json(descriptor.as_bytes())?;
+            add_output(cache, name, &output, &mut outputs, &mut artifacts)?;
         }
     }
     for name in artifacts {
@@ -168,6 +182,35 @@ fn contents(project: &Project, receipt: &Receipt, cache: &Path) -> Result<Vec<Me
         });
     }
     Ok(outputs)
+}
+
+fn utf8(bytes: Vec<u8>) -> Result<String> {
+    String::from_utf8(bytes).map_err(|_| invalid("output descriptor is not UTF-8"))
+}
+
+/// Add the output file `name` holding `output`, and the artifacts it names,
+/// when every one is in `cache`.
+fn add_output(
+    cache: &Path,
+    name: String,
+    output: &Value,
+    outputs: &mut Vec<Member>,
+    artifacts: &mut BTreeSet<String>,
+) -> Result<()> {
+    let names = mapping::names(&output["data"])?
+        .into_iter()
+        .map(|name| format!("artifacts/{name}"))
+        .collect::<Vec<_>>();
+    if names.iter().all(|name| cache.join(name).is_file()) {
+        let bytes = encode(output)?;
+        outputs.push(Member {
+            name,
+            bytes: bytes.len() as u64,
+            inline: Some(bytes),
+        });
+        artifacts.extend(names);
+    }
+    Ok(())
 }
 
 /// Spread `members` over [`CHUNKS`] by size, largest first.
@@ -580,6 +623,47 @@ mod tests {
             output["data"],
             serde_json::json!({"o": ["0000000000000001.olean"], "i": "0000000000000002.ilean"})
         );
+    }
+
+    #[test]
+    fn a_seed_holds_the_files_of_an_output_that_is_only_an_archive() {
+        let (dir, project, receipt) = publisher();
+        let cache = dir.path().join("cache");
+        let archive = "89abcdef01234567.ltar";
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../ltar/tests/fixtures/module.ltar"),
+            cache.join("artifacts").join(archive),
+        )
+        .unwrap();
+        // As Lake leaves a module it restored from the pool's archive alone.
+        fs::write(
+            cache.join("outputs/p/00000000000000dd.json"),
+            format!(r#"{{"service": "covalence", "data": "{archive}"}}"#),
+        )
+        .unwrap();
+        let mapping = project.mapping("p");
+        let mut rows = fs::read_to_string(&mapping).unwrap();
+        rows.push_str(&format!("[\"00000000000000dd\",\"{archive}\"]\n"));
+        fs::write(&mapping, rows).unwrap();
+        let kv = MemoryKv::default().into_dyn();
+        publish(&project, &*kv, &receipt, &cache).unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let seeded = fetch(&kv, SCOPE, REPOSITORY, &commit(1), host.path())
+            .unwrap()
+            .unwrap()
+            .install(host.path())
+            .unwrap();
+        assert!(seeded["p"].contains("00000000000000dd"));
+        let output: Value =
+            json(&fs::read(host.path().join("outputs/p/00000000000000dd.json")).unwrap()).unwrap();
+        assert_eq!(output["data"]["c"], "7777777777777777.c");
+        for name in mapping::names(&output["data"]).unwrap() {
+            assert!(
+                host.path().join("artifacts").join(&name).is_file(),
+                "{name}"
+            );
+        }
+        assert!(!host.path().join("artifacts").join(archive).exists());
     }
 
     #[test]
