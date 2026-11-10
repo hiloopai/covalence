@@ -45,6 +45,13 @@ layout's version (`cov-lake/v1`), `lean --version` and the toolchain's
   Lake left in the build folder. It is written before the revision pointer.
   A targeted `get` uses it to prefetch (below); nothing else reads it.
 
+A repository can hold several Lake workspaces. One below the repository's
+root, such as `projects/smt-axioms`, keeps its revision maps, module indexes
+and seeds under `<owner>/<repo>/<folder>` instead of `<owner>/<repo>`, so a
+path dependency on the root (`../..`) never overwrites the root workspace's
+map of it and its seeds take their own two slots. Git dependency pins stay
+shared. Only the root workspace publishes the commit's source tree.
+
 Lake artifact IDs are 64-bit hashes over outputs, so artifacts from different
 repositories coincide when their bytes do. Input hashes include no checkout
 path. A revision map, not the pool, says which output an input has: two

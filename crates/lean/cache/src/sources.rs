@@ -375,6 +375,7 @@ mod tests {
             .unwrap();
             let project = Project {
                 root: root.clone(),
+                workspace: String::new(),
                 repository: "o/r".into(),
                 record: root.join("record"),
             };

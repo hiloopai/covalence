@@ -479,7 +479,13 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>) -> Result<()> {
     let seed = seed::publish(project, &**kv, &receipt, local.directory())?;
     // The source tree goes last: a record says its targets built and were
     // published at that tree.
-    let sources = sources_tree::publish(project, kv, &receipt.identity.revision, &receipt.targets)?;
+    // The source tree is the repository's; its root workspace's record names
+    // the targets that `hiloop prove` reads.
+    let sources = project
+        .workspace
+        .is_empty()
+        .then(|| sources_tree::publish(project, kv, &receipt.identity.revision, &receipt.targets))
+        .transpose()?;
     let report = encode(&serde_json::json!({
         "scope": scope,
         "packages": published,

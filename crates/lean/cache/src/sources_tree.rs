@@ -416,6 +416,7 @@ mod tests {
         let first = git(&root, &["rev-parse", "HEAD"]);
         let project = Project {
             root: root.clone(),
+            workspace: String::new(),
             repository: "o/r".into(),
             record: root.join("record"),
         };

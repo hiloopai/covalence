@@ -362,7 +362,7 @@ pub(crate) fn publish(
     put(
         kv,
         &identity.scope,
-        &project.repository,
+        &project.namespace(),
         &identity.revision,
         files,
         &upstream,
@@ -755,6 +755,7 @@ mod tests {
         }
         let project = Project {
             root: dir.path().to_owned(),
+            workspace: String::new(),
             repository: REPOSITORY.into(),
             record: dir.path().join("record"),
         };

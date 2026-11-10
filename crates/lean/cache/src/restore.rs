@@ -267,7 +267,7 @@ pub(crate) fn restore(
                 .installed(Installed::Mappings, scope, &packages[0].name)?
                 .is_none();
         let remote = match nearest.as_ref().filter(|_| fresh) {
-            Some((commit, _)) => seed::find(&**kv, scope, &project.repository, commit, &commits)?,
+            Some((commit, _)) => seed::find(&**kv, scope, &project.namespace(), commit, &commits)?,
             None => None,
         };
         let covered = remote
@@ -275,8 +275,8 @@ pub(crate) fn restore(
             .map(|remote| remote.upstream.clone())
             .unwrap_or_default();
         let seeding = remote.map(|remote| {
-            let (cache, scope) = (&cache, scope.to_owned());
-            threads.spawn(move || remote.fetch(&**kv, &scope, &project.repository, cache))
+            let (cache, scope, namespace) = (&cache, scope.to_owned(), project.namespace());
+            threads.spawn(move || remote.fetch(&**kv, &scope, &namespace, cache))
         });
         mirrors.join().unwrap_or(Err(crate::error::Error::Worker))?;
         let checked_out = started.elapsed();

@@ -17,6 +17,11 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Fixed
 
+- A Lake workspace below its repository's root keeps its own revision maps,
+  module indexes and seed slots under `<owner>/<repo>/<folder>`, so
+  publishing it no longer overwrites the root workspace's map of a shared
+  path dependency or takes the root's seed slots.
+
 - `cov-lake-cache` counts pods whose web identity token an EKS cluster
   issued as inside AWS, so EKS jobs with instance metadata disabled no longer
   use Transfer Acceleration, which failed against buckets without it.

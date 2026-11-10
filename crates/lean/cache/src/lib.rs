@@ -62,6 +62,7 @@ fn execute(cli: Cli) -> Result<()> {
     let started = std::time::Instant::now();
     let root = cli.root.canonicalize().operation("locate project root")?;
     let record = cli.record.unwrap_or_else(|| root.join("build/lake-cache"));
+    let workspace = Project::workspace_of(&root)?;
     let project = Project {
         root,
         record: std::path::absolute(record).operation("resolve build record path")?,
@@ -69,6 +70,7 @@ fn execute(cli: Cli) -> Result<()> {
             .repository
             .or_else(|| env::var("GITHUB_REPOSITORY").ok())
             .unwrap_or_default(),
+        workspace,
     };
     if matches!(cli.action, Action::Gc) && !cli.targets.is_empty() {
         return Err(invalid("gc accepts no targets"));

@@ -58,6 +58,10 @@ pub(crate) struct Package {
 pub(crate) struct Project {
     pub root: PathBuf,
     pub repository: String,
+    /// The workspace's folder in the repository, empty for its root. A
+    /// repository can hold several Lake workspaces; each keeps its own
+    /// revision maps, module indexes and seeds.
+    pub workspace: String,
     pub record: PathBuf,
 }
 
@@ -240,12 +244,40 @@ impl Project {
         Ok(packages)
     }
 
+    /// The repository, followed by the workspace's folder unless it is the
+    /// root: the name this workspace's own builds and seeds are kept under.
+    /// A second workspace's path dependency on the root, such as
+    /// `../..`, then never overwrites the root workspace's map of it.
+    pub fn namespace(&self) -> String {
+        if self.workspace.is_empty() {
+            self.repository.clone()
+        } else {
+            format!("{}/{}", self.repository, self.workspace)
+        }
+    }
+
+    /// The workspace folder of `root` in its Git repository, empty at the
+    /// root.
+    pub fn workspace_of(root: &Path) -> Result<String> {
+        let prefix = output(
+            "git",
+            Command::new("git")
+                .current_dir(root)
+                .args(["rev-parse", "--show-prefix"]),
+        )?;
+        let workspace = prefix.trim_end_matches('/').to_owned();
+        if !workspace.is_empty() {
+            mapping::segment_path(&workspace)?;
+        }
+        Ok(workspace)
+    }
+
     /// The pool key of `package`'s revision pointer at `commit` of this
     /// repository, or at its own pin.
     pub fn revision_key(&self, scope: &str, package: &Package, commit: &str) -> Result<String> {
         match &package.source {
             Source::Repository => {
-                pool::revision_key(scope, &self.repository, commit, &package.name)
+                pool::revision_key(scope, &self.namespace(), commit, &package.name)
             }
             Source::Git { repository, commit } => {
                 pool::revision_key(scope, repository, commit, &package.name)
@@ -257,7 +289,9 @@ impl Project {
     /// repository, or at its own pin.
     pub fn modules_key(&self, scope: &str, package: &Package, commit: &str) -> Result<String> {
         match &package.source {
-            Source::Repository => pool::modules_key(scope, &self.repository, commit, &package.name),
+            Source::Repository => {
+                pool::modules_key(scope, &self.namespace(), commit, &package.name)
+            }
             Source::Git { repository, commit } => {
                 pool::modules_key(scope, repository, commit, &package.name)
             }
@@ -661,6 +695,57 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_below_the_repository_root_has_its_own_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        output(
+            "git",
+            Command::new("git")
+                .current_dir(root.path())
+                .args(["init", "-q"]),
+        )
+        .unwrap();
+        let nested = root.path().join("projects/smt-axioms");
+        fs::create_dir_all(&nested).unwrap();
+        assert_eq!(Project::workspace_of(root.path()).unwrap(), "");
+        assert_eq!(
+            Project::workspace_of(&nested).unwrap(),
+            "projects/smt-axioms"
+        );
+        let project = |workspace: &str| Project {
+            root: root.path().to_owned(),
+            workspace: workspace.into(),
+            repository: "o/r".into(),
+            record: root.path().join("record"),
+        };
+        assert_eq!(project("").namespace(), "o/r");
+        let nested = project("projects/smt-axioms");
+        assert_eq!(nested.namespace(), "o/r/projects/smt-axioms");
+        let path = Package {
+            name: "silmaril".into(),
+            source: Source::Repository,
+            dir: "../..".into(),
+        };
+        let commit = "a".repeat(40);
+        assert_eq!(
+            nested.revision_key("s/t", &path, &commit).unwrap(),
+            format!("lake/s/t/rev/o/r/projects/smt-axioms/{commit}/silmaril")
+        );
+        let pin = Package {
+            name: "mathlib".into(),
+            source: Source::Git {
+                repository: "o/m".into(),
+                commit: commit.clone(),
+            },
+            dir: ".lake/packages/mathlib".into(),
+        };
+        // Dependency pins stay shared.
+        assert_eq!(
+            nested.revision_key("s/t", &pin, &commit).unwrap(),
+            project("").revision_key("s/t", &pin, &commit).unwrap()
+        );
+    }
+
+    #[test]
     fn quoted_manifest_names_match_lake_package_names() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -680,6 +765,7 @@ mod tests {
         .unwrap();
         let project = Project {
             root: root.path().to_owned(),
+            workspace: String::new(),
             repository: "o/moria-lean".into(),
             record: root.path().join("record"),
         };
