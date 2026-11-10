@@ -91,8 +91,10 @@ Lake restores a module whose output is only its `.ltar` archive by running
 downloads each archive itself, 64 at a time, decodes it in process with
 `covalence-lean-ltar`, writes its files into Lake's artifact
 directory under the names its trace gives them, and installs the trace's
-outputs as the mapping. Lake then finds every file in its cache and runs no
-archiver. Targeted restores and the upstream Mathlib/CSLib snapshot still
+outputs as the mapping. It downloads every other artifact too, each once, and
+never rewrites a file already in the cache: a cache entry is immutable once
+written. Lake records only the mappings, then finds every file in its cache
+and runs no archiver. Targeted restores and the upstream Mathlib/CSLib snapshot still
 leave archives to Lake. As for any cache hit, with `LAKE_ARTIFACT_CACHE=true`
 Lake then reads `.olean` files from its cache and links only `.ilean` files
 into `.lake/build`; set the package's `restoreAllArtifacts` or

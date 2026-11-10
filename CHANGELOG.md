@@ -17,6 +17,12 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Fixed
 
+- Eager `cov-lake-cache get` and `dependencies` succeed against a warm
+  `LAKE_CACHE_DIR`. They place every artifact themselves, once, skip any
+  already in the cache, and hand Lake only the mappings; Lake's `cache get`
+  failed with "permission denied" rewriting a read-only artifact that one
+  mapping named twice.
+
 - `cov-lake-cache dependencies` and targeted `get` always restore the upstream
   Mathlib/CSLib snapshot first; a pool map, which holds only what its
   publishers built, adds to it. `build` records every Git dependency and `put`

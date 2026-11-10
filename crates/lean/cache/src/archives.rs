@@ -4,11 +4,17 @@
 //! `leantar` once per module. For the archives an eager restore installs,
 //! this tool instead downloads and decodes each one here, 64 at a time, writes
 //! its files into Lake's artifact directory under the names its trace gives
-//! them, and hands Lake the trace's outputs as the mapping. Lake then finds
-//! every file in its cache and runs no archiver.
+//! them, and hands Lake the trace's outputs as the mapping. Other artifacts
+//! it downloads as they are. Lake then gets only mappings, finds every file in
+//! its cache and runs no archiver.
+//!
+//! Lake's own `cache get` must not place these files: when one mapping names
+//! an artifact twice and the file is already in a warm cache, it rewrites the
+//! read-only file and fails (lean4 nightly-2026-11-05,
+//! `Lake/Config/Cache.lean`, `downloadArtifacts`).
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Write},
     path::Path,
@@ -36,50 +42,97 @@ fn archive(entry: &Entry) -> Option<&Sha256> {
         .flatten()
 }
 
-/// Lake's output descriptor for each of `entries`, by input hash: for each
-/// archive, the outputs its trace names, now in `artifacts`; else the
-/// entry's own.
-pub(crate) fn unpack(
+/// What an eager restore puts in the artifact directory: an archive's files,
+/// or one artifact as it is.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Job<'a> {
+    Archive(&'a Sha256),
+    File(&'a str, &'a Sha256),
+}
+
+/// Places every artifact `entries` name in `artifacts`, and returns Lake's
+/// output descriptor for each entry, by input hash: for an archive, the
+/// outputs its trace names; else the entry's own.
+///
+/// Each archive and each artifact is fetched once, however many entries name
+/// it, and a file already in `artifacts` is never rewritten: a cache entry is
+/// immutable once written. Lake then needs only the mappings.
+pub(crate) fn install(
     blobs: &Blobs,
     artifacts: &Path,
     entries: &BTreeMap<String, Entry>,
 ) -> Result<BTreeMap<String, String>> {
     let started = Instant::now();
-    let archives: Vec<_> = entries
-        .iter()
-        .filter_map(|(input, entry)| Some((input, archive(entry)?)))
-        .collect();
-    if !archives.is_empty() {
+    let mut jobs = BTreeSet::new();
+    for entry in entries.values() {
+        match archive(entry) {
+            Some(cid) => {
+                jobs.insert(Job::Archive(cid));
+            }
+            None => jobs.extend(
+                entry
+                    .artifacts
+                    .iter()
+                    .map(|(name, cid)| Job::File(name.as_str(), cid)),
+            ),
+        }
+    }
+    let jobs: Vec<_> = jobs.into_iter().collect();
+    if !jobs.is_empty() {
         fs::create_dir_all(artifacts).operation("create Lake artifact directory")?;
     }
-    let outputs =
-        storage::parallel_with(storage::ARCHIVE_WORKERS, &archives, |_, (input, cid)| {
-            unpack_one(blobs, artifacts, input, cid)
-        })?;
-    if !archives.is_empty() {
+    let done = storage::parallel_with(storage::ARCHIVE_WORKERS, &jobs, |_, job| match job {
+        Job::Archive(cid) => unpack_one(blobs, artifacts, cid).map(Some),
+        Job::File(name, cid) => fetch(blobs, &artifacts.join(name), cid).map(|()| None),
+    })?;
+    let descriptors: BTreeMap<_, _> = jobs
+        .iter()
+        .zip(done)
+        .filter_map(|(job, descriptor)| match job {
+            Job::Archive(cid) => Some((*cid, descriptor?)),
+            Job::File(..) => None,
+        })
+        .collect();
+    if !jobs.is_empty() {
         println!(
-            "Lake cache: unpacked {} archives in {:.1} s",
-            archives.len(),
+            "Lake cache: placed {} archives and {} artifacts in {:.1} s",
+            descriptors.len(),
+            jobs.len() - descriptors.len(),
             started.elapsed().as_secs_f64()
         );
     }
-    let mut rows: BTreeMap<_, _> = entries
+    Ok(entries
         .iter()
-        .map(|(input, entry)| (input.clone(), entry.output.clone()))
-        .collect();
-    for ((input, _), output) in archives.into_iter().zip(outputs) {
-        rows.insert(input.clone(), output);
-    }
-    Ok(rows)
+        .map(|(input, entry)| {
+            let output = archive(entry)
+                .and_then(|cid| descriptors.get(cid))
+                .unwrap_or(&entry.output);
+            (input.clone(), output.clone())
+        })
+        .collect())
 }
 
-fn unpack_one(blobs: &Blobs, artifacts: &Path, input: &str, cid: &Sha256) -> Result<String> {
+/// Downloads one artifact to `path` unless it is already there.
+fn fetch(blobs: &Blobs, path: &Path, cid: &Sha256) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
     let mut bytes = Vec::new();
     blobs
         .get_to(cid, &mut bytes)?
         .ok_or_else(|| invalid(format!("{cid} is missing from the pool")))?;
-    let hash = u64::from_str_radix(input, 16).map_err(|_| invalid("invalid Lake input hash"))?;
-    let archive = covalence_lean_ltar::unpack(&bytes, hash).map_err(|source| Error::Archive {
+    save(path, &bytes)
+}
+
+/// Writes an archive's files and returns the outputs its trace names.
+fn unpack_one(blobs: &Blobs, artifacts: &Path, cid: &Sha256) -> Result<String> {
+    let mut bytes = Vec::new();
+    blobs
+        .get_to(cid, &mut bytes)?
+        .ok_or_else(|| invalid(format!("{cid} is missing from the pool")))?;
+    // The input hash goes only into the trace's `depHash`, which Lake does
+    // not read here, so one decode serves every input naming the archive.
+    let archive = covalence_lean_ltar::unpack(&bytes, 0).map_err(|source| Error::Archive {
         cid: cid.to_string(),
         source,
     })?;
@@ -172,31 +225,48 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../ltar/tests/fixtures/module.ltar")
     }
 
+    /// Each file in `directory` with its modification time.
+    fn listing(directory: &Path) -> Vec<(String, std::time::SystemTime)> {
+        let mut files: Vec<_> = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let modified = entry.metadata().unwrap().modified().unwrap();
+                (entry.file_name().into_string().unwrap(), modified)
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
     #[test]
-    fn archives_become_their_outputs_in_the_artifact_directory() {
+    fn restores_place_each_artifact_once_and_never_rewrite_a_warm_cache() {
         let blobs = Blobs::new(MemoryKv::default().into_dyn(), "lake/test/cas");
-        let (cid, _) = blobs::hash_file(&fixture()).unwrap();
-        blobs.put_file(&cid, &fixture()).unwrap();
-        let name = "89abcdef01234567.ltar".to_owned();
+        let (archive, _) = blobs::hash_file(&fixture()).unwrap();
+        blobs.put_file(&archive, &fixture()).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let object = staging.path().join("object");
+        fs::write(&object, b"object code").unwrap();
+        let (code, _) = blobs::hash_file(&object).unwrap();
+        blobs.put_file(&code, &object).unwrap();
+        let ltar = "89abcdef01234567.ltar".to_owned();
+        let o = "0d9deac573f269f3.o".to_owned();
+        // Two inputs per output, as a union of publishers' maps has them.
+        let entry = |name: &String, cid| Entry {
+            output: format!("\"{name}\""),
+            artifacts: BTreeMap::from([(name.clone(), cid)]),
+        };
         let entries = BTreeMap::from([
-            (
-                "0123456789abcdef".to_owned(),
-                Entry {
-                    output: format!("\"{name}\""),
-                    artifacts: BTreeMap::from([(name, cid)]),
-                },
-            ),
-            (
-                "1123456789abcdef".to_owned(),
-                Entry {
-                    output: "\"0d9deac573f269f3\"".into(),
-                    artifacts: BTreeMap::new(),
-                },
-            ),
+            ("0123456789abcdef".to_owned(), entry(&ltar, archive)),
+            ("0123456789abcde0".to_owned(), entry(&ltar, archive)),
+            ("1123456789abcdef".to_owned(), entry(&o, code)),
+            ("1123456789abcde0".to_owned(), entry(&o, code)),
         ]);
         let artifacts = tempfile::tempdir().unwrap();
-        let rows = unpack(&blobs, artifacts.path(), &entries).unwrap();
-        assert_eq!(rows["1123456789abcdef"], "\"0d9deac573f269f3\"");
+        let rows = install(&blobs, artifacts.path(), &entries).unwrap();
+        assert_eq!(rows["1123456789abcdef"], format!("\"{o}\""));
+        assert_eq!(rows["1123456789abcde0"], format!("\"{o}\""));
+        assert_eq!(rows["0123456789abcdef"], rows["0123456789abcde0"]);
         let outputs: Value = serde_json::from_str(&rows["0123456789abcdef"]).unwrap();
         assert_eq!(
             outputs,
@@ -210,14 +280,12 @@ mod tests {
                 "c": "7777777777777777.c",
             })
         );
-        let mut saved: Vec<_> = fs::read_dir(artifacts.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        saved.sort();
+        let first = listing(artifacts.path());
+        let names: Vec<_> = first.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
-            saved,
+            names,
             [
+                "0d9deac573f269f3.o",
                 "1111111111111111.olean",
                 "2222222222222222.olean.server",
                 "3333333333333333.olean.private",
@@ -227,13 +295,16 @@ mod tests {
                 "7777777777777777.c",
             ]
         );
-        let c = artifacts.path().join("7777777777777777.c");
-        assert!(fs::metadata(&c).unwrap().permissions().readonly());
-        assert_eq!(
-            fs::read(&c).unwrap(),
-            b"// generated\nint main(void) { return 0; }\n"
-        );
-        // A second restore keeps the files it finds.
-        unpack(&blobs, artifacts.path(), &entries).unwrap();
+        for (name, _) in &first {
+            let path = artifacts.path().join(name);
+            assert!(
+                fs::metadata(&path).unwrap().permissions().readonly(),
+                "{name}"
+            );
+        }
+        assert_eq!(fs::read(artifacts.path().join(&o)).unwrap(), b"object code");
+        // A warm cache: the same restore again succeeds and writes nothing.
+        assert_eq!(install(&blobs, artifacts.path(), &entries).unwrap(), rows);
+        assert_eq!(listing(artifacts.path()), first);
     }
 }
