@@ -45,6 +45,9 @@ struct Pin {
     url: String,
     commit: String,
     destination: std::path::PathBuf,
+    /// The folder of the repository that holds the package, when not its
+    /// root, as in a monorepo.
+    sub_dir: Option<String>,
 }
 
 /// The manifest's Git dependencies from remote URLs. Lake clones local
@@ -78,12 +81,19 @@ fn pins(project: &Project) -> Result<Vec<Pin>> {
         if !mapping::hex(commit, 40) {
             return Err(invalid("Lake manifest pins a non-commit revision"));
         }
+        let sub_dir = package["subDir"].as_str().filter(|dir| !dir.is_empty());
+        if let Some(dir) = sub_dir
+            && dir.split('/').any(|part| matches!(part, "" | "." | ".."))
+        {
+            return Err(invalid("Lake manifest names an unsafe package subDir"));
+        }
         if url.contains("://") {
             pins.push(Pin {
                 name: name.to_owned(),
                 url: url.to_owned(),
                 commit: commit.to_owned(),
                 destination: packages.join(name),
+                sub_dir: sub_dir.map(str::to_owned),
             });
         }
     }
@@ -174,7 +184,14 @@ fn materialize_in(project: &Project, kv: &dyn Kv, cache: &Path) -> Result<()> {
             continue;
         }
         let mirror = mirrors.join(format!("{}.git", repository_of(&pin.url)?));
-        checkouts.push((pin.name, pin.url, pin.commit, pin.destination, mirror));
+        checkouts.push((
+            pin.name,
+            pin.url,
+            pin.commit,
+            pin.destination,
+            mirror,
+            pin.sub_dir,
+        ));
     }
     if checkouts.is_empty() {
         return Ok(());
@@ -183,7 +200,7 @@ fn materialize_in(project: &Project, kv: &dyn Kv, cache: &Path) -> Result<()> {
     // Several packages can share a mirror, so each mirror's fetches run one
     // at a time; different mirrors fetch at once.
     let mut by_mirror = BTreeMap::<&Path, BTreeMap<&str, &str>>::new();
-    for (_, url, commit, _, mirror) in &checkouts {
+    for (_, url, commit, _, mirror, _) in &checkouts {
         by_mirror
             .entry(mirror.as_path())
             .or_default()
@@ -208,9 +225,12 @@ fn materialize_in(project: &Project, kv: &dyn Kv, cache: &Path) -> Result<()> {
         .count();
     let mirrored = started.elapsed();
     // Checkouts write disjoint directories and only read their mirrors.
-    storage::parallel(&checkouts, |_, (name, url, commit, destination, mirror)| {
-        check_out(name, url, commit, destination, mirror)
-    })?;
+    storage::parallel(
+        &checkouts,
+        |_, (name, url, commit, destination, mirror, sub_dir)| {
+            check_out(name, url, commit, destination, mirror, sub_dir.as_deref())
+        },
+    )?;
     println!(
         "Lake cache: checked out {} Git dependencies in {:.1} s, after fetching {fetched} commits ({pooled} from the pool) into {} host mirrors in {:.1} s",
         checkouts.len(),
@@ -222,7 +242,14 @@ fn materialize_in(project: &Project, kv: &dyn Kv, cache: &Path) -> Result<()> {
 }
 
 /// Check out `commit` at `destination` from `mirror`, which holds it.
-fn check_out(name: &str, url: &str, commit: &str, destination: &Path, mirror: &Path) -> Result<()> {
+fn check_out(
+    name: &str,
+    url: &str,
+    commit: &str,
+    destination: &Path,
+    mirror: &Path,
+    sub_dir: Option<&str>,
+) -> Result<()> {
     // A repository borrowing the mirror's objects: no copy, no network.
     fs::create_dir_all(destination).operation("create Lake package directory")?;
     run("git init", git(destination).args(["init", "-q"]))?;
@@ -242,9 +269,25 @@ fn check_out(name: &str, url: &str, commit: &str, destination: &Path, mirror: &P
         "git remote",
         git(destination).args(["remote", "add", "origin", url]),
     )?;
+    // Lake reads a monorepo's package only from its folder, and checks the
+    // checkout against `HEAD` with `git diff`, which skips what a sparse
+    // checkout leaves out.
+    if let Some(sub_dir) = sub_dir {
+        run(
+            "git sparse-checkout",
+            git(destination).args(["sparse-checkout", "set", "--cone", sub_dir]),
+        )?;
+    }
     run(
         "git checkout",
-        git(destination).args(["checkout", "-q", "--detach", commit]),
+        git(destination).args([
+            "-c",
+            "checkout.workers=0",
+            "checkout",
+            "-q",
+            "--detach",
+            commit,
+        ]),
     )?;
     println!("Lake cache: checked out {name} at {commit} from the host mirror");
     Ok(())
