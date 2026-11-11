@@ -335,6 +335,157 @@ impl Sources {
     }
 }
 
+/// One `[[lean_lib]]` table of a `lakefile.toml`, as Lake reads its modules.
+struct Library {
+    name: String,
+    /// `roots`, else the library's name.
+    roots: Vec<String>,
+    /// `globs`, else one glob per root.
+    globs: Vec<String>,
+    /// `srcDir`, under the package directory.
+    source: PathBuf,
+}
+
+/// Whether glob `glob` matches `module`: `X.+` its strict submodules, `X.*`
+/// also `X`, and any other glob `X` alone.
+fn glob_matches(glob: &str, module: &str) -> bool {
+    let below = |prefix: &str| {
+        module
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('.'))
+    };
+    match (glob.strip_suffix(".+"), glob.strip_suffix(".*")) {
+        (Some(prefix), _) => below(prefix),
+        (_, Some(prefix)) => module == prefix || below(prefix),
+        _ => module == glob,
+    }
+}
+
+impl Library {
+    fn parse(config: &str, dir: &Path) -> Vec<Self> {
+        format!("\n{config}")
+            .split("\n[[")
+            .filter(|section| section.starts_with("lean_lib]]"))
+            .filter_map(|section| {
+                let name = setting(section, "name").into_iter().next()?;
+                let mut roots = setting(section, "roots");
+                if roots.is_empty() {
+                    roots.push(name.clone());
+                }
+                let mut globs = setting(section, "globs");
+                if globs.is_empty() {
+                    globs.clone_from(&roots);
+                }
+                let source = setting(section, "srcDir")
+                    .into_iter()
+                    .next()
+                    .map_or_else(|| dir.to_owned(), |sub| dir.join(sub));
+                Some(Self {
+                    name,
+                    roots,
+                    globs,
+                    source,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether Lake counts `module` as this library's own, as
+    /// `LeanLibConfig.isBuildableModule` does: a glob matches it, or a root
+    /// is a prefix of it and a glob matches that root.
+    fn claims(&self, module: &str) -> bool {
+        self.globs.iter().any(|glob| glob_matches(glob, module))
+            || self.roots.iter().any(|root| {
+                (module == root || glob_matches(&format!("{root}.+"), module))
+                    && self.globs.iter().any(|glob| glob_matches(glob, root))
+            })
+    }
+
+    /// The roots under which the library claims every module.
+    fn claimed_roots(&self) -> impl Iterator<Item = &String> {
+        self.roots
+            .iter()
+            .filter(|root| self.globs.iter().any(|glob| glob_matches(glob, root)))
+    }
+}
+
+/// Fails when a module belongs to more than one Lake library of its package.
+///
+/// A build that reaches such a module through each library uses whichever
+/// library's settings (its `needs`, its options) it reaches first, so the
+/// module's trace, and with it the input hash a cache is keyed by, differs
+/// between runs. The error names each module and its libraries. Only
+/// packages with a `lakefile.toml` on disk are checked.
+pub(crate) fn one_library(project: &Project, packages: &[Package]) -> Result<()> {
+    let sources = Sources { roots: Vec::new() };
+    let mut shared = Vec::new();
+    for package in packages {
+        let dir = project.root.join(&package.dir);
+        let config = match fs::read_to_string(dir.join("lakefile.toml")) {
+            Ok(config) => config,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(Error::Io {
+                    operation: format!("read {}", dir.join("lakefile.toml").display()),
+                    source,
+                });
+            }
+        };
+        let libraries = Library::parse(&config, &dir);
+        if libraries.len() < 2 {
+            continue;
+        }
+        // Every module a library lists, and every module under a root whose
+        // whole subtree a library claims.
+        let mut modules = BTreeSet::new();
+        for library in &libraries {
+            modules.extend(sources.target_modules(&config, &dir, &library.name));
+            for root in library.claimed_roots() {
+                modules.insert(root.clone());
+                let folder = library.source.join(root.replace('.', "/"));
+                for file in crate::project::files(&folder, "lean")? {
+                    let Some(module) =
+                        file.strip_prefix(&library.source)
+                            .ok()
+                            .and_then(|relative| {
+                                relative.with_extension("").to_str().map(str::to_owned)
+                            })
+                    else {
+                        continue;
+                    };
+                    modules.insert(module.replace('/', "."));
+                }
+            }
+        }
+        for module in modules {
+            let owners = libraries
+                .iter()
+                .filter(|library| library.claims(&module))
+                .map(|library| library.name.as_str())
+                .collect::<Vec<_>>();
+            if owners.len() > 1 {
+                shared.push(format!(
+                    "{module} (package {}): {}",
+                    package.name,
+                    owners.join(", ")
+                ));
+            }
+        }
+    }
+    if shared.is_empty() {
+        return Ok(());
+    }
+    let count = shared.len();
+    shared.truncate(20);
+    Err(crate::error::invalid(format!(
+        "{count} module(s) belong to more than one Lake library, so a build uses \
+         whichever library's settings it reaches first and their traces differ between \
+         runs; narrow the `roots` or `globs` so each module has one library \
+         (a library's default root, its name, claims every module under it):\n  {}",
+        shared.join("\n  ")
+    )))
+}
+
 /// The inputs to place before a targeted build, by package: each module of
 /// the `targets`' import closure that the index of the revision restored
 /// (`commit` for this repository's packages, its pin for a Git dependency)
@@ -610,6 +761,81 @@ mod tests {
                 "Std"
             ]
         );
+    }
+
+    fn workspace(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text) in files {
+            let path = dir.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        dir
+    }
+
+    fn check(dir: &tempfile::TempDir) -> Result<()> {
+        let project = Project {
+            root: dir.path().to_owned(),
+            repository: "example/demo".into(),
+            workspace: String::new(),
+            record: dir.path().join("record"),
+            lean: Default::default(),
+        };
+        let package = Package {
+            name: "demo".into(),
+            source: crate::project::Source::Repository,
+            dir: PathBuf::new(),
+        };
+        one_library(&project, &[package])
+    }
+
+    /// Erebor's shape: library `Demo` keeps its default root `Demo`, so it
+    /// claims `Formal`'s modules too.
+    const SHARED: &str = "name = \"demo\"\n[[lean_lib]]\nname = \"Formal\"\nroots = [\"Demo.Spec.Problem\"]\nglobs = [\"Demo.Spec.+\"]\n\n[[lean_lib]]\nname = \"Demo\"\nglobs = [\"Demo\", \"Demo.App.+\"]\nneeds = [\"records\"]\n";
+    const SOURCES: [(&str, &str); 4] = [
+        ("Demo.lean", "import Demo.App.Main\n"),
+        ("Demo/App/Main.lean", "import Demo.Spec.Problem\n"),
+        ("Demo/Spec/Problem.lean", "import Demo.Spec.Defs\n"),
+        ("Demo/Spec/Defs.lean", "-- leaf\n"),
+    ];
+
+    #[test]
+    fn a_module_two_libraries_claim_fails_naming_both() {
+        let mut files = SOURCES.to_vec();
+        files.push(("lakefile.toml", SHARED));
+        let message = check(&workspace(&files)).unwrap_err().to_string();
+        assert!(message.contains("2 module(s)"), "{message}");
+        assert!(
+            message.contains("Demo.Spec.Defs (package demo): Formal, Demo"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Demo.Spec.Problem (package demo): Formal, Demo"),
+            "{message}"
+        );
+        assert!(!message.contains("Demo.App.Main ("), "{message}");
+    }
+
+    #[test]
+    fn libraries_with_disjoint_roots_pass() {
+        let fixed = SHARED.replace(
+            "name = \"Demo\"\n",
+            "name = \"Demo\"\nroots = [\"Demo.App.Main\"]\n",
+        );
+        let mut files = SOURCES.to_vec();
+        files.push(("lakefile.toml", &fixed));
+        check(&workspace(&files)).unwrap();
+    }
+
+    #[test]
+    fn globs_match_lakes_forms() {
+        assert!(glob_matches("A.+", "A.B.C"));
+        assert!(!glob_matches("A.+", "A"));
+        assert!(glob_matches("A.*", "A"));
+        assert!(glob_matches("A.*", "A.B"));
+        assert!(!glob_matches("A.*", "AB.C"));
+        assert!(glob_matches("A", "A"));
+        assert!(!glob_matches("A", "A.B"));
     }
 
     #[test]

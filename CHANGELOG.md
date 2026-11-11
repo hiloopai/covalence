@@ -17,6 +17,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Changed
 
+- `cov-lake-cache build`, and `get` or `dependencies` with targets, fail when a
+  module belongs to more than one Lake library of its package, naming the
+  module and the libraries. Such a module's trace depended on which library a
+  build reached it through, so its cached build was missed in some runs.
 - Every `cov-lake-cache` command that runs Lake says which Lake the toolchain
   holds: the overlay for its Lean commit, or stock Lake and why.
 - `cov-lake-cache get`, `dependencies` and `build` install a missing Lean

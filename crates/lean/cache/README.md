@@ -64,6 +64,16 @@ the scope.
 
 ## Commands
 
+Before `build`, and before `get` or `dependencies` with targets, each
+command fails if a module belongs to more than one Lake library of a
+`lakefile.toml` package, and names each such module and its libraries. Lake
+counts a module as a library's own when a glob matches it, or when a root is
+a prefix of it and a glob matches that root, so a library's default root,
+its name, claims every module under it. A build reaches a shared module
+through either library and takes that library's `needs` and options, so the
+module's trace, and the input hash the cache is keyed by, differ between
+runs.
+
 - `build` runs `lake build --wfail` once on the given targets (pass every
   target CI builds, such as executables, so they are published), records the root package's outputs,
   then replays the build once per other package, path and Git

@@ -136,6 +136,13 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Ok::<_, error::Error>(kv)
     };
+    // A module that two Lake libraries claim gets a different trace from run
+    // to run, so no build or recording runs over one.
+    if matches!(cli.action, Action::Build)
+        || (!cli.targets.is_empty() && matches!(cli.action, Action::Get | Action::Dependencies))
+    {
+        modules::one_library(&project, &project.packages()?)?;
+    }
     std::thread::scope(|threads| {
         // The toolchain installs while the dependencies check out and the
         // seed downloads; Lake runs wait for it.
