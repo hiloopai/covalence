@@ -1466,6 +1466,19 @@ fn a_missing_toolchain_installs_from_its_release_then_from_the_pool() {
         fs::read(home.join("bin/leantar")).unwrap(),
         fs::read(tools.join("leantar")).unwrap()
     );
+    // A host that keeps Lake's cache keeps the archive too: it only unpacks it.
+    fs::remove_dir_all(&home).unwrap();
+    let start = fixture.server.reads.lock().unwrap().len();
+    let unpacked = log(&checked(cli("get").args(["--seed", "--", "Demo"])));
+    assert!(unpacked.contains("from this host's copy"), "{unpacked}");
+    let reads = fixture.server.reads.lock().unwrap()[start..].to_vec();
+    assert!(
+        reads
+            .iter()
+            .all(|path| !path.contains("/lake/toolchains/cas/")),
+        "{reads:?}"
+    );
+    assert!(home.join("bin/lake").is_file());
     // The receipt a build records names the scope the restore predicted.
     checked(cli("build").args(["--", "Demo"]));
     let rebuilt = log(&checked(&mut cli("put")));

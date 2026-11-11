@@ -40,7 +40,7 @@ use crate::{
     blobs::Blobs,
     error::{Error, IoResult, Result, encode, invalid, json},
     overlay,
-    project::{output, run},
+    project::{host_cache_dir, output, run},
     storage,
 };
 
@@ -183,6 +183,27 @@ fn curl(url: &str) -> Command {
         ])
         .arg(url);
     command
+}
+
+/// Where this host keeps the pool's archive `tar` of `release`, beside
+/// Lake's cache, so a host that keeps that cache only unpacks it.
+fn kept_archive(release: &Release, tar: &Sha256) -> Option<PathBuf> {
+    host_cache_dir().map(|cache| {
+        archives(&cache)
+            .join(release.directory())
+            .join(format!("{tar}.tar.zst"))
+    })
+}
+
+/// The folder of kept archives in the Lake cache `cache`, one subfolder per
+/// toolchain, named as elan names its directory.
+pub(crate) fn archives(cache: &Path) -> PathBuf {
+    cache.join("covalence").join("toolchains")
+}
+
+/// elan's directory name for the release `name` names, if it names one.
+pub(crate) fn elan_directory(name: &str) -> Option<String> {
+    Release::parse(name, Path::new("")).map(|release| release.directory().to_owned())
 }
 
 /// A release in the pool.
@@ -328,7 +349,41 @@ impl Lean {
                 match self.plan()? {
                     Plan::Present => {}
                     Plan::Pool(kv, record) => {
-                        let bytes = install(release, |directory| from_pool(kv, record, directory))?;
+                        let tar: Sha256 = record
+                            .tar
+                            .parse()
+                            .map_err(|_| invalid("invalid toolchain record CID"))?;
+                        let kept = kept_archive(release, &tar);
+                        let local = match kept.as_deref().filter(|path| path.is_file()) {
+                            Some(path) => {
+                                match install(release, |directory| from_kept(path, &tar, directory))
+                                {
+                                    Ok(bytes) => Some(bytes),
+                                    Err(error) => {
+                                        // A damaged copy is a miss: the pool's checked bytes replace it.
+                                        eprintln!(
+                                            "Lake cache: the kept Lean archive failed, so it comes from the pool again: {:?}",
+                                            covalence_lib_error::miette::Report::new(error)
+                                        );
+                                        fs::remove_file(path)
+                                            .operation(format!("remove {}", path.display()))?;
+                                        None
+                                    }
+                                }
+                            }
+                            None => None,
+                        };
+                        let source = if local.is_some() {
+                            "this host's copy"
+                        } else {
+                            "the pool"
+                        };
+                        let bytes = match local {
+                            Some(bytes) => bytes,
+                            None => install(release, |directory| {
+                                from_pool(kv, &tar, directory, kept.as_deref())
+                            })?,
+                        };
                         let version = output(
                             "Lean",
                             Command::new(release.home.join("bin/lean")).arg("--version"),
@@ -340,7 +395,7 @@ impl Lean {
                             )));
                         }
                         println!(
-                            "Lake cache: installed Lean {} from the pool ({:.1} GB unpacked) in {:.1} s",
+                            "Lake cache: installed Lean {} from {source} ({:.1} GB unpacked) in {:.1} s",
                             release.tag,
                             bytes as f64 / 1e9,
                             started.elapsed().as_secs_f64()
@@ -481,29 +536,71 @@ fn install<T>(release: &Release, fill: impl FnOnce(&Path) -> Result<T>) -> Resul
     }
 }
 
-/// Download, check and unpack the pool's archive into `directory`; the
-/// length of the tar it unpacked.
-fn from_pool(kv: &Arc<dyn Kv>, record: &Record, directory: &Path) -> Result<u64> {
-    let tar: Sha256 = record
-        .tar
-        .parse()
-        .map_err(|_| invalid("invalid toolchain record CID"))?;
-    let blobs = Blobs::new(kv.clone(), CAS);
+/// Unpack into `directory` the tar that `fetch` writes, once it checks it;
+/// the tar's length. `what` names the archive in errors.
+fn unpack_from(
+    what: &str,
+    directory: &Path,
+    fetch: impl FnOnce(&mut dyn Write) -> Result<Option<u64>>,
+) -> Result<u64> {
     let (reader, writer) = io::pipe().operation("open toolchain pipe")?;
     thread::scope(|scope| {
         let unpacking = scope.spawn(move || unpack(reader, directory));
-        let downloaded = {
+        let fetched = {
             let mut writer = writer;
-            blobs.get_to(&tar, &mut writer)
+            fetch(&mut writer)
         };
         let unpacked = unpacking.join().unwrap_or(Err(Error::Worker));
-        match (downloaded, unpacked) {
+        match (fetched, unpacked) {
             (Ok(Some(bytes)), Ok(())) => Ok(bytes),
-            (Ok(None), _) => Err(invalid(format!("the pool lacks Lean archive {tar}"))),
+            (Ok(None), _) => Err(invalid(format!("{what} is missing"))),
             // Either side failing breaks the other's stream; report both.
-            (Err(download), Err(unpack)) => Err(invalid(format!("{download}; {unpack}"))),
+            (Err(fetch), Err(unpack)) => Err(invalid(format!("{fetch}; {unpack}"))),
             (Err(error), Ok(())) | (Ok(Some(_)), Err(error)) => Err(error),
         }
+    })
+}
+
+/// Download, check and unpack the pool's archive `tar` into `directory`,
+/// keeping its bytes at `keep` once they check; the tar's length.
+fn from_pool(kv: &Arc<dyn Kv>, tar: &Sha256, directory: &Path, keep: Option<&Path>) -> Result<u64> {
+    let blobs = Blobs::new(kv.clone(), CAS);
+    let what = format!("the pool's Lean archive {tar}");
+    let Some(keep) = keep else {
+        return unpack_from(&what, directory, |writer| blobs.get_to(tar, writer));
+    };
+    let parent = keep
+        .parent()
+        .ok_or_else(|| invalid("the toolchain archive cache has no parent"))?;
+    fs::create_dir_all(parent).operation(format!("create {}", parent.display()))?;
+    let mut staged =
+        tempfile::NamedTempFile::new_in(parent).operation("stage Lean archive copy")?;
+    let bytes = unpack_from(&what, directory, |writer| {
+        blobs.get_keeping(tar, writer, staged.as_file_mut())
+    })?;
+    // One archive per toolchain: a record names one. Others' staged copies stay.
+    for (path, name) in crate::gc::children(parent)? {
+        if name.ends_with(".tar.zst") {
+            fs::remove_file(&path).operation(format!("remove {}", path.display()))?;
+        }
+    }
+    staged
+        .persist(keep)
+        .map_err(|e| e.error)
+        .operation(format!("keep {}", keep.display()))?;
+    Ok(bytes)
+}
+
+/// Check and unpack the archive `tar` this host kept at `path` into
+/// `directory`; the tar's length.
+fn from_kept(path: &Path, tar: &Sha256, directory: &Path) -> Result<u64> {
+    let mut file = File::open(path).operation(format!("open {}", path.display()))?;
+    unpack_from(&path.display().to_string(), directory, |writer| {
+        crate::blobs::decode_checked(tar, writer, |stored| {
+            io::copy(&mut file, stored)
+                .map(Some)
+                .operation(format!("read {}", path.display()))
+        })
     })
 }
 
@@ -688,23 +785,20 @@ mod tests {
             &work.path().join("elan/toolchains"),
         )
         .unwrap();
-        let record = Record {
-            url: "https://example.invalid/lean.tar.zst".into(),
-            tar: cid.to_string(),
-            version: "Lean (version 4)".into(),
-        };
         let left = || {
             fs::read_dir(release.home.parent().unwrap())
                 .unwrap()
                 .count()
         };
-        // A record naming an archive the pool lacks fails, and so do bytes
-        // that fail their check; neither leaves anything behind.
-        let missing = Record {
-            tar: Sha256::of(b"other").to_string(),
-            ..record
-        };
-        assert!(install(&release, |directory| from_pool(&kv, &missing, directory)).is_err());
+        // An archive the pool lacks fails, and so do bytes that fail their
+        // check; neither leaves anything behind.
+        let missing = Sha256::of(b"other");
+        assert!(
+            install(&release, |directory| from_pool(
+                &kv, &missing, directory, None
+            ))
+            .is_err()
+        );
         let digest = data_encoding::BASE32_NOPAD
             .encode(cid.digest())
             .to_ascii_lowercase();
@@ -721,19 +815,65 @@ mod tests {
             zstd::stream::encode_all(&corrupt[..], 19).unwrap().into(),
         )
         .unwrap();
-        let record = Record {
-            tar: cid.to_string(),
-            ..missing
-        };
-        assert!(install(&release, |directory| from_pool(&kv, &record, directory)).is_err());
+        assert!(install(&release, |directory| from_pool(&kv, &cid, directory, None)).is_err());
         assert!(!release.home.exists());
         assert_eq!(left(), 0, "a staging directory was left behind");
         kv.put(key.as_bytes(), fs::read(&archive).unwrap().into())
             .unwrap();
-        install(&release, |directory| from_pool(&kv, &record, directory)).unwrap();
+        install(&release, |directory| from_pool(&kv, &cid, directory, None)).unwrap();
         assert_eq!(fs::read(release.home.join("bin/lean")).unwrap(), b"lean");
         // A second install finds the first and keeps it.
-        install(&release, |directory| from_pool(&kv, &record, directory)).unwrap();
+        install(&release, |directory| from_pool(&kv, &cid, directory, None)).unwrap();
         assert_eq!(left(), 1);
+    }
+
+    #[test]
+    fn a_kept_archive_installs_without_the_pool_and_is_checked() {
+        let kv = MemoryKv::default().into_dyn();
+        let work = tempfile::tempdir().unwrap();
+        let archive = work.path().join("lean.tar.zst");
+        let frame = zstd::stream::encode_all(&fake_release()[..], 19).unwrap();
+        fs::write(&archive, &frame).unwrap();
+        let (cid, _) = Blobs::new(kv.clone(), CAS).put_frame(&archive).unwrap();
+        let release = Release::parse(
+            "leanprover/lean4:nightly-2026-11-05",
+            &work.path().join("elan/toolchains"),
+        )
+        .unwrap();
+        let kept = work
+            .path()
+            .join("cache/kept")
+            .join(format!("{cid}.tar.zst"));
+        fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        fs::write(kept.with_file_name("older.tar.zst"), "an older release").unwrap();
+        install(&release, |directory| {
+            from_pool(&kv, &cid, directory, Some(&kept))
+        })
+        .unwrap();
+        // The pool's bytes, kept as they are, and only that archive.
+        assert_eq!(fs::read(&kept).unwrap(), frame);
+        assert_eq!(fs::read_dir(kept.parent().unwrap()).unwrap().count(), 1);
+
+        fs::remove_dir_all(&release.home).unwrap();
+        install(&release, |directory| from_kept(&kept, &cid, directory)).unwrap();
+        assert_eq!(fs::read(release.home.join("bin/lean")).unwrap(), b"lean");
+
+        // A copy that decodes to other bytes fails its check and installs nothing.
+        fs::remove_dir_all(&release.home).unwrap();
+        let other = release_archive(&[(
+            "lean-4-linux/bin/lean",
+            tar::EntryType::Regular,
+            b"evil",
+            None,
+        )]);
+        fs::write(&kept, zstd::stream::encode_all(&other[..], 19).unwrap()).unwrap();
+        assert!(install(&release, |directory| from_kept(&kept, &cid, directory)).is_err());
+        assert!(!release.home.exists());
+        assert_eq!(
+            fs::read_dir(release.home.parent().unwrap())
+                .unwrap()
+                .count(),
+            0
+        );
     }
 }

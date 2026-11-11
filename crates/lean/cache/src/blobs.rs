@@ -162,29 +162,66 @@ impl Blobs {
     /// `None` if missing. Fails if they do not hash to `cid`; after a failure
     /// `writer` holds unchecked bytes, so discard them.
     pub fn get_to(&self, cid: &Sha256, writer: &mut dyn Write) -> Result<Option<u64>> {
-        let decoder = zstd::stream::raw::Decoder::new().operation("start artifact decoder")?;
-        let hashing = Hashing {
-            inner: writer,
-            hash: sha2::Sha256::new(),
-            bytes: 0,
-        };
-        let mut decoding = zstd::stream::zio::Writer::new(hashing, decoder);
-        let found = self
-            .kv
-            .get_to(self.key(cid).as_bytes(), &mut decoding)
-            .map_err(store_error(format!("download {cid}")))?;
-        if found.is_none() {
-            return Ok(None);
-        }
-        decoding
-            .finish()
-            .operation("finish artifact decompression")?;
-        let hashing = decoding.into_inner().0;
-        if cid != &self::cid(&hashing.hash.finalize())? {
-            return Err(invalid(format!("artifact {cid} failed its hash check")));
-        }
-        Ok(Some(hashing.bytes))
+        decode_checked(cid, writer, |stored| {
+            self.kv
+                .get_to(self.key(cid).as_bytes(), stored)
+                .map_err(store_error(format!("download {cid}")))
+        })
     }
+
+    /// As [`Blobs::get_to`], also writing the stored Zstandard bytes to
+    /// `kept`, unchecked until this returns.
+    pub fn get_keeping(
+        &self,
+        cid: &Sha256,
+        writer: &mut dyn Write,
+        kept: &mut dyn Write,
+    ) -> Result<Option<u64>> {
+        decode_checked(cid, writer, |stored| {
+            self.kv
+                .get_to(self.key(cid).as_bytes(), &mut Tee(kept, stored))
+                .map_err(store_error(format!("download {cid}")))
+        })
+    }
+}
+
+/// A writer that passes everything to both of its writers.
+struct Tee<'a>(&'a mut dyn Write, &'a mut dyn Write);
+
+impl Write for Tee<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.write_all(bytes)?;
+        self.1.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()?;
+        self.1.flush()
+    }
+}
+
+/// Write what the Zstandard stream `feed` writes decodes to into `writer`,
+/// and return its length, or `None` if `feed` finds no stream. Fails unless
+/// it hashes to `cid`; after a failure `writer` holds unchecked bytes.
+pub(crate) fn decode_checked(
+    cid: &Sha256,
+    writer: &mut dyn Write,
+    feed: impl FnOnce(&mut dyn Write) -> Result<Option<u64>>,
+) -> Result<Option<u64>> {
+    let decoder = zstd::stream::raw::Decoder::new().operation("start artifact decoder")?;
+    let hashing = Hashing::new(writer);
+    let mut decoding = zstd::stream::zio::Writer::new(hashing, decoder);
+    if feed(&mut decoding)?.is_none() {
+        return Ok(None);
+    }
+    decoding
+        .finish()
+        .operation("finish artifact decompression")?;
+    let (_, digest, bytes) = decoding.into_inner().0.finish();
+    if cid != &self::cid(&digest)? {
+        return Err(invalid(format!("artifact {cid} failed its hash check")));
+    }
+    Ok(Some(bytes))
 }
 
 #[cfg(test)]

@@ -33,6 +33,10 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
   Lean, and no longer installs `leantar` itself, so update the action and the
   binary together. Keep `ELAN_HOME` on local disk, not on a lazily loaded
   sticky disk. `LAKE` still runs that Lake as found.
+- A host keeps the toolchain archive it took from the pool beside Lake's
+  cache, so when its Lake cache persists (a sticky disk, a developer machine, a
+  prove worker) the next install only unpacks it, checked as a pool read is.
+  `gc` deletes the archives of toolchains no kept scope uses.
 
 ### Fixed
 

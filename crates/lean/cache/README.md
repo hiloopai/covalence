@@ -230,9 +230,18 @@ arrives; once it has, its `lean --version` must match the record. The pool
 holds the release's bytes only: the bundled `leantar` and the Lake overlay
 are installed into the unpacked toolchain on each host.
 
-Install the toolchain on the runner's local disk. A toolchain on lazily
+A host keeps each pool archive it installs beside Lake's cache, at
+`covalence/toolchains/<elan's name>/<tar CID>.tar.zst`, one per toolchain.
+When the toolchain directory is missing but that copy is there, as on a
+runner whose Lake cache sits on a sticky disk, the toolchain is only unpacked
+from it, with the same check; a copy that fails it is reported, deleted and
+fetched from the pool again. `gc` deletes the copies of toolchains no kept
+scope uses.
+
+Install the toolchain itself on the runner's local disk. A toolchain on lazily
 loaded network storage, such as a Blacksmith sticky disk, costs seconds on its
-first reads inside Lake; keep `ELAN_HOME` off it.
+first reads inside Lake; keep `ELAN_HOME` off it. One archive read in order
+costs far less there than thousands of files.
 
 ## Host-wide local layer
 

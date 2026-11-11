@@ -12,7 +12,9 @@
 //! - the artifacts those records and entries name that no remaining record
 //!   and no kept map or snapshot names;
 //! - their installed roots, their snapshots' markers and mappings, and their
-//!   use records.
+//!   use records;
+//! - the Lean release archives kept for toolchains none of the kept scopes
+//!   uses (`covalence/toolchains/<elan's name>/`).
 //!
 //! Records of local builds belong to no map, so they and their artifacts
 //! stay. Every other command holds the cache lock shared while it runs, and
@@ -198,7 +200,7 @@ impl Reach {
 }
 
 /// The entries of `directory` with their names; none if it is missing.
-fn children(directory: &Path) -> Result<Vec<(PathBuf, String)>> {
+pub(crate) fn children(directory: &Path) -> Result<Vec<(PathBuf, String)>> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -389,6 +391,19 @@ fn sweep(directory: &Path, cutoff: SystemTime) -> Result<Option<Report>> {
         snapshots(directory)?.into_iter().partition(|snapshot| {
             unknown || snapshot.used >= cutoff || toolchains.contains(&snapshot.toolchain)
         });
+
+    // Kept Lean archives of toolchains no kept scope uses.
+    if !unknown {
+        let wanted = toolchains
+            .iter()
+            .filter_map(|toolchain| crate::toolchain::elan_directory(toolchain))
+            .collect::<BTreeSet<_>>();
+        for (path, name) in children(&crate::toolchain::archives(directory))? {
+            if !wanted.contains(&name) {
+                remove_dir(&path)?;
+            }
+        }
+    }
 
     let mut keep = Reach::default();
     for scope in kept.keys() {
@@ -690,6 +705,21 @@ mod tests {
         );
         assert!(cache.has("artifacts/000000000000000c.olean"));
         assert!(!cache.has("artifacts/000000000000000a.olean"));
+    }
+
+    #[test]
+    fn kept_lean_archives_go_with_their_toolchains() {
+        let cache = Cache::new();
+        cache.scope(OLD, OLD_TOOLCHAIN, 30, &[]);
+        cache.scope(NEW, NEW_TOOLCHAIN, 1, &[]);
+        for name in ["leanprover--lean4---v4.1.0", "leanprover--lean4---v4.2.0"] {
+            let kept = cache.path.join("covalence/toolchains").join(name);
+            fs::create_dir_all(&kept).unwrap();
+            fs::write(kept.join("archive.tar.zst"), name).unwrap();
+        }
+        sweep(&cache.path, cutoff()).unwrap().unwrap();
+        assert!(!cache.has("covalence/toolchains/leanprover--lean4---v4.1.0"));
+        assert!(cache.has("covalence/toolchains/leanprover--lean4---v4.2.0/archive.tar.zst"));
     }
 
     #[test]
