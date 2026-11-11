@@ -499,36 +499,175 @@ pub(crate) struct Staged {
 }
 
 /// Write one tar stream's members under `directory`.
-fn unpack(reader: impl Read, directory: &Path) -> Result<usize> {
+/// Unpack a chunk: each artifact straight into Lake's `artifacts` folder,
+/// unless it holds it already, and each output file into `directory`, which
+/// [`Staged::install`] moves into place once upstream mappings are in. Every
+/// artifact it adds goes into `added`, so a chunk that fails its check can
+/// take them back.
+fn unpack(
+    reader: impl Read,
+    directory: &Path,
+    artifacts: &Path,
+    added: &mut Vec<PathBuf>,
+) -> Result<usize> {
     let mut archive = tar::Archive::new(reader);
     let mut files = 0;
+    let folder = Folder::open(artifacts)?;
     for entry in archive.entries().operation("read seed chunk")? {
         let mut entry = entry.operation("read seed entry")?;
         let path = entry.path().operation("read seed entry path")?;
-        let Some(name) = path.to_str().filter(|name| member(name)) else {
+        let Some(name) = path.to_str().filter(|name| member(name)).map(str::to_owned) else {
             return Err(invalid("seed holds an unexpected path"));
         };
         if entry.header().entry_type() != tar::EntryType::Regular {
             return Err(invalid("seed holds a non-file entry"));
         }
-        let destination = directory.join(name);
+        files += 1;
+        if let Some(artifact) = name.strip_prefix("artifacts/") {
+            if folder.add(artifact, &mut entry)? {
+                added.push(artifacts.join(artifact));
+            }
+            continue;
+        }
+        let destination = directory.join(&name);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).operation("create seed directory")?;
         }
         let mut file = File::create_new(&destination).operation("create seed file")?;
         io::copy(&mut entry, &mut file).operation("write seed file")?;
-        files += 1;
     }
     // Read the archive's padding too, so the writer never meets a closed pipe.
     io::copy(&mut archive.into_inner(), &mut io::sink()).operation("read seed chunk")?;
     Ok(files)
 }
 
-/// Download, check and unpack one chunk into `directory`.
-fn fetch_chunk(kv: &dyn Kv, key: &str, chunk: &Chunk, directory: &Path) -> Result<usize> {
+/// Lake's flat artifact folder. Creating a file there takes the folder's
+/// lock for the whole create, so creates run one at a time however many
+/// threads ask (11–13 s for 200k files on a prove node); naming a file that
+/// already has its bytes, by one link, takes it for much less. On Linux each
+/// artifact is written to an unnamed file first, then linked in whole.
+struct Folder<'a> {
+    path: &'a Path,
+    #[cfg(target_os = "linux")]
+    handle: rustix::fd::OwnedFd,
+}
+
+impl<'a> Folder<'a> {
+    fn open(path: &'a Path) -> Result<Self> {
+        fs::create_dir_all(path).operation("create Lake artifact directory")?;
+        Ok(Self {
+            path,
+            #[cfg(target_os = "linux")]
+            handle: rustix::fs::open(
+                path,
+                rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(io::Error::from)
+            .operation("open Lake artifact directory")?,
+        })
+    }
+
+    /// Add `name` with the bytes of `reader`, unless the folder holds it;
+    /// whether it was added. A name always appears with its whole contents.
+    fn add(&self, name: &str, reader: &mut impl Read) -> Result<bool> {
+        if self.path.join(name).exists() {
+            io::copy(reader, &mut io::sink()).operation("skip seed artifact")?;
+            return Ok(false);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{AtFlags, CWD, Mode, OFlags, linkat, openat};
+            use std::os::fd::AsRawFd;
+            match openat(
+                &self.handle,
+                ".",
+                OFlags::TMPFILE | OFlags::WRONLY | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o444),
+            ) {
+                Ok(handle) => {
+                    let mut file = File::from(handle);
+                    io::copy(reader, &mut file).operation("write seed artifact")?;
+                    let unnamed = format!("/proc/self/fd/{}", file.as_raw_fd());
+                    return match linkat(
+                        CWD,
+                        unnamed.as_str(),
+                        &self.handle,
+                        name,
+                        AtFlags::SYMLINK_FOLLOW,
+                    ) {
+                        Ok(()) => Ok(true),
+                        Err(rustix::io::Errno::EXIST) => Ok(false),
+                        Err(error) => Err(io::Error::from(error)).operation("name seed artifact"),
+                    };
+                }
+                // A file system without unnamed files takes the portable way.
+                Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::ISDIR) => {}
+                Err(error) => {
+                    return Err(io::Error::from(error)).operation("create seed artifact");
+                }
+            }
+        }
+        let mut pending =
+            tempfile::NamedTempFile::new_in(self.path).operation("stage seed artifact")?;
+        io::copy(reader, &mut pending).operation("write seed artifact")?;
+        let mut permissions = pending
+            .as_file()
+            .metadata()
+            .operation("read seed artifact permissions")?
+            .permissions();
+        permissions.set_readonly(true);
+        pending
+            .as_file()
+            .set_permissions(permissions)
+            .operation("mark seed artifact read-only")?;
+        match pending.persist_noclobber(self.path.join(name)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error.error).operation("name seed artifact"),
+        }
+    }
+}
+
+/// Download, check and unpack one chunk: its artifacts into `artifacts`,
+/// the rest into `directory`. A chunk that fails takes its artifacts back.
+fn fetch_chunk(
+    kv: &dyn Kv,
+    key: &str,
+    chunk: &Chunk,
+    directory: &Path,
+    artifacts: &Path,
+) -> Result<usize> {
+    let mut added = Vec::new();
+    let result = fetch_checked(kv, key, chunk, directory, artifacts, &mut added);
+    if result.is_err() {
+        for path in &added {
+            if let Err(error) = fs::remove_file(path) {
+                eprintln!(
+                    "Lake cache: could not take back {} of a failed seed chunk: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+    result
+}
+
+fn fetch_checked(
+    kv: &dyn Kv,
+    key: &str,
+    chunk: &Chunk,
+    directory: &Path,
+    artifacts: &Path,
+    added: &mut Vec<PathBuf>,
+) -> Result<usize> {
     let (reader, writer) = io::pipe().operation("open seed pipe")?;
     thread::scope(|scope| {
-        let unpacking = scope.spawn(move || unpack(reader, directory));
+        let unpacking = scope.spawn(move || {
+            let mut added = Vec::new();
+            let result = unpack(reader, directory, artifacts, &mut added);
+            (added, result)
+        });
         let downloaded = (|| {
             let decoder = zstd::stream::write::Decoder::new(writer).operation("start Zstandard")?;
             let mut hashing = Hashing::new(decoder);
@@ -539,7 +678,13 @@ fn fetch_chunk(kv: &dyn Kv, key: &str, chunk: &Chunk, directory: &Path) -> Resul
             decoder.flush().operation("finish seed chunk")?;
             Ok::<_, Error>((found, sha256, bytes))
         })();
-        let unpacked = unpacking.join().unwrap_or(Err(Error::Worker));
+        let unpacked = match unpacking.join() {
+            Ok((mine, result)) => {
+                added.extend(mine);
+                result
+            }
+            Err(_) => Err(Error::Worker),
+        };
         let (found, sha256, bytes) = match (downloaded, &unpacked) {
             (Ok(downloaded), _) => downloaded,
             // Either side failing breaks the other's stream; report both.
@@ -636,7 +781,8 @@ pub(crate) fn find(
 }
 
 impl Remote {
-    /// Download and unpack the seed beside Lake's cache in `cache`.
+    /// Download the seed, its artifacts straight into Lake's cache in `cache`
+    /// and its output files beside it.
     pub fn fetch(
         &self,
         kv: &dyn Kv,
@@ -655,6 +801,7 @@ impl Remote {
                 &format!("{prefix}/{index}.tar.zst"),
                 chunk,
                 directory.path(),
+                &cache.join("artifacts"),
             )
         })?;
         let revisions = if self.upstream.is_empty() {
@@ -685,8 +832,8 @@ impl Remote {
 }
 
 impl Staged {
-    /// Move the seed into Lake's cache: the artifacts it lacks, then every
-    /// output file. Returns the inputs it mapped.
+    /// Move the seed's output files into Lake's cache, after the artifacts
+    /// they name. Returns the inputs it mapped.
     pub fn install(self, cache: &Path) -> Result<Seeded> {
         let started = Instant::now();
         for (relative, text) in &self.revisions {
@@ -710,42 +857,38 @@ impl Staged {
             }
         }
         let mut seeded = Seeded::new();
-        let mut moved = 0;
-        for kind in ["artifacts", "outputs"] {
-            let source = self.directory.path().join(kind);
-            if !source.exists() {
-                continue;
+        let source = self.directory.path().join("outputs");
+        let outputs = if source.exists() {
+            walk(&source)?
+        } else {
+            Vec::new()
+        };
+        for from in &outputs {
+            let relative = from
+                .strip_prefix(&source)
+                .map_err(|_| invalid("seed file outside its directory"))?;
+            let (Some(package), Some(input)) = (
+                relative.parent().and_then(Path::to_str),
+                relative.file_stem().and_then(|stem| stem.to_str()),
+            ) else {
+                return Err(invalid("seed output file outside a package"));
+            };
+            seeded
+                .entry(package.to_owned())
+                .or_default()
+                .insert(input.to_owned());
+            let to = cache.join("outputs").join(relative);
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent).operation("create Lake cache directory")?;
             }
-            for from in walk(&source)? {
-                let relative = from
-                    .strip_prefix(&source)
-                    .map_err(|_| invalid("seed file outside its directory"))?;
-                let to = cache.join(kind).join(relative);
-                if kind == "outputs"
-                    && let (Some(package), Some(input)) = (
-                        relative.parent().and_then(Path::to_str),
-                        relative.file_stem().and_then(|stem| stem.to_str()),
-                    )
-                {
-                    seeded
-                        .entry(package.to_owned())
-                        .or_default()
-                        .insert(input.to_owned());
-                } else if to.exists() {
-                    continue;
-                }
-                if let Some(parent) = to.parent() {
-                    fs::create_dir_all(parent).operation("create Lake cache directory")?;
-                }
-                fs::rename(&from, &to).operation("install seed file")?;
-                moved += 1;
-            }
+            fs::rename(from, &to).operation("install seed file")?;
         }
         println!(
-            "Lake cache: seeded {moved} of {} files ({:.1} GB) in {:.1} s, installed in {:.1} s",
+            "Lake cache: seeded {} files ({:.1} GB) in {:.1} s, installed {} output files in {:.1} s",
             self.files,
             self.bytes as f64 / 1e9,
             self.seconds,
+            outputs.len(),
             started.elapsed().as_secs_f64(),
         );
         Ok(seeded)
@@ -1157,6 +1300,28 @@ mod tests {
         .install(host.path())
         .unwrap();
         assert_eq!(seeded["p"].len(), 2);
+    }
+
+    #[test]
+    fn artifacts_appear_whole_once_and_read_only() {
+        let cache = tempfile::tempdir().unwrap();
+        let artifacts = cache.path().join("artifacts");
+        let folder = Folder::open(&artifacts).unwrap();
+        assert!(
+            folder
+                .add("00000000000000aa.olean", &mut &b"first"[..])
+                .unwrap()
+        );
+        // A folder that holds a name keeps its bytes.
+        assert!(
+            !folder
+                .add("00000000000000aa.olean", &mut &b"second"[..])
+                .unwrap()
+        );
+        let path = artifacts.join("00000000000000aa.olean");
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert!(fs::metadata(&path).unwrap().permissions().readonly());
+        assert_eq!(fs::read_dir(&artifacts).unwrap().count(), 1);
     }
 
     #[test]
