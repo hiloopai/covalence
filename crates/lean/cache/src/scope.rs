@@ -460,6 +460,7 @@ mod tests {
             root,
             repository: "example/demo".into(),
             workspace: String::new(),
+            lean: Default::default(),
         };
         let excludes: Vec<String> = excludes.iter().map(|e| (*e).to_owned()).collect();
         let targets: Vec<String> = ["Demo", "Self", "tool"].map(String::from).into();
@@ -543,6 +544,7 @@ mod tests {
             root,
             repository: "example/demo".into(),
             workspace: String::new(),
+            lean: Default::default(),
         };
         assert!(scope(&project, "HEAD", &[], &["--wfail".into()]).is_err());
         assert!(scope(&project, "HEAD", &[], &[]).is_err());

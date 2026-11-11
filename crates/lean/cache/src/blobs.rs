@@ -136,6 +136,28 @@ impl Blobs {
         Ok(())
     }
 
+    /// Store the Zstandard stream at `path` byte for byte, under the CID of
+    /// the bytes it decodes to, and return that CID and the stream's length.
+    /// Existing blocks are kept.
+    pub fn put_frame(&self, path: &Path) -> Result<(Sha256, u64)> {
+        let mut input = File::open(path).operation(format!("open {}", path.display()))?;
+        let mut decoder =
+            zstd::stream::read::Decoder::new(&mut input).operation("start Zstandard")?;
+        let mut hashing = Hashing::new(io::sink());
+        io::copy(&mut decoder, &mut hashing).operation("decode Zstandard stream")?;
+        let (_, digest, _) = hashing.finish();
+        let cid = self::cid(&digest)?;
+        let len = input
+            .metadata()
+            .operation("measure Zstandard stream")?
+            .len();
+        input.rewind().operation("rewind Zstandard stream")?;
+        self.kv
+            .put_new_from(self.key(&cid).as_bytes(), &mut input, len)
+            .map_err(store_error(format!("upload {cid}")))?;
+        Ok((cid, len))
+    }
+
     /// Write the bytes of `cid` to `writer` and return their length, or
     /// `None` if missing. Fails if they do not hash to `cid`; after a failure
     /// `writer` holds unchecked bytes, so discard them.
@@ -199,5 +221,29 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn a_stored_frame_keeps_its_bytes_and_reads_back_decoded() {
+        let kv = MemoryKv::default().into_dyn();
+        let blobs = Blobs::new(kv.clone(), "lake/toolchains/cas");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("release.tar.zst");
+        let bytes = b"tar bytes ".repeat(10_000);
+        let frame = zstd::stream::encode_all(bytes.as_slice(), 19).unwrap();
+        std::fs::write(&path, &frame).unwrap();
+        let (cid, len) = blobs.put_frame(&path).unwrap();
+        assert_eq!(cid, Sha256::of(&bytes));
+        assert_eq!(len, frame.len() as u64);
+        assert_eq!(
+            &kv.get(blobs.key(&cid).as_bytes()).unwrap().unwrap()[..],
+            &frame
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            blobs.get_to(&cid, &mut out).unwrap(),
+            Some(bytes.len() as u64)
+        );
+        assert_eq!(out, bytes);
     }
 }

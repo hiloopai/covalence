@@ -15,6 +15,29 @@ fn toolchain() -> String {
     std::env::var("LAKE_TEST_TOOLCHAIN")
         .unwrap_or_else(|_| "leanprover/lean4:nightly-2026-10-30".into())
 }
+/// elan's directory name for `toolchain()`, under `toolchains/`.
+fn elan_directory() -> String {
+    let toolchain = toolchain();
+    let (origin, tag) = toolchain.split_once(':').unwrap();
+    let origin = if tag.starts_with("nightly-") {
+        format!("{origin}-nightly")
+    } else {
+        origin.to_owned()
+    };
+    format!("{}---{tag}", origin.replace('/', "--"))
+}
+
+/// The prefix of the toolchain on `PATH`.
+fn path_toolchain() -> PathBuf {
+    static PREFIX: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PREFIX
+        .get_or_init(|| {
+            let output = checked(Command::new("lean").arg("--print-prefix"));
+            PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+        })
+        .clone()
+}
+
 // s3s-fs base64-encodes the entire key in one metadata filename (NAME_MAX=255).
 const REPOSITORY: &str = "t/p";
 
@@ -63,6 +86,7 @@ impl Fixture {
         )
         .unwrap();
         checked(Command::new("git").args(["init", "-q"]).arg(&root));
+        fs::write(temporary.path().join("github-path"), "").unwrap();
         let server = Server::new(&temporary.path().join("s3"));
         let fixture = Self {
             temporary,
@@ -78,6 +102,11 @@ impl Fixture {
         command
             .current_dir(&self.root)
             .env("ELAN_TOOLCHAIN", toolchain())
+            // The toolchain on `PATH`, which no test installs or publishes but
+            // the one that removes `LAKE`.
+            .env("LAKE", path_toolchain().join("bin/lake"))
+            .env("ELAN_HOME", self.temporary.path().join("elan"))
+            .env("GITHUB_PATH", self.temporary.path().join("github-path"))
             .env("LAKE_CACHE_DIR", self.temporary.path().join("cache"))
             .env("LAKE_ARTIFACT_CACHE", "true")
             .env("AWS_REGION", "us-east-1")
@@ -1300,4 +1329,111 @@ fn a_dependency_the_pool_already_maps_is_recorded_without_a_replay() {
         rows(&replayed)
     );
     checked(&mut fixture.cli("put"));
+}
+
+/// `PATH` without any directory holding `lean` or `lake`.
+fn path_without_lean() -> std::ffi::OsString {
+    let path = std::env::var_os("PATH").unwrap();
+    std::env::join_paths(
+        std::env::split_paths(&path).filter(|directory| {
+            !directory.join("lean").exists() && !directory.join("lake").exists()
+        }),
+    )
+    .unwrap()
+}
+
+/// A missing toolchain installs from its release, then, once `put` has
+/// published it, from the pool while the seed downloads; Lake runs from it
+/// without any Lean on `PATH`, with the bundled `leantar` and overlay.
+#[cfg(unix)]
+#[test]
+fn a_missing_toolchain_installs_from_its_release_then_from_the_pool() {
+    let fixture = Fixture::new();
+    // The release archive's layout: the command, its `leantar` and overlays.
+    let tools = fixture.temporary.path().join("tools");
+    fs::create_dir_all(&tools).unwrap();
+    let command = tools.join("cov-lake-cache");
+    fs::copy(env!("CARGO_BIN_EXE_cov-lake-cache"), &command).unwrap();
+    fs::copy(path_toolchain().join("bin/leantar"), tools.join("leantar")).unwrap();
+    let overlays = Path::new(env!("CARGO_BIN_EXE_cov-lake-cache")).with_file_name("lake-overlay");
+    if overlays.is_dir() {
+        std::os::unix::fs::symlink(&overlays, tools.join("lake-overlay")).unwrap();
+    }
+    let home = fixture
+        .temporary
+        .path()
+        .join("elan/toolchains")
+        .join(elan_directory());
+    let cli = |action: &str| {
+        let mut cmd = Command::new(&command);
+        fixture.env(&mut cmd);
+        cmd.env_remove("LAKE")
+            .env("PATH", path_without_lean())
+            .args([action, "--repository", REPOSITORY]);
+        cmd
+    };
+
+    let missed = log(&checked(&mut cli("get")));
+    assert!(missed.contains("from https://"), "{missed}");
+    assert!(missed.contains("no published build"), "{missed}");
+    assert!(!home.is_symlink() && home.join("bin/lake").is_file());
+    assert_eq!(
+        fs::read(home.join("bin/leantar")).unwrap(),
+        fs::read(tools.join("leantar")).unwrap()
+    );
+    if overlays.is_dir() {
+        assert!(missed.contains("Lake overlay for Lean"), "{missed}");
+    }
+    assert_eq!(
+        fs::read_to_string(fixture.temporary.path().join("github-path")).unwrap(),
+        format!("{}\n", home.join("bin").display())
+    );
+    checked(cli("build").args(["--", "Demo"]));
+    let published = log(&checked(&mut cli("put")));
+    assert!(published.contains("published Lean"), "{published}");
+    let key = format!(
+        "lake/toolchains/{}-{}/{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        elan_directory()
+    );
+    let record: Value = serde_json::from_slice(
+        &fs::read(fixture.temporary.path().join("s3/bucket").join(&key)).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        record["url"].as_str().unwrap().starts_with("https://"),
+        "{record}"
+    );
+    // Published once.
+    let again = log(&checked(&mut cli("put")));
+    assert!(!again.contains("published Lean"), "{again}");
+
+    // A fresh host: no toolchain, no cache.
+    fs::remove_dir_all(&home).unwrap();
+    fixture.reset_local();
+    let start = fixture.server.reads.lock().unwrap().len();
+    let restored = log(&checked(cli("get").args(["--seed", "--", "Demo"])));
+    assert!(restored.contains("from the pool"), "{restored}");
+    assert!(
+        restored.contains(&format!("restoring {}", fixture.revision())),
+        "the scope named before the toolchain arrived missed the build: {restored}"
+    );
+    assert!(restored.contains("Lake cache: seeded"), "{restored}");
+    assert!(!restored.contains("Built Demo"), "rebuilt: {restored}");
+    let reads = fixture.server.reads.lock().unwrap()[start..].to_vec();
+    assert!(
+        reads
+            .iter()
+            .any(|path| path.contains("/lake/toolchains/cas/sha2-256/")),
+        "{reads:?}"
+    );
+    assert_eq!(
+        fs::read(home.join("bin/leantar")).unwrap(),
+        fs::read(tools.join("leantar")).unwrap()
+    );
+    // The receipt a build records names the scope the restore predicted.
+    checked(cli("build").args(["--", "Demo"]));
+    let rebuilt = log(&checked(&mut cli("put")));
+    assert!(!rebuilt.contains("published Lean"), "{rebuilt}");
 }

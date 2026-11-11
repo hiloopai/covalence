@@ -22,15 +22,15 @@ use std::{
 
 use crate::{
     error::{IoResult, Result, invalid},
-    project::{Project, output},
+    project::output,
 };
 
 const STOCK: &str = "lib/lean/.lake-overlay-stock";
 const LOCK: &str = "lib/lean/.lake-overlay.lock";
 
-/// Install the bundled overlay for the project's toolchain, or with
+/// Install the bundled overlay into the toolchain at `sysroot`, or with
 /// `LAKE_POOL_STOCK_LAKE=1` restore the toolchain's own Lake.
-pub(crate) fn apply(project: &Project) -> Result<()> {
+pub(crate) fn apply(sysroot: &Path) -> Result<()> {
     let stock = env::var_os("LAKE_POOL_STOCK_LAKE").is_some_and(|value| value == "1");
     let overlays = env::current_exe()
         .operation("locate cov-lake-cache")?
@@ -39,19 +39,8 @@ pub(crate) fn apply(project: &Project) -> Result<()> {
         eprintln!("Lake cache: stock Lake (this cov-lake-cache bundles no overlay)");
         return Ok(());
     }
-    // Elan selects the toolchain from the project's cwd; an empty Lake
-    // directory avoids loading the workspace.
-    let empty = tempfile::tempdir().operation("create toolchain query directory")?;
-    let sysroot = PathBuf::from(output(
-        "Lean",
-        project
-            .lake()
-            .arg("--dir")
-            .arg(empty.path())
-            .args(["env", "lean", "--print-prefix"]),
-    )?);
     if stock {
-        restore(&sysroot)?;
+        restore(sysroot)?;
         eprintln!("Lake cache: stock Lake (LAKE_POOL_STOCK_LAKE=1)");
         return Ok(());
     }
@@ -64,7 +53,7 @@ pub(crate) fn apply(project: &Project) -> Result<()> {
         eprintln!("Lake cache: stock Lake (no overlay for Lean {githash})");
         return Ok(());
     }
-    install(&overlay, &sysroot)?;
+    install(&overlay, sysroot)?;
     eprintln!(
         "Lake cache: Lake overlay for Lean {githash} in {}",
         sysroot.display()
@@ -161,7 +150,7 @@ fn collect(root: &Path, relative: &Path, files: &mut Vec<PathBuf>) -> Result<()>
     Ok(())
 }
 
-fn same(a: &Path, b: &Path) -> Result<bool> {
+pub(crate) fn same(a: &Path, b: &Path) -> Result<bool> {
     let b_bytes = match fs::read(b) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -172,7 +161,7 @@ fn same(a: &Path, b: &Path) -> Result<bool> {
 
 /// Write `source`'s bytes and mode to `target` in one rename, so a Lake that
 /// is running or starting sees the old file or the new one, never a part.
-fn replace(source: &Path, target: &Path) -> Result<()> {
+pub(crate) fn replace(source: &Path, target: &Path) -> Result<()> {
     let parent = target
         .parent()
         .ok_or_else(|| invalid(format!("{} has no parent", target.display())))?;

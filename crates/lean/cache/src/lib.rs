@@ -19,6 +19,7 @@ mod seed;
 mod sources;
 mod sources_tree;
 mod storage;
+mod toolchain;
 
 use std::{env, path::PathBuf, process::ExitCode};
 
@@ -74,7 +75,12 @@ fn execute(cli: Cli) -> Result<()> {
     let root = cli.root.canonicalize().operation("locate project root")?;
     let record = cli.record.unwrap_or_else(|| root.join("build/lake-cache"));
     let workspace = Project::workspace_of(&root)?;
+    let prepares = matches!(
+        cli.action,
+        Action::Dependencies | Action::Build | Action::Get
+    );
     let project = Project {
+        lean: toolchain::Lean::new(&root, prepares)?,
         root,
         record: std::path::absolute(record).operation("resolve build record path")?,
         repository: cli
@@ -122,9 +128,6 @@ fn execute(cli: Cli) -> Result<()> {
         .then(|| gc::in_use(&cache))
         .transpose()?;
     let store = || {
-        if !matches!(cli.action, Action::Put) {
-            overlay::apply(&project)?;
-        }
         let kv = storage::store()?;
         // A restore checks the dependencies out while its seed downloads.
         if !matches!(cli.action, Action::Put | Action::Get) {
@@ -132,23 +135,37 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Ok::<_, error::Error>(kv)
     };
-    match cli.action {
-        Action::Dependencies => dependencies::fetch(&project, &store()?, &cli.targets),
-        Action::Build => project.build(&store()?, &cli.targets),
-        Action::Put => storage::publish(&project, &store()?),
-        Action::Get => {
-            restore::restore(&project, &store()?, &cli.targets, cli.seed, started)?;
-            drop(in_use);
-            gc::after_restore(&cache)
+    std::thread::scope(|threads| {
+        // The toolchain installs while the dependencies check out and the
+        // seed downloads; Lake runs wait for it.
+        if prepares {
+            threads.spawn(|| project.lean.ready(&project.root));
         }
-        Action::Gc => gc::collect(&cache),
-        Action::Scope => {
-            let base = cli.base.ok_or_else(|| invalid("scope requires --base"))?;
-            let targets = scope::scope(&project, &base, &cli.exclude, &cli.targets)?;
-            println!("{}", targets.join(" "));
-            Ok(())
-        }
-    }
+        match cli.action {
+            Action::Dependencies => dependencies::fetch(&project, &store()?, &cli.targets),
+            Action::Build => project.build(&store()?, &cli.targets),
+            Action::Put => {
+                let kv = store()?;
+                storage::publish(&project, &kv)?;
+                project.lean.publish(&kv)
+            }
+            Action::Get => {
+                restore::restore(&project, &store()?, &cli.targets, cli.seed, started)?;
+                drop(in_use);
+                gc::after_restore(&cache)
+            }
+            Action::Gc => gc::collect(&cache),
+            Action::Scope => {
+                let base = cli.base.ok_or_else(|| invalid("scope requires --base"))?;
+                let targets = scope::scope(&project, &base, &cli.exclude, &cli.targets)?;
+                println!("{}", targets.join(" "));
+                Ok(())
+            }
+        }?;
+        // A run that never started Lake still leaves the toolchain ready for
+        // the steps after it.
+        project.lean.ready(&project.root)
+    })
 }
 
 /// Run the command line, or, under Lake as its `CURL`, a download.

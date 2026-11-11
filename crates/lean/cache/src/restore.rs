@@ -98,7 +98,7 @@ impl Session {
 
     /// Lake, configured to fetch through this session.
     pub fn lake(&self, project: &Project) -> Result<Command> {
-        let mut command = project.lake();
+        let mut command = project.lake()?;
         command
             .env("LAKE_CONFIG", self.directory.path().join("config.toml"))
             .env(

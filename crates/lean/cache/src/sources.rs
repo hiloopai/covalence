@@ -378,6 +378,7 @@ mod tests {
                 workspace: String::new(),
                 repository: "o/r".into(),
                 record: root.join("record"),
+                lean: Default::default(),
             };
             materialize_in(&project, &kv, cache).unwrap();
             (project, root.join(".lake/packages/dep-a"))

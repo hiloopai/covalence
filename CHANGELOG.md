@@ -19,6 +19,16 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 - Every `cov-lake-cache` command that runs Lake says which Lake the toolchain
   holds: the overlay for its Lean commit, or stock Lake and why.
+- `cov-lake-cache get`, `dependencies` and `build` install a missing Lean
+  release toolchain into elan's directory for it while the Git dependencies
+  check out and the seed downloads, from the shared pool, else from the
+  release elan downloads; `put` publishes the release archive to the pool.
+  Lake runs from that toolchain, which goes on `GITHUB_PATH` for later steps,
+  and the toolchain gets the bundled `leantar` and Lake overlay. CI can drop
+  `leanprover/lean-action` and elan: the `lake-cache` action no longer needs
+  Lean, and no longer installs `leantar` itself, so update the action and the
+  binary together. Keep `ELAN_HOME` on local disk, not on a lazily loaded
+  sticky disk. `LAKE` still runs that Lake as found.
 
 ### Fixed
 

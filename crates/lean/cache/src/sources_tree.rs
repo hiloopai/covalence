@@ -419,6 +419,7 @@ mod tests {
             workspace: String::new(),
             repository: "o/r".into(),
             record: root.join("record"),
+            lean: Default::default(),
         };
         let kv = covalence_kv_memory::MemoryKv::default().into_dyn();
         let targets = ["Demo".to_owned()];

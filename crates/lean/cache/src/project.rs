@@ -17,6 +17,7 @@ use crate::{
     gc, mapping,
     modules::Index,
     pool,
+    toolchain::Lean,
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -67,6 +68,8 @@ pub(crate) struct Project {
     /// revision maps, module indexes and seeds.
     pub workspace: String,
     pub record: PathBuf,
+    /// The Lake this command runs, which waits for its toolchain.
+    pub lean: Lean,
 }
 
 /// `LAKE_CACHE_DIR`, else `$XDG_CACHE_HOME/lake`, else `~/.cache/lake`.
@@ -155,11 +158,13 @@ fn remove(path: &Path) -> Result<()> {
 }
 
 impl Project {
-    /// Lake in this project, with `LAKE_CACHE_DIR` defaulting to
-    /// `$XDG_CACHE_HOME/lake`, else `~/.cache/lake`, instead of Lake's
-    /// per-toolchain directory, so CI can save one host-wide cache.
-    pub fn lake(&self) -> Command {
-        let mut command = Command::new(env::var_os("LAKE").unwrap_or_else(|| "lake".into()));
+    /// Lake in this project, once its toolchain is ready, with
+    /// `LAKE_CACHE_DIR` defaulting to `$XDG_CACHE_HOME/lake`, else
+    /// `~/.cache/lake`, instead of Lake's per-toolchain directory, so CI can
+    /// save one host-wide cache.
+    pub fn lake(&self) -> Result<Command> {
+        self.lean.ready(&self.root)?;
+        let mut command = Command::new(self.lean.program());
         command.current_dir(&self.root);
         if let Some(directory) = host_cache_dir() {
             command.env("LAKE_CACHE_DIR", directory);
@@ -172,7 +177,7 @@ impl Project {
         if env::var_os("LAKE_RESTORE_ARTIFACTS").is_none() {
             command.env("LAKE_RESTORE_ARTIFACTS", "true");
         }
-        command
+        Ok(command)
     }
 
     pub fn git(&self, args: &[&str]) -> Result<String> {
@@ -355,36 +360,42 @@ impl Project {
         let mut hash = Sha256::new();
         hash.update(pool::FORMAT.as_bytes());
         hash.update([0]);
-        // Elan selects the toolchain from the project's cwd. An empty Lake
-        // directory avoids loading the entire workspace just to read its version.
-        let empty = tempfile::tempdir().operation("create toolchain query directory")?;
-        hash.update(
-            output(
-                "Lean",
-                self.lake()
-                    .arg("--dir")
-                    .arg(empty.path())
-                    .args(["env", "lean", "--version"]),
-            )?
-            .as_bytes(),
-        );
-        let sysroot = output(
-            "Lean",
-            self.lake()
-                .arg("--dir")
-                .arg(empty.path())
-                .args(["env", "lean", "--print-prefix"]),
-        )?;
+        // A toolchain still arriving from the pool needs no Lean to name.
+        let (version, leantar) = match self.lean.predicted()? {
+            Some(predicted) => predicted,
+            None => {
+                // Elan selects the toolchain from the project's cwd. An empty
+                // Lake directory avoids loading the entire workspace just to
+                // read its version.
+                let empty = tempfile::tempdir().operation("create toolchain query directory")?;
+                let version = output(
+                    "Lean",
+                    self.lake()?
+                        .arg("--dir")
+                        .arg(empty.path())
+                        .args(["env", "lean", "--version"]),
+                )?;
+                let sysroot = output(
+                    "Lean",
+                    self.lake()?.arg("--dir").arg(empty.path()).args([
+                        "env",
+                        "lean",
+                        "--print-prefix",
+                    ]),
+                )?;
+                let leantar = Path::new(&sysroot)
+                    .join("bin/leantar")
+                    .with_extension(env::consts::EXE_EXTENSION);
+                (version, leantar)
+            }
+        };
+        hash.update(version.as_bytes());
         // Patched and stock leantar both write `LTR4` and report the same
         // version, and stock leantar decodes the patched opcodes 0xa0 and
         // 0xb0 as constructors instead of rejecting them. Only the
         // executable identifies the codec.
         hash.update(b"\0leantar\0");
-        hash.update(digest(
-            &Path::new(&sysroot)
-                .join("bin/leantar")
-                .with_extension(env::consts::EXE_EXTENSION),
-        )?);
+        hash.update(digest(&leantar)?);
         let revision = self.git(&["rev-parse", "HEAD"])?;
         if !mapping::hex(&revision, 40) {
             return Err(invalid("expected a 40-digit Git revision"));
@@ -476,7 +487,7 @@ impl Project {
                 pooled.insert(package.name.clone());
                 continue;
             }
-            let mut command = self.lake();
+            let mut command = self.lake()?;
             command
                 .args(["build", "--wfail", "-o"])
                 .arg(&mapping)
@@ -740,6 +751,7 @@ mod tests {
             workspace: workspace.into(),
             repository: "o/r".into(),
             record: root.path().join("record"),
+            lean: Lean::default(),
         };
         assert_eq!(project("").namespace(), "o/r");
         let nested = project("projects/smt-axioms");
@@ -792,6 +804,7 @@ mod tests {
             workspace: String::new(),
             repository: "o/moria-lean".into(),
             record: root.path().join("record"),
+            lean: Lean::default(),
         };
         let names = project
             .packages()

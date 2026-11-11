@@ -40,9 +40,14 @@ pub(crate) const ARCHIVE_WORKERS: usize = 64;
 pub(crate) fn store() -> Result<Arc<dyn Kv>> {
     // Sixteen files, each with up to two 8 MiB parts, bound payload buffers
     // to 256 MiB. The transport supplies retries and connection reuse.
+    store_with(2)
+}
+
+/// The pool bucket, reading `parts` 8 MiB ranges of one value at once.
+pub(crate) fn store_with(parts: usize) -> Result<Arc<dyn Kv>> {
     Ok(Arc::new(
         s3()?
-            .concurrency(2)
+            .concurrency(parts)
             .max_idle_connections(ARCHIVE_WORKERS)
             .part_size(8 * 1024 * 1024)
             .upload_buffer_bytes(256 * 1024 * 1024),

@@ -56,6 +56,10 @@ pub enum Error {
         program: &'static str,
         status: ExitStatus,
     },
+    /// Every Lake run waits for one install of the toolchain, so each shares
+    /// its failure.
+    #[snafu(display("install the Lean toolchain: {source}"))]
+    Toolchain { source: std::sync::Arc<Error> },
     #[snafu(display("{message}"))]
     Invalid { message: String },
     #[snafu(display("a cache transfer worker panicked"))]

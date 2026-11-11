@@ -40,9 +40,8 @@ runs:
         # Validate the saved archive each time; a cached executable is not authority.
         install_dir=$(mktemp -d "$RUNNER_TEMP/cov-lake-cache-XXXXXXXX")
         tar -xzf "$archive" -C "$install_dir"
-        # Lake resolves the archiver inside its toolchain, independently of PATH.
-        toolchain=$(lean --print-prefix)
-        install -m 755 "$install_dir/leantar" "$toolchain/bin/leantar"
+        # cov-lake-cache installs the Lean toolchain, its bundled leantar and
+        # the Lake overlay itself, and puts the toolchain's bin on PATH.
         echo "$install_dir" >> "$GITHUB_PATH"
         # Restored outputs live in Lake's artifact cache; later steps' own
         # `lake build` must link them all into each package's `.lake/build`

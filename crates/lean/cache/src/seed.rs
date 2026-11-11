@@ -836,6 +836,7 @@ mod tests {
             workspace: String::new(),
             repository: REPOSITORY.into(),
             record: dir.path().join("record"),
+            lean: Default::default(),
         };
         let receipt = Receipt {
             identity: Identity {

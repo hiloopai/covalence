@@ -34,7 +34,7 @@ pub(crate) fn config(project: &Project) -> PathBuf {
 /// Restores each Git dependency's published build of its pin; with targets,
 /// only mappings, then a build of what the targets need.
 pub(crate) fn fetch(project: &Project, kv: &Arc<dyn Kv>, targets: &[String]) -> Result<()> {
-    run("Lake", project.lake().args(["env", "true"]))?;
+    run("Lake", project.lake()?.args(["env", "true"]))?;
     let scope = project.identity()?.scope;
     let lazy = !targets.is_empty();
     let mut session = Session::new(project, kv, &scope, Local::open(project)?)?;
@@ -72,7 +72,7 @@ pub(crate) fn upstream(
         if seeded.contains(&snapshot) || local.upstream_installed(level, &snapshot.request()) {
             continue;
         }
-        let mut command = project.lake();
+        let mut command = project.lake()?;
         command.env("LAKE_CONFIG", config(project)).args([
             "cache",
             "get",
@@ -211,7 +211,7 @@ fn unpack_snapshot(project: &Project, local: &Local, package: &str, revision: &s
     run(
         "Lake dependency cache",
         project
-            .lake()
+            .lake()?
             .env("LAKE_CONFIG", config(project))
             .args(["cache", "add", &format!("--package={package}")])
             .arg(file.path()),

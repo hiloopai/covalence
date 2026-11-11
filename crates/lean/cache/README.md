@@ -189,6 +189,41 @@ still checks every trace against the sources. A seed that is missing, or fails
 its check because a publish overwrote it mid-read, is reported and the restore
 continues from the pool.
 
+## Toolchain
+
+A `lean-toolchain` naming a Lean release or nightly
+(`leanprover/lean4:v4.22.0`, `leanprover/lean4:nightly-2026-11-05`) runs from
+elan's directory for it, `$ELAN_HOME/toolchains/<elan's name>` (`~/.elan`
+without `ELAN_HOME`), without elan. `ELAN_TOOLCHAIN` overrides the file, as
+for elan. When that directory is missing, `get`, `dependencies` and `build`
+install it while the Git dependencies check out and the seed downloads, and
+only Lake runs wait for it: from the pool, else from the release archive elan
+downloads (found through `https://release.lean-lang.org`). A toolchain
+already there is used as it is. Under GitHub Actions they then add the
+toolchain's `bin` to `GITHUB_PATH`, so later steps find `lake` and `lean`
+without elan or `leanprover/lean-action`. `LAKE`, or any other toolchain name,
+runs that Lake as found and installs nothing.
+
+`put` publishes the release archive the first time a toolchain is used,
+under `lake/toolchains/`:
+
+- `cas/sha2-256/<digest>/bytes.zst`: the release's `.tar.zst`, byte for byte,
+  which is a Zstandard frame of the tar under whose SHA-256 CID it is kept.
+  Every read checks it before the toolchain is moved into place.
+- `<os>-<arch>/<elan's name>`: the JSON record `{"url", "tar", "version"}`:
+  the archive's URL, the tar's CID and `lean --version`, written after the
+  archive.
+
+The record's `lean --version` and the bundled `leantar` name the pool scope,
+so a restore looks up its build and downloads its seed before the toolchain
+arrives; once it has, its `lean --version` must match the record. The pool
+holds the release's bytes only: the bundled `leantar` and the Lake overlay
+are installed into the unpacked toolchain on each host.
+
+Install the toolchain on the runner's local disk. A toolchain on lazily
+loaded network storage, such as a Blacksmith sticky disk, costs seconds on its
+first reads inside Lake; keep `ELAN_HOME` off it.
+
 ## Host-wide local layer
 
 Before any Lake run, `dependencies`, `build` and `get` check out each Git
@@ -269,8 +304,9 @@ Ubuntu 24.04 or newer. Source installs can use
 GitHub workflows can use the `.github/actions/lake-cache` composite action
 pinned to a full public commit, with `revision` and `sha256` inputs. It verifies
 the archive even when restored from disk and puts `cov-lake-cache` on `PATH`.
-It also installs the bundled `leantar` in the selected Lean toolchain, which
-must already be installed and writable. The archive records the upstream
+It needs no Lean: `get`, `dependencies` and `build` install the toolchain
+(below). Every command that runs Lake first installs the bundled `leantar`,
+which sits beside the executable, into the toolchain. The archive records the upstream
 commits in `LEANTAR-REVISIONS`, their combined source tree in `LEANTAR-TREE`,
 and all license notices. It combines upstream master with the pinned, unmerged
 [explicit-stack fix](https://github.com/digama0/leangz/pull/22). The codec supports
@@ -300,7 +336,8 @@ pin; remove it once the supported Lean distribution includes
 
 Run `cargo test -p covalence-lean-cache --features lake-tests` with the pinned
 Lean release on `PATH` for the signed S3 server and real Lake integration
-tests. The umbrella CI calls a separate workflow for these tests so library
+tests. They run that release through `LAKE`, except one, which installs it
+from its release archive and then from the test pool. The umbrella CI calls a separate workflow for these tests so library
 developers do not need to install Lean to run `glu ci`.
 
 Maintainer: Thomas. Retire this command when Lake natively provides bounded S3
