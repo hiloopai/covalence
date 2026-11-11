@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    if: github.repository == 'hiloopai/covalence' && github.ref == 'refs/heads/main'
+    if: github.repository_id == '1419632160' && github.ref == 'refs/heads/main'
     uses: ./.github/workflows/ci-lake.yml
   publish:
     needs: build

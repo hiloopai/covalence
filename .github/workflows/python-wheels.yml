@@ -256,7 +256,7 @@ jobs:
   # files but never upload them.
   # PyPI authenticates the upload by trusted publishing.
   pypi:
-    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'hiloopai/covalence'
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository_id == '1419632160'
     needs: [wheel, sdist, sdist-install, release]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
