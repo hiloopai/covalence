@@ -11,7 +11,7 @@ use std::{
     fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    process::{Command, ExitCode, Stdio},
     sync::Arc,
     thread,
     time::Instant,
@@ -209,14 +209,8 @@ impl Session {
             }
             run("Lake restore", command.arg(file))
         };
-        // Loading a workspace reconfigures any package whose configuration is
-        // stale, such as one just checked out, under an exclusive lock that a
-        // concurrent load fails on rather than waits for. The first Lake run
-        // loads the workspace alone; the rest then only read it.
-        if let Some((first, rest)) = files.split_first() {
-            restore(first)?;
-            storage::parallel(rest, |_, file| restore(file))?;
-        }
+        // `configure` loaded the workspace, so these only read it.
+        storage::parallel(&files, |_, file| restore(file))?;
         let levels: &[Installed] = if lazy {
             &[Installed::Mappings]
         } else {
@@ -229,6 +223,17 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Load the workspace once, alone. Loading reconfigures any package whose
+    /// configuration is stale, such as one just checked out, under an
+    /// exclusive lock that a concurrent load fails on rather than waits for;
+    /// after this, Lake runs at once only read it.
+    pub fn configure(&self, project: &Project) -> Result<()> {
+        run(
+            "Lake workspace load",
+            self.lake(project)?.arg("env").stdout(Stdio::null()),
+        )
     }
 
     /// Build `targets` strictly. Lake takes each artifact from its local
@@ -295,6 +300,16 @@ pub(crate) fn restore(
             looked_up.as_secs_f64(),
             checked_out.as_secs_f64(),
         );
+        session.configure(project)?;
+        // The import closure needs only the checked-out sources and the
+        // pool, so it is read while the seed downloads.
+        let prefetching = lazy.then(|| {
+            let commit = nearest.as_ref().map(|(commit, _)| commit.clone());
+            let (packages, scope) = (&packages, scope.to_owned());
+            threads.spawn(move || {
+                modules::prefetch(project, &**kv, &scope, packages, commit.as_deref(), targets)
+            })
+        });
         let mut installs = Vec::new();
         if lazy {
             let phase = Instant::now();
@@ -350,11 +365,11 @@ pub(crate) fn restore(
             }
         }
         let phase = Instant::now();
-        let prefetch = if lazy {
-            let commit = nearest.as_ref().map(|(commit, _)| commit.as_str());
-            modules::prefetch(project, &**kv, scope, &packages, commit, targets)?
-        } else {
-            BTreeMap::new()
+        let prefetch = match prefetching {
+            Some(prefetching) => prefetching
+                .join()
+                .unwrap_or(Err(crate::error::Error::Worker))?,
+            None => BTreeMap::new(),
         };
         session.install(project, &installs, lazy, &seeded, &prefetch)?;
         println!(
