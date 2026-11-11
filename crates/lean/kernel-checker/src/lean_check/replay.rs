@@ -578,6 +578,7 @@ fn check_module(args: &Invocation, inputs: Option<&built::Inputs>) -> Result<Val
     for key in prior.into_keys() {
         edits.push(Edit::Remove(key.into_bytes().into()));
     }
+    edits.sort_by(|a, b| a.key().cmp(b.key()));
     let map = map.apply(edits).into_diagnostic()?;
     let manifest = Manifest {
         kind: FORMAT.into(),
@@ -600,6 +601,72 @@ fn check_module(args: &Invocation, inputs: Option<&built::Inputs>) -> Result<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn replay_receipts_merge_insertions_and_removed_declarations_in_key_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("Proof.olean");
+        let executable = root.join("bridge");
+        fs::write(&file, "compiled module").unwrap();
+        let invocation = |previous| Invocation {
+            file: file.clone(),
+            imports: ImportSource::SearchPath("Proof".into()),
+            toolchain: root.to_owned(),
+            executable: executable.clone(),
+            cwd: root.to_owned(),
+            lean_path: None,
+            context: "fixed-context".into(),
+            previous,
+            trace: None,
+            cache: root.join("receipts.db").to_str().unwrap().into(),
+        };
+        let bridge = |names: &[&str], reused: usize| {
+            let mut reports = vec![json!({"protocol": FORMAT, "module": "Proof",
+                "imports": [], "is_module": true, "declarations": names.len(),
+                "load_ms": 0, "inputs": []})];
+            for name in names {
+                reports.push(json!({"name": name,
+                    "name_key": serde_json::to_string(&[("str", name)]).unwrap(),
+                    "kind": "theorem", "fallback": null, "interface": "True",
+                    "body": "True.intro", "dependencies": [], "statement_only": true,
+                    "interface_dependencies": []}));
+            }
+            reports.push(json!({"encoded": true, "encoding_ms": 0}));
+            let output = reports
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(&executable, format!(
+                "#!/bin/sh\n/bin/cat <<'REPORTS'\n{output}\nREPORTS\nIFS= read -r reuse\nprintf '%s\\n' '{{\"done\":true,\"reused\":{reused},\"replay_ms\":0}}'\n"
+            )).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        bridge(&["a", "m", "z"], 0);
+        let initial = check_module(&invocation(None), None).unwrap();
+        bridge(&["b", "n", "z"], 1);
+        let changed = check_module(
+            &invocation(Some(
+                initial["replay_cache"].as_str().unwrap().parse().unwrap(),
+            )),
+            None,
+        )
+        .unwrap();
+        assert_eq!(changed["reused_theorems"], 1);
+        assert_eq!(changed["fresh_theorems"], 2);
+        bridge(&["b", "n", "z"], 3);
+        let unchanged = check_module(
+            &invocation(Some(
+                changed["replay_cache"].as_str().unwrap().parse().unwrap(),
+            )),
+            None,
+        )
+        .unwrap();
+        assert_eq!(unchanged["reused_theorems"], 3);
+        assert_eq!(unchanged["fresh_theorems"], 0);
+    }
 
     fn item(name: &str, local: Option<&str>, deps: &[&str]) -> Record {
         Record {

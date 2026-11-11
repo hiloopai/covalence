@@ -20,6 +20,11 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 - Every `cov-lake-cache` command that runs Lake says which Lake the toolchain
   holds: the overlay for its Lean commit, or stock Lake and why.
 
+### Fixed
+
+- Kernel replay can update cached receipts when declarations are removed and
+  added together, by ordering all receipt-map edits by key before applying them.
+
 ## [0.1.0-dev.8] - 2026-11-11
 
 ### Fixed
