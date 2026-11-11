@@ -124,17 +124,24 @@ pub(crate) fn pins(
     kv: &Arc<dyn Kv>,
     session: &Session,
 ) -> Result<Vec<(Package, bool, Cid<Bdasl>)>> {
-    let mut installs = Vec::new();
-    for package in project.packages()? {
-        let Source::Git { commit, .. } = &package.source else {
-            continue;
-        };
-        let key = project.revision_key(session.scope(), &package, commit)?;
-        if let Some(root) = storage::pointer(&**kv, &key)? {
-            installs.push((package, false, root));
-        }
-    }
-    Ok(installs)
+    let pinned = project
+        .packages()?
+        .into_iter()
+        .filter_map(|package| match &package.source {
+            Source::Git { commit, .. } => Some(
+                project
+                    .revision_key(session.scope(), &package, commit)
+                    .map(|key| (package, key)),
+            ),
+            Source::Repository => None,
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let roots = storage::parallel(&pinned, |_, (_, key)| storage::pointer(&**kv, key))?;
+    Ok(pinned
+        .into_iter()
+        .zip(roots)
+        .filter_map(|((package, _), root)| root.map(|root| (package, false, root)))
+        .collect())
 }
 
 /// The upstream snapshots of this workspace's Git dependencies, which

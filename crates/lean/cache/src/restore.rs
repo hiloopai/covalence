@@ -50,6 +50,8 @@ pub(crate) struct Session {
     index: BTreeMap<String, String>,
     /// Credentials resolved once for every download process.
     lease: Vec<(&'static str, String)>,
+    /// Whether a Lake run has loaded the workspace alone.
+    configured: bool,
 }
 
 impl Session {
@@ -74,6 +76,7 @@ impl Session {
             blobs: pool::blobs(kv.clone(), scope)?,
             index: BTreeMap::new(),
             lease: storage::lease()?,
+            configured: false,
         };
         session.save_index()?;
         Ok(session)
@@ -197,6 +200,9 @@ impl Session {
             }
         }
         self.save_index()?;
+        if files.len() > 1 {
+            self.configure(project)?;
+        }
         let restore = |(package, root_package, file): &(&Package, bool, PathBuf)| {
             let mut command = self.lake(project)?;
             // Every artifact of an eager restore is in place, so Lake only
@@ -209,7 +215,8 @@ impl Session {
             }
             run("Lake restore", command.arg(file))
         };
-        // `configure` loaded the workspace, so these only read it.
+        // One Lake run alone, or several once `configure` loaded the
+        // workspace, so they only read it.
         storage::parallel(&files, |_, file| restore(file))?;
         let levels: &[Installed] = if lazy {
             &[Installed::Mappings]
@@ -229,11 +236,15 @@ impl Session {
     /// configuration is stale, such as one just checked out, under an
     /// exclusive lock that a concurrent load fails on rather than waits for;
     /// after this, Lake runs at once only read it.
-    pub fn configure(&self, project: &Project) -> Result<()> {
-        run(
-            "Lake workspace load",
-            self.lake(project)?.arg("env").stdout(Stdio::null()),
-        )
+    pub fn configure(&mut self, project: &Project) -> Result<()> {
+        if !self.configured {
+            run(
+                "Lake workspace load",
+                self.lake(project)?.arg("env").stdout(Stdio::null()),
+            )?;
+            self.configured = true;
+        }
+        Ok(())
     }
 
     /// Build `targets` strictly. Lake takes each artifact from its local
@@ -330,7 +341,11 @@ pub(crate) fn restore(
             looked_up.as_secs_f64(),
             checked_out.as_secs_f64(),
         );
-        session.configure(project)?;
+        // While a seed downloads, loading the workspace costs nothing;
+        // otherwise only Lake runs at once need it.
+        if seeding.is_some() {
+            session.configure(project)?;
+        }
         // The import closure needs only the checked-out sources and the
         // pool, so it is read while the seed downloads.
         let prefetching = lazy.then(|| {
