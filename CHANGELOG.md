@@ -15,6 +15,11 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+### Changed
+
+- Every `cov-lake-cache` command that runs Lake says which Lake the toolchain
+  holds: the overlay for its Lean commit, or stock Lake and why.
+
 ## [0.1.0-dev.8] - 2026-11-11
 
 ### Fixed

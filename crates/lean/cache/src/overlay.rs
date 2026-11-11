@@ -36,6 +36,7 @@ pub(crate) fn apply(project: &Project) -> Result<()> {
         .operation("locate cov-lake-cache")?
         .with_file_name("lake-overlay");
     if !stock && !overlays.is_dir() {
+        eprintln!("Lake cache: stock Lake (this cov-lake-cache bundles no overlay)");
         return Ok(());
     }
     // Elan selects the toolchain from the project's cwd; an empty Lake
@@ -50,7 +51,9 @@ pub(crate) fn apply(project: &Project) -> Result<()> {
             .args(["env", "lean", "--print-prefix"]),
     )?);
     if stock {
-        return restore(&sysroot);
+        restore(&sysroot)?;
+        eprintln!("Lake cache: stock Lake (LAKE_POOL_STOCK_LAKE=1)");
+        return Ok(());
     }
     let githash = output(
         "Lean",
@@ -58,9 +61,15 @@ pub(crate) fn apply(project: &Project) -> Result<()> {
     )?;
     let overlay = overlays.join(&githash);
     if !overlay.is_dir() {
+        eprintln!("Lake cache: stock Lake (no overlay for Lean {githash})");
         return Ok(());
     }
-    install(&overlay, &sysroot)
+    install(&overlay, &sysroot)?;
+    eprintln!(
+        "Lake cache: Lake overlay for Lean {githash} in {}",
+        sysroot.display()
+    );
+    Ok(())
 }
 
 /// Make every file of `overlay` the toolchain's, keeping the first stock copy
