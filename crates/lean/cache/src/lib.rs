@@ -14,6 +14,7 @@ mod overlay;
 pub mod pool;
 mod project;
 mod restore;
+mod scope;
 mod seed;
 mod sources;
 mod sources_tree;
@@ -35,6 +36,8 @@ enum Action {
     Get,
     /// Delete what only scopes unused for `COVALENCE_LAKE_GC_DAYS` hold.
     Gc,
+    /// Print the targets a change from `--base` can affect.
+    Scope,
 }
 
 #[derive(Parser)]
@@ -55,6 +58,13 @@ struct Cli {
     /// mappings from the restored commit's seed first.
     #[arg(long)]
     seed: bool,
+    /// With `scope`, the revision the change starts from.
+    #[arg(long)]
+    base: Option<String>,
+    /// With `scope`, a Git glob from the repository's root of files Lake
+    /// never reads, such as `docs/**`.
+    #[arg(long)]
+    exclude: Vec<String>,
     #[arg(last = true, allow_hyphen_values = true)]
     targets: Vec<String>,
 }
@@ -73,6 +83,9 @@ fn execute(cli: Cli) -> Result<()> {
             .unwrap_or_default(),
         workspace,
     };
+    if !matches!(cli.action, Action::Scope) && (cli.base.is_some() || !cli.exclude.is_empty()) {
+        return Err(invalid("--base and --exclude apply to scope"));
+    }
     if matches!(cli.action, Action::Gc) && !cli.targets.is_empty() {
         return Err(invalid("gc accepts no targets"));
     }
@@ -95,12 +108,17 @@ fn execute(cli: Cli) -> Result<()> {
     {
         return Err(invalid("publication requires a trusted main CI run"));
     }
-    if project.repository.is_empty() && !matches!(cli.action, Action::Dependencies | Action::Gc) {
+    if project.repository.is_empty()
+        && !matches!(
+            cli.action,
+            Action::Dependencies | Action::Gc | Action::Scope
+        )
+    {
         return Err(invalid("--repository or GITHUB_REPOSITORY is required"));
     }
     let cache = project.cache_dir()?;
     // gc itself takes the lock exclusively.
-    let in_use = (!matches!(cli.action, Action::Gc))
+    let in_use = (!matches!(cli.action, Action::Gc | Action::Scope))
         .then(|| gc::in_use(&cache))
         .transpose()?;
     let store = || {
@@ -124,6 +142,12 @@ fn execute(cli: Cli) -> Result<()> {
             gc::after_restore(&cache)
         }
         Action::Gc => gc::collect(&cache),
+        Action::Scope => {
+            let base = cli.base.ok_or_else(|| invalid("scope requires --base"))?;
+            let targets = scope::scope(&project, &base, &cli.exclude, &cli.targets)?;
+            println!("{}", targets.join(" "));
+            Ok(())
+        }
     }
 }
 

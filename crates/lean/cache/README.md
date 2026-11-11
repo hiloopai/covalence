@@ -102,6 +102,18 @@ the scope.
   each Git dependency's build of its pin from the pool on top of it, so a
   partial pool map never hides upstream's artifacts.
 - `gc` frees the host's cache of toolchain scopes it stopped using (below).
+- `scope --base <rev> -- <targets>` prints the part of `targets` that the
+  change from `rev` to the working tree can affect, for CI that checks only
+  what a pull request changed. A changed module reaches every module that
+  imports it, through this repository's packages. A changed file that a
+  module reads with `include_str` or `include_bytes` reaches that module, and
+  a changed `needs` input reaches its library's modules. A library prints as
+  its affected modules (`+Module`), less those another one imports. An
+  executable or module prints when its import closure is affected. A change
+  to a `lakefile`, `lake-manifest.json` or `lean-toolchain`, a package
+  without `lakefile.toml`, or a changed file none of these rules places
+  prints every target. `--exclude <glob>` (Git glob syntax, from the
+  repository's root) names files Lake never reads, such as `docs/**`.
 - With targets, `get` and `dependencies` install only mappings (`get` also
   those of the dependencies). `get` then runs `lake build --wfail` on the
   targets, which fetches only the artifacts they need. Before the build, `get`

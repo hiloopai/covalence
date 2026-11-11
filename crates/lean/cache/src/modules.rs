@@ -226,8 +226,13 @@ impl Sources {
         Ok(Self { roots })
     }
 
+    /// Each package's source folders, by package name.
+    pub fn roots(&self) -> &[(String, PathBuf)] {
+        &self.roots
+    }
+
     /// The package and file of `module`, if a source folder holds it.
-    fn find(&self, module: &str) -> Option<(&str, PathBuf)> {
+    pub fn find(&self, module: &str) -> Option<(&str, PathBuf)> {
         let relative = format!("{}.lean", module.replace('.', "/"));
         self.roots.iter().find_map(|(package, root)| {
             let path = root.join(&relative);
@@ -289,7 +294,7 @@ impl Sources {
     /// The modules of library or executable `name` in a `lakefile.toml`:
     /// its `root` or `roots` (the name by default) and the modules its
     /// `globs` match (`X.+` the submodules of `X`, `X.*` also `X`).
-    fn target_modules(&self, config: &str, root: &Path, name: &str) -> Vec<String> {
+    pub fn target_modules(&self, config: &str, root: &Path, name: &str) -> Vec<String> {
         let Some(section) = config.split("\n[[").skip(1).find(|section| {
             (section.starts_with("lean_lib]]") || section.starts_with("lean_exe]]"))
                 && setting(section, "name").first().map(String::as_str) == Some(name)
@@ -558,7 +563,7 @@ fn quoted(text: &str) -> Vec<String> {
 }
 
 /// The string values of `key` in one TOML table, a string or an array.
-fn setting(section: &str, key: &str) -> Vec<String> {
+pub(crate) fn setting(section: &str, key: &str) -> Vec<String> {
     let mut lines = section.lines();
     while let Some(line) = lines.next() {
         let Some(rest) = line.trim().strip_prefix(key) else {
