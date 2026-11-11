@@ -1147,6 +1147,16 @@ fn recording_after_a_seeded_restore_reuses_the_pools_archives() {
     let published = fs::read_to_string(fixture.record("packages/demo.jsonl")).unwrap();
     fixture.reset_local();
     checked(fixture.cli("get").args(["--seed", "--", "Demo"]));
+    // Revisions published before module indexes existed reuse archives too.
+    fs::remove_dir_all(
+        fixture
+            .temporary
+            .path()
+            .join("s3/bucket/lake")
+            .join(fixture.scope())
+            .join("modules"),
+    )
+    .unwrap();
     // The seed holds unpacked files only; Lake would pack every archive.
     let recorded = log(&checked(fixture.cli("build").args(["--", "Demo"])));
     assert!(

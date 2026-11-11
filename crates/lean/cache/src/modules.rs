@@ -446,9 +446,10 @@ pub(crate) fn pooled_mapping(
 /// restore).
 ///
 /// A module counts as unchanged when the input of its trace in the build
-/// folder, which the restore just wrote, equals the input the module index
-/// of the revision restored (`commit`, or a dependency's pin) names; its
-/// archive is that input's in the revision map. Lake packs the rest.
+/// folder, which the restore just wrote, has an archive in the map of the
+/// revision restored (`commit`, or a dependency's pin). The trace names the
+/// input, so this needs no module index: maps published before the index
+/// existed reuse their archives too. Lake packs the rest.
 pub(crate) fn reuse_archives(
     project: &Project,
     kv: &Arc<dyn Kv>,
@@ -470,29 +471,32 @@ pub(crate) fn reuse_archives(
             },
             Source::Git { commit, .. } => commit.as_str(),
         };
-        let Some(index) = Index::get(&**kv, &project.modules_key(scope, package, commit)?)? else {
-            continue;
-        };
         let Some(entries) = pool_entries(project, kv, &remote, &local, scope, package, commit)?
         else {
             continue;
         };
         let build = project.root.join(&package.dir).join(".lake/build");
-        for (module, input) in &index.modules {
-            if module.contains(':') {
-                continue;
-            }
-            let path = module.replace('.', "/");
-            let trace = build.join(format!("lib/lean/{path}.trace"));
-            let Ok(bytes) = fs::read(&trace) else {
+        let lib = build.join("lib/lean");
+        for trace in crate::project::files(&lib, "trace")? {
+            // A module `A.B`'s trace is `lib/lean/A/B.trace`; dotted names
+            // are other files' traces.
+            let Some(path) = trace
+                .strip_prefix(&lib)
+                .ok()
+                .and_then(|relative| relative.with_extension("").to_str().map(str::to_owned))
+                .filter(|path| !path.contains('.'))
+            else {
                 continue;
             };
-            let current = serde_json::from_slice::<serde_json::Value>(&bytes)
+            let bytes = fs::read(&trace).operation(format!("read {}", trace.display()))?;
+            // Old trace stubs name no input.
+            let Some(entry) = serde_json::from_slice::<serde_json::Value>(&bytes)
                 .ok()
-                .and_then(|trace| trace["depHash"].as_str().map(str::to_owned));
-            let Some(entry) = entries
-                .get(input)
-                .filter(|_| current.as_deref() == Some(input))
+                .and_then(|trace| {
+                    trace["depHash"]
+                        .as_str()
+                        .and_then(|input| entries.get(input))
+                })
             else {
                 continue;
             };
