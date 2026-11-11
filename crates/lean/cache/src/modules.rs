@@ -541,7 +541,11 @@ pub(crate) fn reuse_archives(
             if let Some(parent) = placed.parent() {
                 fs::create_dir_all(parent).operation("create build folder")?;
             }
-            fs::copy(cached, placed).operation("place archive")?;
+            // A link, as Lake makes its own: one file, and one a build
+            // manifest names by its artifact.
+            fs::hard_link(cached, placed)
+                .or_else(|_| fs::copy(cached, placed).map(|_| ()))
+                .operation("place archive")?;
             Ok(())
         },
     )?;

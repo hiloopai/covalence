@@ -449,6 +449,12 @@ fn publish_modules(
 
 pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>) -> Result<()> {
     let started = Instant::now();
+    if let Ok(published) = fs::read_to_string(project.published())
+        && published == project.git(&["rev-parse", "HEAD"])?
+    {
+        println!("Lake cache: {published} is published already");
+        return Ok(());
+    }
     let receipt = project.receipt()?;
     let scope = &receipt.identity.scope;
     let remote = pool::store(kv.clone(), scope)?;
@@ -483,6 +489,19 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>) -> Result<()> {
     let git_packs = sources::publish_packs(project, &**kv)?;
     // A seed only shortcuts the maps just published.
     let seed = seed::publish(project, &**kv, &receipt, local.directory())?;
+    let build = match crate::builds::Manifest::load(&project.build_manifest())? {
+        Some(manifest) if crate::builds::tree(project)?.as_ref() == Some(&manifest.tree) => {
+            let key = crate::builds::key(project, scope, &manifest.lake, &manifest.tree)?;
+            // Any build of the tree serves; one that checked fewer targets
+            // gives way.
+            let published = crate::builds::Manifest::get(&**kv, &key)?;
+            if !published.is_some_and(|published| published.covers(&manifest.targets)) {
+                manifest.put(&**kv, &key)?;
+            }
+            Some(manifest.files.len())
+        }
+        _ => None,
+    };
     // The source tree goes last: a record says its targets built and were
     // published at that tree.
     // The source tree is the repository's; its root workspace's record names
@@ -497,6 +516,7 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>) -> Result<()> {
         "packages": published,
         "sources": sources,
         "seed": seed,
+        "build_files": build,
         "git_packs": git_packs,
         "seconds": started.elapsed().as_secs_f64(),
     }))?;

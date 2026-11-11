@@ -446,6 +446,8 @@ impl Project {
     pub fn build(&self, kv: &Arc<dyn Kv>, targets: &[String]) -> Result<()> {
         let receipt = self.record.join("success.json");
         remove(&receipt)?;
+        remove(&self.build_manifest())?;
+        remove(&self.published())?;
         let packages_dir = self.record.join("packages");
         for directory in [&packages_dir, &self.record.join("modules")] {
             if directory.exists() {
@@ -456,6 +458,28 @@ impl Project {
         self.clean()?;
         let identity = self.identity()?;
         let packages = self.packages()?;
+        // A commit published with this tree's build needs no second record.
+        let root = self.revision_key(&identity.scope, &packages[0], &identity.revision)?;
+        if crate::storage::pointer(&**kv, &root)?.is_some()
+            && let Some(manifest) = crate::builds::find(
+                self,
+                &**kv,
+                &identity.scope,
+                &crate::builds::lake(self)?,
+                targets,
+            )?
+        {
+            let artifacts = self.cache_dir()?.join("artifacts");
+            if manifest.present(&artifacts)? && manifest.place(self, &packages, &artifacts)? {
+                println!(
+                    "Lake cache: {} is published with this build already; nothing to record",
+                    identity.revision
+                );
+                return fs::write(self.published(), &identity.revision)
+                    .operation("record the published commit");
+            }
+        }
+        crate::builds::forget(self)?;
         let nearest = crate::storage::nearest(
             &**kv,
             self,
@@ -510,6 +534,20 @@ impl Project {
         for package in recorded.keys().filter(|package| !pooled.contains(*package)) {
             mapping::artifacts(&self.mapping(package), &artifacts)?;
         }
+        if let Some(change) = crate::builds::changed(self)? {
+            println!("Lake cache: no build manifest: {change} differs from the commit");
+        } else if let Some(tree) = crate::builds::tree(self)?
+            && let Some(manifest) = crate::builds::Manifest::record(
+                self,
+                &packages,
+                &artifacts,
+                crate::builds::lake(self)?,
+                tree,
+                targets,
+            )?
+        {
+            manifest.save(&self.build_manifest())?;
+        }
         if !pooled.is_empty() {
             println!(
                 "Lake cache: recorded {} dependencies from the pool's maps of their pins without replaying them",
@@ -524,6 +562,17 @@ impl Project {
             pooled,
         };
         fs::write(receipt, encode(&record)?).operation("save successful build receipt")
+    }
+
+    /// Where `build` names the commit it found published already, which
+    /// leaves `put` nothing to do.
+    pub fn published(&self) -> PathBuf {
+        self.record.join("published")
+    }
+
+    /// Where `build` records the manifest of the build folders it checked.
+    pub fn build_manifest(&self) -> PathBuf {
+        self.record.join("build.json")
     }
 
     pub fn receipt(&self) -> Result<Receipt> {

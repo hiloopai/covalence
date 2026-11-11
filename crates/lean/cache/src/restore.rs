@@ -26,7 +26,7 @@ use serde_json::json;
 use crate::{
     archives,
     blobs::Blobs,
-    dependencies,
+    builds, dependencies,
     error::{IoResult, Result, encode, invalid, json},
     local::{Installed, Local},
     mapping, modules, pool,
@@ -269,9 +269,35 @@ pub(crate) fn restore(
         // The seed needs only the toolchain and the pool, so it downloads
         // while the dependencies check out.
         let mirrors = threads.spawn(|| sources::materialize(project, &**kv));
+        let lake = threads.spawn(|| builds::lake(project));
         let identity = project.identity()?;
         let scope = identity.scope.as_str();
         let identified = started.elapsed();
+        // A clean tree some publisher built needs no Lake when this host
+        // holds every artifact of that build.
+        let lake = lake.join().unwrap_or(Err(crate::error::Error::Worker))?;
+        let manifest = builds::find(project, &**kv, scope, &lake, targets)?;
+        let artifacts = cache.join("artifacts");
+        let present = match &manifest {
+            Some(manifest) => manifest.present(&artifacts)?,
+            None => false,
+        };
+        let mut mirrors = Some(mirrors);
+        if present && let Some(checking) = mirrors.take() {
+            checking
+                .join()
+                .unwrap_or(Err(crate::error::Error::Worker))?;
+        }
+        if present
+            && let Some(manifest) = &manifest
+            && manifest.place(project, &packages, &artifacts)?
+        {
+            println!(
+                "Lake cache: restored in {:.1} s without Lake",
+                started.elapsed().as_secs_f64()
+            );
+            return Ok(());
+        }
         let nearest = storage::nearest(&**kv, project, scope, &packages[0], &commits)?;
         let looked_up = started.elapsed();
         let fresh = seed
@@ -290,7 +316,11 @@ pub(crate) fn restore(
             let (cache, scope, namespace) = (&cache, scope.to_owned(), project.namespace());
             threads.spawn(move || remote.fetch(&**kv, &scope, &namespace, cache))
         });
-        mirrors.join().unwrap_or(Err(crate::error::Error::Worker))?;
+        if let Some(checking) = mirrors {
+            checking
+                .join()
+                .unwrap_or(Err(crate::error::Error::Worker))?;
+        }
         let checked_out = started.elapsed();
         let mut session = Session::new(project, kv, scope, local)?;
         println!(
@@ -377,8 +407,21 @@ pub(crate) fn restore(
             installs.len(),
             phase.elapsed().as_secs_f64()
         );
+        // The seed and the maps may have brought every artifact of this
+        // tree's build.
+        if let Some(manifest) = &manifest
+            && manifest.present(&artifacts)?
+            && manifest.place(project, &packages, &artifacts)?
+        {
+            println!(
+                "Lake cache: restored in {:.1} s without Lake",
+                started.elapsed().as_secs_f64()
+            );
+            return Ok(());
+        }
         if lazy {
             let phase = Instant::now();
+            builds::forget(project)?;
             session.build(project, targets)?;
             println!(
                 "Lake cache: built the targets in {:.1} s",

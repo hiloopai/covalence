@@ -61,6 +61,19 @@ pub(crate) fn apply(sysroot: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The bundled overlay [`apply`] installs into the toolchain of Lean
+/// `githash`; `None` when that toolchain runs its own Lake.
+pub(crate) fn bundled(githash: &str) -> Result<Option<PathBuf>> {
+    if env::var_os("LAKE_POOL_STOCK_LAKE").is_some_and(|value| value == "1") {
+        return Ok(None);
+    }
+    let overlay = env::current_exe()
+        .operation("locate cov-lake-cache")?
+        .with_file_name("lake-overlay")
+        .join(githash);
+    Ok(overlay.is_dir().then_some(overlay))
+}
+
 /// Make every file of `overlay` the toolchain's, keeping the first stock copy
 /// of each. A toolchain that already matches is not written, so a read-only
 /// toolchain with the overlay unpacked in place works.

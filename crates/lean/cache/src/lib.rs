@@ -4,6 +4,7 @@
 mod accelerate;
 mod archives;
 mod blobs;
+mod builds;
 mod dependencies;
 pub mod error;
 mod gc;

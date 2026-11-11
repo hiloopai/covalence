@@ -540,10 +540,11 @@ fn restore_uses_the_nearest_published_ancestor_and_worktrees_share_one_cache() {
         !built.contains("Built Demo"),
         "rebuilt in a worktree: {built}"
     );
+    // Pointers and the lookup of a build manifest, which this commit lacks.
     assert!(
         fixture.server.reads.lock().unwrap()[reads..]
             .iter()
-            .all(|path| path.contains("/rev/"))
+            .all(|path| path.contains("/rev/") || path.contains("/builds/"))
     );
 }
 
@@ -1176,6 +1177,9 @@ fn recording_after_a_seeded_restore_reuses_the_pools_archives() {
     let published = fs::read_to_string(fixture.record("packages/demo.jsonl")).unwrap();
     fixture.reset_local();
     checked(fixture.cli("get").args(["--seed", "--", "Demo"]));
+    // A new tree, so the build records instead of placing the published one.
+    fs::write(fixture.root.join("NOTES"), "outside every target\n").unwrap();
+    fixture.commit();
     // Revisions published before module indexes existed reuse archives too.
     fs::remove_dir_all(
         fixture
@@ -1196,6 +1200,36 @@ fn recording_after_a_seeded_restore_reuses_the_pools_archives() {
         fs::read_to_string(fixture.record("packages/demo.jsonl")).unwrap(),
         published
     );
+}
+
+#[test]
+fn a_published_tree_restores_and_records_again_without_lake() {
+    let fixture = Fixture::new();
+    fixture.build();
+    checked(&mut fixture.cli("put"));
+    let report: Value =
+        serde_json::from_slice(&fs::read(fixture.record("publication.json")).unwrap()).unwrap();
+    assert!(report["build_files"].as_u64().unwrap() > 0, "{report}");
+    // A second checkout of the tree: the host's cache holds every artifact.
+    fs::remove_dir_all(fixture.root.join(".lake/build")).unwrap();
+    let restored = log(&checked(fixture.cli("get").args(["--", "Demo"])));
+    assert!(restored.contains("without Lake"), "{restored}");
+    assert!(!restored.contains("Built Demo"), "{restored}");
+    // Lake finds the placed build complete and rewrites none of it.
+    let trace = fixture.root.join(".lake/build/lib/lean/Demo/A.trace");
+    let written = fs::metadata(&trace).unwrap().modified().unwrap();
+    let checked_again = log(&checked(fixture.lake().args(["build", "--wfail", "Demo"])));
+    for verb in ["Built", "Fetched", "Unpacked", "Replayed"] {
+        assert!(!checked_again.contains(verb), "{checked_again}");
+    }
+    assert_eq!(fs::metadata(&trace).unwrap().modified().unwrap(), written);
+    // Recording the published commit again leaves nothing to publish.
+    let recorded = log(&checked(fixture.cli("build").args(["--", "Demo"])));
+    assert!(recorded.contains("nothing to record"), "{recorded}");
+    let writes = fixture.server.writes.lock().unwrap().len();
+    let put = log(&checked(&mut fixture.cli("put")));
+    assert!(put.contains("is published already"), "{put}");
+    assert_eq!(fixture.server.writes.lock().unwrap().len(), writes);
 }
 
 #[test]
