@@ -14,7 +14,14 @@ create_exception!(
     covalence,
     Error,
     PyException,
-    "The base class of IntegrityError, StoreError and UnsupportedError."
+    "The base class of IntegrityError, SqliteError, StoreError and UnsupportedError."
+);
+
+create_exception!(
+    covalence,
+    SqliteError,
+    Error,
+    "SQLite refused a statement or a database."
 );
 
 /// A subclass of [`Error`] and `base`, made once. `create_exception!` takes
@@ -70,6 +77,7 @@ pub(crate) fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
     m.add("Error", py.get_type::<Error>())?;
     m.add("IntegrityError", integrity_error(py)?)?;
+    m.add("SqliteError", py.get_type::<SqliteError>())?;
     m.add("StoreError", store_error(py)?)?;
     m.add("UnsupportedError", unsupported_error(py)?)
 }
@@ -87,6 +95,8 @@ pub(crate) enum Class {
     Unsupported,
     /// `OSError`: a local file failed.
     Os,
+    /// `SqliteError`.
+    Sqlite,
 }
 
 /// `message` as an exception of `class`.
@@ -95,6 +105,7 @@ pub(crate) fn raise_as(class: Class, message: impl Display) -> PyErr {
     let class = match class {
         Class::Value => return PyValueError::new_err(message),
         Class::Os => return PyOSError::new_err(message),
+        Class::Sqlite => return SqliteError::new_err(message),
         Class::Integrity => integrity_error,
         Class::Store => store_error,
         Class::Unsupported => unsupported_error,
@@ -188,6 +199,20 @@ impl Raise for covalence_cas_trait::Error {
             Unsupported { .. } => Class::Unsupported,
             Backend { .. } => Class::Store,
             Io { .. } => Class::Os,
+            _ => Class::Value,
+        }
+    }
+}
+
+impl Raise for covalence_sqlite_cas::Error {
+    fn class(&self) -> Class {
+        use covalence_sqlite_cas::Error::*;
+        match self {
+            Corrupt { .. } | Length { .. } => Class::Integrity,
+            Missing { .. } | Store { .. } => Class::Store,
+            Unsupported { .. } => Class::Unsupported,
+            Io { .. } => Class::Os,
+            Vfs { .. } | Sqlite { .. } => Class::Sqlite,
             _ => Class::Value,
         }
     }

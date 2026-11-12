@@ -9,6 +9,9 @@ Errors
 .. autoexception:: IntegrityError
    :show-inheritance:
 
+.. autoexception:: SqliteError
+   :show-inheritance:
+
 .. autoexception:: StoreError
    :show-inheritance:
 

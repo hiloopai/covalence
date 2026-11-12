@@ -1128,6 +1128,7 @@ dependencies = [
  "covalence-lib-dasl",
  "covalence-lib-data",
  "covalence-lib-python",
+ "covalence-sqlite-cas",
  "pep440_rs",
  "tempfile",
  "toml",

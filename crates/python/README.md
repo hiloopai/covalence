@@ -1,7 +1,7 @@
 # Covalence for Python
 
-Content identifiers (CIDs), DASL values, and content-addressed and key-value
-stores, from Python.
+Content identifiers (CIDs), DASL values, content-addressed and key-value
+stores, and read-only SQLite databases opened from those stores, from Python.
 
 `covalence.config` also provides application directories and TOML configuration.
 
@@ -326,6 +326,107 @@ finished; the original descriptor remains open. Duplicates share a file
 position, so the caller must also keep the original descriptor exclusively
 owned during the operation.
 
+## SQLite databases
+
+`SqliteDatabase` opens a SQLite database file that a `Cas` holds under its
+CID. The database is read-only, and is never copied to a path of its own.
+
+```pycon
+>>> import sqlite3
+>>> from covalence import Cas, ChunkManifest, SqliteDatabase
+>>> source = sqlite3.connect(":memory:")
+>>> _ = source.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+>>> _ = source.executemany("INSERT INTO notes (body) VALUES (?)", [("first",), ("second",)])
+>>> source.commit()
+>>> data = source.serialize()
+>>> source.close()
+>>> store = Cas.memory()
+>>> database_cid = store.put(data)
+>>> database = SqliteDatabase.open(store, database_cid)
+>>> with database.connect() as connection:
+...     connection.execute("SELECT body FROM notes WHERE id = ?", (2,)).fetchall()
+[('second',)]
+
+```
+
+`SqliteDatabase.open(cas, cid)` returns `None` if the store lacks `cid`.
+A CID is the hash of all the bytes, so it can be checked only with all the
+bytes at hand. `verify=` says what to do about that:
+
+- `"download"`, the default, does not trust the store. It downloads all the
+  bytes to a local file with no name and checks them against `cid` before
+  SQLite reads any; other bytes raise `IntegrityError`. It accepts at most
+  `max_bytes=` bytes, 1 GiB by default, and needs a BLAKE3, SHA-256 or SHA-1
+  CID.
+- `"trusted-ranges"` fetches only the byte ranges that queries read, as
+  `Cas.get_range` gives them, and checks nothing against `cid`. Use it only
+  for a store trusted as much as a local file.
+- A `ChunkManifest` fetches ranges and checks every chunk against the
+  manifest before SQLite sees it, so the store need not be trusted. The
+  manifest holds the digest of each fixed-size chunk of the database, and
+  must itself come from somewhere trusted, such as a CID you trust:
+
+  ```pycon
+  >>> manifest = ChunkManifest.of(data, chunk_size=4096)
+  >>> manifest
+  ChunkManifest(size=8192, chunk_size=4096, hash='blake3')
+  >>> trusted = manifest.put(store)
+  >>> checked = SqliteDatabase.open(store, database_cid, verify=ChunkManifest.load(store, trusted))
+  >>> connection = checked.connect()
+  >>> connection.execute("SELECT count(*) FROM notes").fetchone()
+  (2,)
+  >>> checked.stats()["fetches"]
+  2
+
+  ```
+
+- `"blake3-ranges"`, ranges proven against a BLAKE3 CID itself, is not
+  supported yet. It raises `UnsupportedError` and never falls back to
+  another mode.
+
+When ranges are read, three options decide what that costs. `stats()` counts
+the reads and the requests, to compare them on your own queries:
+
+- `block_size=` is the unit that is fetched and cached: 4096 bytes by
+  default, or the manifest's chunk size.
+- `fetch=` sizes a request when a read misses the cache: `"read-ahead"` (the
+  default) grows requests while reads are sequential, up to `fetch_bytes=`;
+  `"aligned"` fetches fixed windows of `fetch_bytes=`; `"exact"` fetches only
+  what is read. `set_fetch` changes it on an open database, such as before a
+  scan.
+- `cache=` keeps fetched blocks for all connections: `"memory"` (the
+  default, 32 MiB), `"file"` or `"none"`, holding up to `cache_bytes=`.
+
+Connections and cursors follow DB-API (PEP 249) where a read-only database
+has use for it: `execute`, `fetchone`, `fetchmany`, `fetchall`, `description`,
+iteration and `close`.
+
+```pycon
+>>> cursor = connection.execute("SELECT id, body FROM notes WHERE body LIKE :start", {"start": "f%"})
+>>> [column[0] for column in cursor.description], list(cursor)
+(['id', 'body'], [(1, 'first')])
+>>> connection.execute("DELETE FROM notes")
+Traceback (most recent call last):
+    ...
+covalence.SqliteError: attempt to write a readonly database
+>>> connection.close()
+
+```
+
+- These are not `sqlite3` connections: Python's `sqlite3` module uses a
+  SQLite library of its own, which cannot read from a store.
+- Every write to the database raises `SqliteError`, as do `ATTACH` and
+  `VACUUM INTO`: a connection opens no other database. Temporary tables can
+  be written, and stay in local temporary storage.
+- `execute` runs one statement to its end and keeps its rows in memory until
+  they are fetched.
+- A connection can be used from any thread and runs one statement at a time;
+  open one for each thread to read in parallel.
+- A read that fails raises its cause: `IntegrityError` for bytes a manifest
+  refused or a store that gave too few, `StoreError` for a store that failed.
+- A store without ranges of its own, such as a compressed `Cas.kv`, reads
+  the whole value for each range: download from those instead.
+
 ## Blobs and facts
 
 - `Blob` is bytes read whole or by range:
@@ -359,6 +460,7 @@ owned during the operation.
   below 0 or of 2**64 or more where a size, offset or code is expected.
 - Other failures raise a subclass of `covalence.Error`:
   - `IntegrityError` (also a `ValueError`) when data does not match its CID;
+  - `SqliteError` when SQLite refuses a statement or a database;
   - `StoreError` (also an `OSError`) when a store's storage fails;
   - `UnsupportedError` (also a `NotImplementedError`) for an unsupported
     operation, such as hashing with an unknown function.

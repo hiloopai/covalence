@@ -1,8 +1,8 @@
 covalence
 =========
 
-Content identifiers (CIDs), DASL values, and content-addressed and key-value
-stores, from Python.
+Content identifiers (CIDs), DASL values, content-addressed and key-value
+stores, and read-only SQLite databases opened from those stores, from Python.
 
 - The `README <https://github.com/hiloopai/covalence/tree/main/crates/python#readme>`__
   explains the terms and how the stores behave.
@@ -15,4 +15,5 @@ stores, from Python.
    values
    stores
    blobs
+   sqlite
    errors
