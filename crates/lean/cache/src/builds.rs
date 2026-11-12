@@ -275,7 +275,7 @@ impl Manifest {
         tree: String,
         targets: &[String],
     ) -> Result<Option<Self>> {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if let Some(package) = packages.iter().find(|package| folder(package).is_none()) {
             println!(
                 "Lake cache: no build manifest: {} lies outside the workspace",
@@ -292,6 +292,7 @@ impl Manifest {
             }
         }
         let mut files = BTreeMap::new();
+        let mut executables = 0;
         for folder in packages.iter().filter_map(folder) {
             let Some(found) = walk(&project.root.join(&folder))? else {
                 println!(
@@ -321,6 +322,16 @@ impl Manifest {
                 {
                     continue;
                 }
+                // Executables stay out, as seeds leave them to the pool:
+                // Lake links one when a target needs it.
+                if path
+                    .strip_prefix(project.root.join(&folder).join("bin"))
+                    .is_ok()
+                    && metadata.permissions().mode() & 0o111 != 0
+                {
+                    executables += 1;
+                    continue;
+                }
                 let content = match cached.get(&(metadata.dev(), metadata.ino())) {
                     Some(name) => Content::Link(name.clone()),
                     None if metadata.len() <= TEXT_LIMIT => {
@@ -344,6 +355,11 @@ impl Manifest {
                 };
                 files.insert(relative, content);
             }
+        }
+        if executables > 0 {
+            println!(
+                "Lake cache: the build manifest leaves out {executables} executables, which Lake links when a target needs them"
+            );
         }
         Ok(Some(Self {
             lake,
@@ -491,7 +507,7 @@ impl Manifest {
         }
         fs::write(&marker, self.mark()).operation("mark the placed build")?;
         println!(
-            "Lake cache: placed the build of tree {} ({} files) in {:.1} s; Lake has nothing to do",
+            "Lake cache: placed the build of tree {} ({} files) in {:.1} s; Lake has nothing to rebuild",
             self.tree,
             self.files.len(),
             started.elapsed().as_secs_f64()
@@ -506,7 +522,7 @@ impl Manifest {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use super::*;
     use crate::project::Source;
@@ -537,6 +553,11 @@ mod tests {
         .unwrap();
         fs::write(lib.join("A.olean.hash"), "0123456789abcdef").unwrap();
         fs::write(lib.join("A.trace"), r#"{"depHash": "1"}"#).unwrap();
+        // An executable Lake linked, which seeds leave to the pool too.
+        let bin = one.join(".lake/build/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("tool"), [0xff, 0xfe, 0x00]).unwrap();
+        fs::set_permissions(bin.join("tool"), fs::Permissions::from_mode(0o755)).unwrap();
         let packages = [
             Package {
                 name: "root".into(),
