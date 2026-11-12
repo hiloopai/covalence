@@ -159,8 +159,13 @@ impl Get for Store {
 
     fn size_unchecked(&self, _key: &Cid) -> Result<Option<u64>, Error> {
         self.calls.lock().unwrap().push(Call::Size);
-        let missing = *self.fault.lock().unwrap() == Fault::Missing;
-        Ok((!missing).then(|| *self.size.lock().unwrap()))
+        match *self.fault.lock().unwrap() {
+            Fault::Missing => Ok(None),
+            Fault::Fail => Err(Error::Backend {
+                source: "the store is down".into(),
+            }),
+            _ => Ok(Some(*self.size.lock().unwrap())),
+        }
     }
 
     fn get_range_unchecked(

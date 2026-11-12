@@ -368,3 +368,57 @@ fn caches_save_fetches_and_each_database_has_its_own() {
     assert_eq!(rows(&second.connect().unwrap(), QUERIES[0]), ["10|45|2000"]);
     assert_eq!(answers(&first.connect().unwrap()), expected);
 }
+
+#[cfg(unix)]
+#[test]
+fn other_files_attach_only_read_only_and_only_if_the_connection_allows() {
+    use covalence_sqlite_cas::rusqlite::limits::Limit;
+
+    let (_dir, path) = sample_file(10);
+    let store = Store::new(sample(10));
+    let database = Database::open(store.clone(), &store.blake3(), Options::new()).unwrap();
+    let connection = database.connect().unwrap();
+    let attach =
+        |name: &str, target: &str| connection.execute(&format!("ATTACH ?1 AS {name}"), [target]);
+
+    // A path is asked of this crate's VFS, which knows only its databases.
+    attach("plain", path.to_str().unwrap()).unwrap_err();
+
+    // A URI can name another VFS. The file opens read-only, as the
+    // connection is, and cannot be opened for writing.
+    let uri = format!("file:{}?vfs=unix", path.display());
+    attach("other", &uri).unwrap();
+    assert_eq!(
+        rows(&connection, "SELECT count(*) FROM other.items"),
+        ["10"]
+    );
+    let error = connection
+        .execute("DELETE FROM other.items", [])
+        .unwrap_err();
+    assert!(error.to_string().contains("readonly"), "{error}");
+    for mode in ["rw", "rwc"] {
+        attach("writable", &format!("{uri}&mode={mode}")).unwrap_err();
+    }
+    connection.execute_batch("DETACH other").unwrap();
+
+    // Even a database in memory attaches read-only. Temporary tables are
+    // the connection's place to write.
+    attach("scratch", ":memory:").unwrap();
+    let error = connection
+        .execute_batch("CREATE TABLE scratch.t (n)")
+        .unwrap_err();
+    assert!(error.to_string().contains("readonly"), "{error}");
+    connection.execute_batch("DETACH scratch").unwrap();
+    connection
+        .execute_batch("CREATE TEMP TABLE t AS SELECT count(*) AS n FROM main.items")
+        .unwrap();
+    assert_eq!(rows(&connection, "SELECT n FROM temp.t"), ["10"]);
+
+    // A connection that runs SQL it does not trust can refuse every `ATTACH`.
+    connection
+        .set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)
+        .unwrap();
+    attach("other", &uri).unwrap_err();
+    attach("scratch", ":memory:").unwrap_err();
+    assert_eq!(rows(&connection, "SELECT count(*) FROM items"), ["10"]);
+}

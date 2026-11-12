@@ -78,9 +78,10 @@ pub enum Error {
         /// The VFS's error.
         source: vfs::Error,
     },
-    /// SQLite refused the database: it is not a database file, or reading it
-    /// failed. [`Database::last_error`](crate::Database::last_error) has the
-    /// cause of a failed read.
+    /// SQLite failed: the bytes are not a database file, a statement is wrong
+    /// or tried to write, or a read failed.
+    /// [`Database::explain`](crate::Database::explain) gives the cause of a
+    /// failed read.
     #[snafu(display("{source}"))]
     Sqlite {
         /// SQLite's error.
