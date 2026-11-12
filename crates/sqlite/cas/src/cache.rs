@@ -88,6 +88,16 @@ pub trait BlockCache: Send + Sync {
 
     /// Offer all the bytes of `block` to the cache, which may keep them.
     fn insert(&self, block: u64, bytes: &[u8]);
+
+    /// The most blocks the cache holds at once, or `None` if it has no such
+    /// limit or cannot say.
+    ///
+    /// One request to the store fetches no more blocks than this, unless a
+    /// single read needs more: blocks the cache cannot hold would be fetched
+    /// for nothing.
+    fn capacity(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Builds the block cache of a database when it is opened.
@@ -110,8 +120,8 @@ where
 
 /// Keeps nothing: every read SQLite makes is fetched.
 ///
-/// Blocks fetched ahead of need are dropped, so this suits only policies that
-/// fetch exactly what is read, such as [`Exact`](crate::fetch::Exact).
+/// Its [`capacity`](BlockCache::capacity) is 0, so every fetch policy fetches
+/// only the blocks that are read, as [`Exact`](crate::fetch::Exact) does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NoCache;
 
@@ -120,6 +130,9 @@ impl BlockCache for NoCache {
         false
     }
     fn insert(&self, _block: u64, _bytes: &[u8]) {}
+    fn capacity(&self) -> Option<u64> {
+        Some(0)
+    }
 }
 
 impl CachePolicy for NoCache {
@@ -378,6 +391,10 @@ impl<A: Arena> BlockCache for ClockCache<A> {
             state.slot_of.insert(block, slot);
         }
     }
+
+    fn capacity(&self) -> Option<u64> {
+        Some(self.capacity as u64)
+    }
 }
 
 #[cfg(test)]
@@ -535,6 +552,21 @@ mod tests {
         let cache = NoCache.build(LAYOUT).unwrap();
         fill(&*cache, LAYOUT, 0..11);
         assert_eq!(held(&*cache, LAYOUT), [] as [u64; 0]);
+    }
+
+    #[test]
+    fn caches_say_how_many_blocks_they_hold() {
+        assert_eq!(NoCache.build(LAYOUT).unwrap().capacity(), Some(0));
+        for (bytes, blocks) in [(0, 0), (7, 0), (8, 1), (31, 3), (88, 11), (u64::MAX, 11)] {
+            for policy in policies(bytes) {
+                assert_eq!(policy.build(LAYOUT).unwrap().capacity(), Some(blocks));
+            }
+        }
+        let arena = Heap {
+            block: 8,
+            slots: Vec::new(),
+        };
+        assert_eq!(ClockCache::new(arena, LAYOUT, 5).capacity(), Some(5));
     }
 
     #[test]

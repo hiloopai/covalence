@@ -165,9 +165,11 @@ impl Registered {
     ///   that needed the bytes.
     /// - The connection is not serialized (`SQLITE_OPEN_NO_MUTEX`): use it
     ///   from one thread at a time, as `rusqlite` enforces.
-    /// - SQL run on the connection can still `ATTACH` files through other
-    ///   VFSes. Callers that run untrusted SQL should forbid that, for example
-    ///   with an authorizer or `SQLITE_LIMIT_ATTACHED`.
+    /// - SQL run on the connection can still reach files of other VFSes. A
+    ///   URI that names a VFS lets `ATTACH` read a local file and
+    ///   `VACUUM INTO` write a new one. Callers that run SQL they do not
+    ///   trust should set `SQLITE_LIMIT_ATTACHED` to 0 (the `limits`
+    ///   feature), which refuses both.
     pub fn open(&self, file: &str) -> Result<Connection, Error> {
         let uri = file
             .get(..5)

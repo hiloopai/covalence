@@ -19,15 +19,14 @@ covalence-lib-cid.workspace = true
 covalence-lib-dasl.workspace = true
 covalence-lib-data.workspace = true
 covalence-lib-error.workspace = true
-covalence-lib-sqlite.workspace = true
+# `limits`: connections refuse `ATTACH`.
+covalence-lib-sqlite = { workspace = true, features = ["limits"] }
 sha1 = "0.11.0"
 sha2.workspace = true
 tempfile = "3.27.0"
 
 [dev-dependencies]
 covalence-cas-memory.workspace = true
-# For the test that refuses `ATTACH` with a connection limit.
-covalence-lib-sqlite = { workspace = true, features = ["limits"] }
 
 [package.metadata.docs.rs]
 all-features = true

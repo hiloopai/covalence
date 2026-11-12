@@ -13,7 +13,7 @@ use covalence_lib_cid::Cid;
 use covalence_lib_error::snafu::{OptionExt, ResultExt, ensure};
 use covalence_lib_sqlite::{
     Connection,
-    rusqlite::{self, config::DbConfig, ffi::ErrorCode},
+    rusqlite::{self, config::DbConfig, ffi::ErrorCode, limits::Limit},
     vfs,
 };
 
@@ -158,6 +158,11 @@ impl Database {
     ///   checked as they are read (`cell_size_check` is on), as SQLite
     ///   advises for database files from elsewhere. Both can be changed on
     ///   the connection.
+    /// - No other database can be attached: `SQLITE_LIMIT_ATTACHED` is 0, so
+    ///   `ATTACH` and `VACUUM INTO` fail. SQLite would let either name
+    ///   another VFS in a URI, and so read a local file or write a new one.
+    ///   Code that wants to attach raises the limit with
+    ///   [`Connection::set_limit`].
     /// - SQLite's temporary files, such as the spill of a large sort, are
     ///   local files of the system's default VFS.
     ///
@@ -174,6 +179,7 @@ impl Database {
             Err(source) => return Err(Error::Vfs { source }),
         };
         let prepare = || {
+            connection.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
             connection.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
             connection.pragma_update(None, "cell_size_check", true)?;
             // Reads the schema, so that a file that is no database fails here.

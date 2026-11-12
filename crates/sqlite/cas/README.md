@@ -157,10 +157,13 @@ refused, `Error::Length` for a short answer, or `Error::Store`.
 - The schema comes from the database, so connections open with
   `trusted_schema` off and `cell_size_check` on, as SQLite advises for files
   from elsewhere.
-- SQL can still `ATTACH` other local files for reading through a URI that
-  names another VFS. A connection that runs SQL it does not trust can set
-  `SQLITE_LIMIT_ATTACHED` to 0 (the `limits` feature of
-  `covalence-lib-sqlite`).
+- No other database can be attached. SQLite lets `ATTACH` and `VACUUM INTO`
+  name another VFS in a URI, and so read a local file or write a new one.
+  Connections therefore open with `SQLITE_LIMIT_ATTACHED` at 0, and both
+  statements fail. Code that wants to attach raises the limit with
+  `Connection::set_limit`; SQL cannot.
+- This keeps the database and other files as they are. It does not bound the
+  time, memory or temporary disk space that a statement uses.
 - A store without ranges of its own answers each range by reading the whole
   value. Reading ranges from such a store costs more than one download.
 - Two reads that miss the same block at the same time both fetch it.

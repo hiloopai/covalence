@@ -106,7 +106,7 @@ impl Ranges {
         let need = at / block_size..end.div_ceil(block_size);
         let policy = Arc::clone(&self.policy.read().unwrap_or_else(PoisonError::into_inner));
         let miss = Miss::new(need.clone(), self.layout.blocks(), block_size);
-        let blocks = window(&need, policy.plan(&miss), &miss);
+        let blocks = window(&need, policy.plan(&miss), &miss, self.cache.capacity());
         let start = blocks.start * block_size;
         let len = (blocks.end.saturating_mul(block_size)).min(size) - start;
 
@@ -145,10 +145,13 @@ impl Ranges {
 }
 
 /// The blocks to fetch for `miss`: `plan`, widened to hold `need`, and cut to
-/// the database and to the most bytes of one fetch. An empty plan is `need`.
-fn window(need: &Range<u64>, plan: Range<u64>, miss: &Miss) -> Range<u64> {
+/// the database, to the most bytes of one fetch and to the `room` of the
+/// cache, if it has a limit. An empty plan is `need`.
+fn window(need: &Range<u64>, plan: Range<u64>, miss: &Miss, room: Option<u64>) -> Range<u64> {
     let plan = if plan.is_empty() { need.clone() } else { plan };
-    let most = (MAX_BLOCK_SIZE / miss.block_size.max(1)).max(need.end - need.start);
+    let most = MAX_BLOCK_SIZE / miss.block_size.max(1);
+    let most = room.map_or(most, |room| most.min(room));
+    let most = most.max(need.end - need.start);
     let end = (plan.end.max(need.end).min(miss.blocks)).min(need.start.saturating_add(most));
     let start = plan.start.min(need.start).max(end.saturating_sub(most));
     start..end
@@ -163,7 +166,7 @@ mod tests {
         let miss = |need: Range<u64>| Miss::new(need, 1_000, 4096);
         let check = |need: Range<u64>, plan: Range<u64>, expected: Range<u64>| {
             assert_eq!(
-                window(&need, plan.clone(), &miss(need.clone())),
+                window(&need, plan.clone(), &miss(need.clone()), None),
                 expected,
                 "{plan:?}"
             );
@@ -186,15 +189,33 @@ mod tests {
         // A fetch is at most `MAX_BLOCK_SIZE` bytes, taken from the need on.
         let most = MAX_BLOCK_SIZE / 4096;
         let large = Miss::new(most..most + 2, 10 * most, 4096);
-        assert_eq!(window(&large.need, 0..u64::MAX, &large), most..2 * most);
-        assert_eq!(window(&large.need, 0..most + 2, &large), 2..most + 2);
+        assert_eq!(
+            window(&large.need, 0..u64::MAX, &large, None),
+            most..2 * most
+        );
+        assert_eq!(window(&large.need, 0..most + 2, &large, None), 2..most + 2);
         // A read that needs more than the limit is still fetched whole.
         let wide = Miss::new(0..10, 10, MAX_BLOCK_SIZE);
-        assert_eq!(window(&wide.need, 0..0, &wide), 0..10);
+        assert_eq!(window(&wide.need, 0..0, &wide, None), 0..10);
         let bytes = Miss::new(5..7, u64::MAX, 1);
         assert_eq!(
-            window(&bytes.need, 0..u64::MAX, &bytes),
+            window(&bytes.need, 0..u64::MAX, &bytes, None),
             5..5 + MAX_BLOCK_SIZE
         );
+    }
+
+    #[test]
+    fn windows_hold_no_more_than_the_cache_unless_the_read_does() {
+        let miss = Miss::new(10..12, 1_000, 4096);
+        let window = |plan: Range<u64>, room: u64| window(&miss.need, plan, &miss, Some(room));
+        // A cache that keeps nothing, or less than the read: only the read.
+        assert_eq!(window(0..1_000, 0), 10..12);
+        assert_eq!(window(0..1_000, 1), 10..12);
+        assert_eq!(window(0..1_000, 2), 10..12);
+        // Else as many blocks as the cache holds, from the read on.
+        assert_eq!(window(0..1_000, 8), 10..18);
+        assert_eq!(window(0..12, 8), 4..12);
+        assert_eq!(window(8..14, 8), 8..14);
+        assert_eq!(window(8..14, u64::MAX), 8..14);
     }
 }

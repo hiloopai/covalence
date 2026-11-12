@@ -11,7 +11,7 @@ use covalence_cas_trait::Put;
 use covalence_lib_cid::{Cid, Multicodec};
 use covalence_sqlite_cas::{
     Database, Error, Options,
-    cache::{FileCache, MemoryCache, NoCache},
+    cache::{BlockCache, FileCache, Layout, MemoryCache, NoCache},
     fetch::{Aligned, Exact, FetchPolicy, Miss, ReadAhead},
     rusqlite::Connection,
     verify::{Manifest, Verification},
@@ -167,7 +167,6 @@ fn the_database_cannot_be_written() {
             "CREATE TABLE more (x)",
             "CREATE INDEX more ON items (payload)",
             "DROP TABLE blobs",
-            "VACUUM",
             "PRAGMA user_version = 7",
             "PRAGMA journal_mode = WAL; CREATE TABLE more (x)",
             "BEGIN IMMEDIATE; DELETE FROM blobs; COMMIT",
@@ -182,6 +181,9 @@ fn the_database_cannot_be_written() {
                 connection.execute_batch("ROLLBACK").unwrap();
             }
         }
+        // `VACUUM` fails sooner: it would attach a database to rebuild into.
+        let error = connection.execute_batch("VACUUM").unwrap_err();
+        assert!(error.to_string().contains("too many attached"), "{error}");
         // Work that needs scratch space still does: it goes to temporary files.
         connection
             .execute_batch(
@@ -278,6 +280,21 @@ impl<F: Fn(&Miss) -> Range<u64> + Send + Sync> FetchPolicy for Recorded<F> {
     }
 }
 
+/// A cache that keeps nothing and has no limit to say: every read is fetched,
+/// as its policy plans it.
+struct Forgetful;
+
+impl BlockCache for Forgetful {
+    fn read(&self, _block: u64, _offset: usize, _buf: &mut [u8]) -> bool {
+        false
+    }
+    fn insert(&self, _block: u64, _bytes: &[u8]) {}
+}
+
+fn forgetful(_layout: Layout) -> std::io::Result<Box<dyn BlockCache>> {
+    Ok(Box::new(Forgetful))
+}
+
 #[test]
 fn fetch_policies_size_the_requests_and_can_be_swapped_while_open() {
     let (bytes, expected) = expected();
@@ -286,7 +303,7 @@ fn fetch_policies_size_the_requests_and_can_be_swapped_while_open() {
     let options = Options::new()
         .verification(Verification::TrustedRanges)
         .fetch(Exact)
-        .cache(NoCache);
+        .cache(forgetful);
     let database = Database::open(store.clone(), &store.blake3(), options).unwrap();
     let connection = database.connect().unwrap();
     store.take_calls();
@@ -335,6 +352,37 @@ fn fetch_policies_size_the_requests_and_can_be_swapped_while_open() {
 }
 
 #[test]
+fn no_request_is_for_more_than_the_cache_can_hold() {
+    let (bytes, expected) = expected();
+    let store = Store::new(bytes);
+    let ranges = |options: Options| {
+        let options = options.verification(Verification::TrustedRanges);
+        let database = Database::open(store.clone(), &store.blake3(), options).unwrap();
+        assert_eq!(store.take_calls(), [Call::Size]);
+        assert_eq!(answers(&database.connect().unwrap()), expected);
+        store.take_ranges()
+    };
+    // A cache that keeps nothing: whatever the policy, only what is read.
+    let exact = ranges(Options::new().fetch(Exact).cache(NoCache));
+    let policies: [Arc<dyn FetchPolicy>; 3] = [
+        Arc::new(Aligned::new(1 << 20)),
+        Arc::new(ReadAhead::default()),
+        Arc::new(Recorded(Default::default(), |_: &Miss| 0..u64::MAX)),
+    ];
+    for policy in policies {
+        assert_eq!(ranges(Options::new().fetch(policy).cache(NoCache)), exact);
+    }
+    // A cache of 8 blocks: no more than 8 blocks at once, and fewer requests.
+    let options = Options::new()
+        .fetch(Aligned::new(1 << 20))
+        .cache(MemoryCache::new(8 * 4096));
+    let small = ranges(options);
+    assert!(small.iter().all(|(_, len)| *len <= 8 * 4096), "{small:?}");
+    assert!(small.iter().any(|(_, len)| *len == 8 * 4096), "{small:?}");
+    assert!(small.len() < exact.len(), "{} {}", small.len(), exact.len());
+}
+
+#[test]
 fn caches_save_fetches_and_each_database_has_its_own() {
     let (bytes, expected) = expected();
     let store = Store::new(bytes);
@@ -371,22 +419,44 @@ fn caches_save_fetches_and_each_database_has_its_own() {
 
 #[cfg(unix)]
 #[test]
-fn other_files_attach_only_read_only_and_only_if_the_connection_allows() {
+fn sql_reaches_no_other_file_unless_the_connection_allows() {
     use covalence_sqlite_cas::rusqlite::limits::Limit;
 
-    let (_dir, path) = sample_file(10);
+    let (dir, path) = sample_file(10);
     let store = Store::new(sample(10));
     let database = Database::open(store.clone(), &store.blake3(), Options::new()).unwrap();
     let connection = database.connect().unwrap();
     let attach =
         |name: &str, target: &str| connection.execute(&format!("ATTACH ?1 AS {name}"), [target]);
+    let vacuum = |target: &str| connection.execute("VACUUM INTO ?1", [target]);
+    let uri = format!("file:{}?vfs=unix", path.display());
+    let copy = dir.path().join("copy.db");
+    let copy_uri = format!("file:{}?vfs=unix", copy.display());
+
+    // As connected, nothing attaches and nothing is written, whatever the name.
+    for target in [path.to_str().unwrap(), &uri, ":memory:", ""] {
+        let error = attach("other", target).unwrap_err();
+        assert!(error.to_string().contains("too many attached"), "{error}");
+    }
+    for target in [copy.to_str().unwrap(), &copy_uri] {
+        let error = vacuum(target).unwrap_err();
+        assert!(error.to_string().contains("too many attached"), "{error}");
+    }
+    assert!(!copy.exists());
+    assert_eq!(rows(&connection, "SELECT count(*) FROM items"), ["10"]);
+
+    // Code can allow it; SQL cannot.
+    connection
+        .set_limit(Limit::SQLITE_LIMIT_ATTACHED, 1)
+        .unwrap();
 
     // A path is asked of this crate's VFS, which knows only its databases.
     attach("plain", path.to_str().unwrap()).unwrap_err();
+    vacuum(copy.to_str().unwrap()).unwrap_err();
+    assert!(!copy.exists());
 
     // A URI can name another VFS. The file opens read-only, as the
     // connection is, and cannot be opened for writing.
-    let uri = format!("file:{}?vfs=unix", path.display());
     attach("other", &uri).unwrap();
     assert_eq!(
         rows(&connection, "SELECT count(*) FROM other.items"),
@@ -396,10 +466,10 @@ fn other_files_attach_only_read_only_and_only_if_the_connection_allows() {
         .execute("DELETE FROM other.items", [])
         .unwrap_err();
     assert!(error.to_string().contains("readonly"), "{error}");
+    connection.execute_batch("DETACH other").unwrap();
     for mode in ["rw", "rwc"] {
         attach("writable", &format!("{uri}&mode={mode}")).unwrap_err();
     }
-    connection.execute_batch("DETACH other").unwrap();
 
     // Even a database in memory attaches read-only. Temporary tables are
     // the connection's place to write.
@@ -414,11 +484,9 @@ fn other_files_attach_only_read_only_and_only_if_the_connection_allows() {
         .unwrap();
     assert_eq!(rows(&connection, "SELECT n FROM temp.t"), ["10"]);
 
-    // A connection that runs SQL it does not trust can refuse every `ATTACH`.
-    connection
-        .set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)
-        .unwrap();
-    attach("other", &uri).unwrap_err();
-    attach("scratch", ":memory:").unwrap_err();
-    assert_eq!(rows(&connection, "SELECT count(*) FROM items"), ["10"]);
+    // And `VACUUM INTO` then writes a copy where a URI says: the reason
+    // connections attach nothing unless code allows it.
+    vacuum(&copy_uri).unwrap();
+    let copied = Connection::open(&copy).unwrap();
+    assert_eq!(rows(&copied, "SELECT count(*) FROM items"), ["10"]);
 }
