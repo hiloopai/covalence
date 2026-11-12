@@ -28,6 +28,11 @@ tempfile = "3.27.0"
 [dev-dependencies]
 covalence-cas-memory.workspace = true
 
+# Measures the fetch, cache and verification policies: see its first lines.
+[[bench]]
+name = "policies"
+harness = false
+
 [package.metadata.docs.rs]
 all-features = true
 
