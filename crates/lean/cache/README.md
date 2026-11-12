@@ -227,6 +227,7 @@ overlay, which reads `LAKE_OUTPUTS_ENDPOINT`; stock Lake never asks, and builds.
 
 ```sh
 cov-lake-cache build --adopt -- Demo     # Lake takes internal outputs; lists them
+cov-lake-cache adopted > modules.txt     # the modules those outputs belong to
 cov-kernel-checker lean-check replay-built --project . --modules modules.txt
 cov-lake-cache put --replayed .lake/declaration-replay/last-run.json
 ```

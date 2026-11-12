@@ -1297,14 +1297,12 @@ fn internal_builds_share_outputs_and_main_adopts_them_after_a_kernel_replay() {
     let refused = fixture.cli("put").output().unwrap();
     assert!(!refused.status.success());
     assert!(log(&refused).contains("--replayed"), "{}", log(&refused));
-    let modules = fs::read_dir(fixture.root.join(".lake/build/lib/lean/Demo"))
-        .unwrap()
-        .filter_map(|entry| {
-            let name = entry.unwrap().file_name().into_string().unwrap();
-            name.strip_suffix(".trace")
-                .map(|module| serde_json::json!({"status": "kernel_replayed", "module": format!("Demo.{module}")}))
-        })
-        .chain([serde_json::json!({"status": "kernel_replayed", "module": "Demo"})])
+    // The replay covers the modules `adopted` lists.
+    let listed = String::from_utf8(checked(&mut fixture.cli("adopted")).stdout).unwrap();
+    assert!(listed.lines().any(|module| module == "Demo.A"), "{listed}");
+    let modules = listed
+        .lines()
+        .map(|module| serde_json::json!({"status": "kernel_replayed", "module": module}))
         .collect::<Vec<_>>();
     let report = fixture.temporary.path().join("last-run.json");
     fs::write(

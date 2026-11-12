@@ -41,6 +41,9 @@ enum Action {
     Gc,
     /// Print the targets a change from `--base` can affect.
     Scope,
+    /// Print the modules `build --adopt` took internal outputs for, one per
+    /// line, for the kernel replay `put --replayed` requires.
+    Adopted,
 }
 
 #[derive(Parser)]
@@ -134,8 +137,8 @@ fn execute(cli: Cli) -> Result<()> {
     if !matches!(cli.action, Action::Scope) && (cli.base.is_some() || !cli.exclude.is_empty()) {
         return Err(invalid("--base and --exclude apply to scope"));
     }
-    if matches!(cli.action, Action::Gc) && !cli.targets.is_empty() {
-        return Err(invalid("gc accepts no targets"));
+    if matches!(cli.action, Action::Gc | Action::Adopted) && !cli.targets.is_empty() {
+        return Err(invalid("gc and adopted accept no targets"));
     }
     if cli.seed && !matches!(cli.action, Action::Get) {
         return Err(invalid("--seed applies to get"));
@@ -151,14 +154,14 @@ fn execute(cli: Cli) -> Result<()> {
     if project.repository.is_empty()
         && !matches!(
             cli.action,
-            Action::Dependencies | Action::Gc | Action::Scope
+            Action::Dependencies | Action::Gc | Action::Scope | Action::Adopted
         )
     {
         return Err(invalid("--repository or GITHUB_REPOSITORY is required"));
     }
     let cache = project.cache_dir()?;
     // gc itself takes the lock exclusively.
-    let in_use = (!matches!(cli.action, Action::Gc | Action::Scope))
+    let in_use = (!matches!(cli.action, Action::Gc | Action::Scope | Action::Adopted))
         .then(|| gc::in_use(&cache))
         .transpose()?;
     let store = || {
@@ -203,6 +206,16 @@ fn execute(cli: Cli) -> Result<()> {
                 gc::after_restore(&cache)
             }
             Action::Gc => gc::collect(&cache),
+            Action::Adopted => {
+                if let Some(adoption) =
+                    internal::Adoption::load(&internal::adoption_list(&project))?
+                {
+                    for module in adoption.modules(&project, &project.packages()?)? {
+                        println!("{module}");
+                    }
+                }
+                Ok(())
+            }
             Action::Scope => {
                 let base = cli.base.ok_or_else(|| invalid("scope requires --base"))?;
                 let targets = scope::scope(&project, &base, &cli.exclude, &cli.targets)?;
