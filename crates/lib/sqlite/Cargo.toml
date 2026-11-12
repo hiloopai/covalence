@@ -13,12 +13,23 @@ publish = true
 
 [features]
 hooks = ["rusqlite/hooks"]
+limits = ["rusqlite/limits"]
 
 [dependencies]
+covalence-lib-error.workspace = true
 rusqlite = { version = "0.40.2", features = ["blob", "bundled", "functions"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
 
 [package.metadata.docs.rs]
 all-features = true
 
-[lints]
-workspace = true
+# A copy of [workspace.lints]; keep in sync. Unsafe code is denied rather than
+# forbidden so that the private `vfs::ffi` module, which implements SQLite's C
+# callbacks, can allow it.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
