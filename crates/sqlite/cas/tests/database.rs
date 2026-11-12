@@ -352,7 +352,7 @@ fn fetch_policies_size_the_requests_and_can_be_swapped_while_open() {
 }
 
 #[test]
-fn no_request_is_for_more_than_the_cache_can_hold() {
+fn no_request_is_for_more_than_a_quarter_of_the_cache() {
     let (bytes, expected) = expected();
     let store = Store::new(bytes);
     let ranges = |options: Options| {
@@ -372,10 +372,10 @@ fn no_request_is_for_more_than_the_cache_can_hold() {
     for policy in policies {
         assert_eq!(ranges(Options::new().fetch(policy).cache(NoCache)), exact);
     }
-    // A cache of 8 blocks: no more than 8 blocks at once, and fewer requests.
+    // A cache of 32 blocks: no more than 8 blocks at once, and fewer requests.
     let options = Options::new()
         .fetch(Aligned::new(1 << 20))
-        .cache(MemoryCache::new(8 * 4096));
+        .cache(MemoryCache::new(32 * 4096));
     let small = ranges(options);
     assert!(small.iter().all(|(_, len)| *len <= 8 * 4096), "{small:?}");
     assert!(small.iter().any(|(_, len)| *len == 8 * 4096), "{small:?}");

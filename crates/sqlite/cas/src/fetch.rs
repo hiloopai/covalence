@@ -101,77 +101,132 @@ impl FetchPolicy for Aligned {
     }
 }
 
-/// Fetches ahead of sequential reads, in windows that double.
+/// Fetches ahead of sequential reads, in windows that grow.
 ///
-/// - A read that starts a new place in the database fetches only the blocks
-///   it needs, as [`Exact`] does, so scattered lookups stay small.
-/// - A read that continues where an earlier fetch ended, or skips at most
-///   that fetch's length past it, fetches twice as much as that fetch did,
-///   up to the largest window. A scan soon reads in large requests.
+/// - A read at a new place fetches a first window from where it starts:
+///   64 KiB unless [`ReadAhead::first`] says otherwise, and never less than
+///   the read needs. Scattered lookups cost that much each.
+/// - A read near an earlier fetch continues it: the next fetch starts where
+///   that one ended and is four times as long, up to the largest window. A
+///   scan soon reads in large requests.
+/// - Near is within that fetch's length of either end of it, so scans are
+///   followed towards the end of the database and towards its start. The
+///   blocks between are fetched too: SQLite scans a table by jumping ahead
+///   to a page of its tree and coming back.
 /// - Several interleaved scans are followed at once, such as two connections
 ///   scanning, or a join walking an index and a table.
+///
+/// The sizes to choose depend on the store. A request costs its round trip,
+/// which is the time of some number of bytes at the store's speed: 1.5 MB
+/// for 15 ms at 100 MB/s. A first window that is a small part of that costs
+/// little, and a largest window several times that leaves little to gain.
+///
+/// ```
+/// use covalence_sqlite_cas::fetch::{FetchPolicy, Miss, ReadAhead};
+///
+/// // A database of 10,000 blocks of 4 KiB, read from block 100 on.
+/// let miss = |block: u64| Miss::new(block..block + 1, 10_000, 4096);
+/// let policy = ReadAhead::new(1 << 20).first(16 << 10);
+/// assert_eq!(policy.plan(&miss(100)), 100..104);
+/// assert_eq!(policy.plan(&miss(104)), 104..120);
+/// assert_eq!(policy.plan(&miss(120)), 120..184);
+/// assert_eq!(policy.plan(&miss(184)), 184..440);
+/// assert_eq!(policy.plan(&miss(440)), 440..696);
+/// // A read somewhere else starts small again.
+/// assert_eq!(policy.plan(&miss(5_000)), 5_000..5_004);
+/// ```
 #[derive(Debug)]
 pub struct ReadAhead {
+    /// The first window, in bytes.
+    first: u64,
     /// The largest window, in bytes.
     max: u64,
     /// The most scans followed at once.
     limit: usize,
-    /// The scans being followed, least recently continued first.
-    heads: Mutex<VecDeque<Head>>,
-}
-
-/// A scan: where its last fetch ended and how many blocks it fetched.
-#[derive(Clone, Copy, Debug)]
-struct Head {
-    next: u64,
-    window: u64,
+    /// The last fetch of each scan followed, least recently continued first.
+    followed: Mutex<VecDeque<Range<u64>>>,
 }
 
 impl ReadAhead {
-    /// The scans followed at once by [`ReadAhead::new`].
+    /// The first window unless [`ReadAhead::first`] sets another: 64 KiB.
+    pub const FIRST: u64 = 64 << 10;
+
+    /// The largest window of [`ReadAhead::default`]: 4 MiB.
+    pub const MAX: u64 = 4 << 20;
+
+    /// The scans followed at once unless [`ReadAhead::scans`] sets another number.
     pub const SCANS: usize = 8;
 
-    /// Windows that grow to `max_bytes`, following up to [`ReadAhead::SCANS`] scans.
+    /// What a window is multiplied by each time its scan continues.
+    const GROWTH: u64 = 4;
+
+    /// Windows that grow from [`ReadAhead::FIRST`] bytes to `max_bytes`.
+    ///
+    /// Sizes are rounded down to whole blocks and up to one block, and no
+    /// window is larger than `max_bytes` unless a read needs more.
     pub fn new(max_bytes: u64) -> Self {
-        Self::with_scans(max_bytes, Self::SCANS)
+        Self {
+            first: Self::FIRST,
+            max: max_bytes,
+            limit: Self::SCANS,
+            followed: Mutex::default(),
+        }
     }
 
-    /// Windows that grow to `max_bytes`, following up to `scans` scans, at least one.
-    pub fn with_scans(max_bytes: u64, scans: usize) -> Self {
-        Self {
-            max: max_bytes,
-            limit: scans.max(1),
-            heads: Mutex::default(),
-        }
+    /// The same policy with a first window of `bytes` bytes.
+    ///
+    /// With 0 a read at a new place fetches only the blocks it needs, as
+    /// [`Exact`] does.
+    pub fn first(mut self, bytes: u64) -> Self {
+        self.first = bytes;
+        self
+    }
+
+    /// The same policy following up to `scans` scans at once, at least one.
+    pub fn scans(mut self, scans: usize) -> Self {
+        self.limit = scans.max(1);
+        self
     }
 }
 
 impl Default for ReadAhead {
-    /// Windows that grow to 1 MiB.
+    /// Windows that grow from 64 KiB to 4 MiB.
     fn default() -> Self {
-        Self::new(1 << 20)
+        Self::new(Self::MAX)
     }
 }
 
 impl FetchPolicy for ReadAhead {
     fn plan(&self, miss: &Miss) -> Range<u64> {
         let Range { start, end } = miss.need;
-        let need = end.saturating_sub(start);
-        let mut heads = self.heads.lock().unwrap_or_else(PoisonError::into_inner);
-        let continued = heads
-            .iter()
-            .position(|head| head.next <= start && start - head.next <= head.window);
-        let window = match continued.and_then(|at| heads.remove(at)) {
-            Some(head) => head.window.saturating_mul(2).min(miss.blocks_in(self.max)),
-            None => need,
+        let most = miss.blocks_in(self.max);
+        let len = |fetch: &Range<u64>| fetch.end.saturating_sub(fetch.start);
+        let grown = |last: &Range<u64>| len(last).saturating_mul(Self::GROWTH).min(most);
+        let mut followed = self.followed.lock().unwrap_or_else(PoisonError::into_inner);
+        // The scan this read continues: one whose last fetch holds the read
+        // or is within its own length of it, and the longest such fetch.
+        let near = |last: &Range<u64>| {
+            let reach = len(last);
+            start <= last.end.saturating_add(reach) && last.start <= end.saturating_add(reach)
         };
-        let window = window.max(need);
-        let end = start.saturating_add(window).min(miss.blocks).max(end);
-        if heads.len() >= self.limit {
-            heads.pop_front();
+        let nearest = followed.iter().enumerate().filter(|(_, last)| near(last));
+        let continued = nearest.max_by_key(|(_, last)| len(last)).map(|(at, _)| at);
+        let fetch = match continued.and_then(|at| followed.remove(at)) {
+            // On from where the last fetch ended.
+            Some(last) if last.end <= start => last.end..last.end.saturating_add(grown(&last)),
+            // Blocks of the last fetch that the cache did not keep: as many again.
+            Some(last) if last.start <= start => start..start.saturating_add(len(&last)),
+            // Back from where the last fetch started.
+            Some(last) => last.start.saturating_sub(grown(&last))..last.start,
+            // A new place.
+            None => start..start.saturating_add(miss.blocks_in(self.first).min(most)),
+        };
+        let fetch = fetch.start.min(start)..fetch.end.min(miss.blocks).max(end);
+        if followed.len() >= self.limit {
+            followed.pop_front();
         }
-        heads.push_back(Head { next: end, window });
-        start..end
+        followed.push_back(fetch.clone());
+        fetch
     }
 }
 
@@ -203,72 +258,157 @@ mod tests {
         assert_eq!(Aligned::new(8).plan(&Miss::new(3..4, 9, 0)), 0..8);
     }
 
+    /// A policy whose scans start with one block.
+    fn from_one_block() -> ReadAhead {
+        ReadAhead::default().first(0)
+    }
+
     #[test]
-    fn read_ahead_doubles_along_a_scan_and_stops_at_its_largest_window() {
-        let policy = ReadAhead::new(16 * 4096);
+    fn read_ahead_grows_fourfold_along_a_scan_up_to_its_largest_window() {
+        let policy = ReadAhead::new(64 * 4096).first(0);
         let mut next = 100;
         let mut windows = Vec::new();
-        for _ in 0..7 {
+        for _ in 0..6 {
             let plan = policy.plan(&miss(next..next + 1));
             assert_eq!(plan.start, next);
             windows.push(plan.end - plan.start);
             next = plan.end;
         }
-        assert_eq!(windows, [1, 2, 4, 8, 16, 16, 16]);
+        assert_eq!(windows, [1, 4, 16, 64, 64, 64]);
         // The end of the database cuts a window, and the scan ends there.
-        let end = Miss::new(9_990..9_991, 10_000, 4096);
-        assert_eq!(policy.plan(&end), 9_990..9_991);
-        assert_eq!(
-            policy.plan(&Miss::new(9_991..9_992, 10_000, 4096)),
-            9_991..9_993
-        );
-        assert_eq!(
-            policy.plan(&Miss::new(9_993..9_994, 10_000, 4096)),
-            9_993..9_997
-        );
-        assert_eq!(
-            policy.plan(&Miss::new(9_997..9_998, 10_000, 4096)),
-            9_997..10_000
-        );
+        let policy = from_one_block();
+        assert_eq!(policy.plan(&miss(9_990..9_991)), 9_990..9_991);
+        assert_eq!(policy.plan(&miss(9_991..9_992)), 9_991..9_995);
+        assert_eq!(policy.plan(&miss(9_995..9_996)), 9_995..10_000);
+    }
+
+    #[test]
+    fn read_ahead_starts_with_its_first_window() {
+        // 64 KiB unless set, which is 16 of these blocks, and 4 MiB at most.
+        let policy = ReadAhead::default();
+        assert_eq!(policy.plan(&miss(100..101)), 100..116);
+        assert_eq!(policy.plan(&miss(116..117)), 116..180);
+        assert_eq!(policy.plan(&miss(180..181)), 180..436);
+        assert_eq!(policy.plan(&miss(436..437)), 436..1_460);
+        assert_eq!(policy.plan(&miss(1_460..1_461)), 1_460..2_484);
+        // A read that needs more than the first window is fetched whole.
+        let policy = ReadAhead::new(8 * 4096).first(2 * 4096);
+        assert_eq!(policy.plan(&miss(100..101)), 100..102);
+        assert_eq!(policy.plan(&miss(500..505)), 500..505);
+        // A first window is no larger than the largest, and at least a block.
+        let policy = ReadAhead::new(8 * 4096).first(u64::MAX);
+        assert_eq!(policy.plan(&miss(100..101)), 100..108);
+        let policy = ReadAhead::new(0).first(0);
+        assert_eq!(policy.plan(&miss(100..101)), 100..101);
+        assert_eq!(policy.plan(&miss(101..102)), 101..102);
     }
 
     #[test]
     fn read_ahead_keeps_scattered_reads_small() {
-        let policy = ReadAhead::default();
+        let policy = from_one_block();
         for start in [5_000, 20, 7_300, 1_000, 9_999, 3] {
             assert_eq!(policy.plan(&miss(start..start + 1)), start..start + 1);
         }
-        // A read before a scan's end, or far past it, is not that scan.
-        let policy = ReadAhead::default();
+        // A read further from a fetch than the fetch is long is a new place.
+        let policy = from_one_block();
         assert_eq!(policy.plan(&miss(50..52)), 50..52);
-        assert_eq!(policy.plan(&miss(49..50)), 49..50);
-        assert_eq!(policy.plan(&miss(60..61)), 60..61);
+        assert_eq!(policy.plan(&miss(55..56)), 55..56);
+        assert_eq!(policy.plan(&miss(46..47)), 46..47);
+    }
+
+    #[test]
+    fn read_ahead_follows_scans_towards_the_start() {
+        let policy = ReadAhead::new(64 * 4096).first(0);
+        let mut next = 400;
+        let mut windows = Vec::new();
+        for _ in 0..6 {
+            let plan = policy.plan(&miss(next - 1..next));
+            assert_eq!(plan.end, next);
+            windows.push(plan.end - plan.start);
+            next = plan.start;
+        }
+        assert_eq!(windows, [1, 4, 16, 64, 64, 64]);
+        // The start of the database cuts a window.
+        let policy = from_one_block();
+        assert_eq!(policy.plan(&miss(9..10)), 9..10);
+        assert_eq!(policy.plan(&miss(8..9)), 5..9);
+        assert_eq!(policy.plan(&miss(4..5)), 0..5);
+    }
+
+    #[test]
+    fn read_ahead_fetches_what_a_scan_skips_and_what_was_not_kept() {
+        let policy = from_one_block();
+        assert_eq!(policy.plan(&miss(100..101)), 100..101);
+        assert_eq!(policy.plan(&miss(101..102)), 101..105);
+        // A jump ahead by no more than the last fetch: the blocks between
+        // come with it, for when the scan returns to them.
+        assert_eq!(policy.plan(&miss(108..109)), 105..121);
+        // So does a jump back.
+        let policy = from_one_block();
+        assert_eq!(policy.plan(&miss(500..504)), 500..504);
+        assert_eq!(policy.plan(&miss(495..496)), 484..500);
+        // A block of the last fetch is missing, as when a cache holds less
+        // than a window: the same number of blocks again, from there.
+        assert_eq!(policy.plan(&miss(490..491)), 490..506);
+        assert_eq!(policy.plan(&miss(506..507)), 506..570);
+        // A read across the end of the last fetch is one of those too.
+        assert_eq!(policy.plan(&miss(568..572)), 568..632);
+        // A read across its start goes back from there, and is held whole.
+        assert_eq!(policy.plan(&miss(560..570)), 312..570);
     }
 
     #[test]
     fn read_ahead_follows_scans_that_skip_or_interleave() {
-        let policy = ReadAhead::default();
+        let policy = from_one_block();
         // Two scans take turns.
         assert_eq!(policy.plan(&miss(100..101)), 100..101);
         assert_eq!(policy.plan(&miss(900..901)), 900..901);
-        assert_eq!(policy.plan(&miss(101..102)), 101..103);
-        assert_eq!(policy.plan(&miss(901..902)), 901..903);
-        assert_eq!(policy.plan(&miss(103..104)), 103..107);
+        assert_eq!(policy.plan(&miss(101..102)), 101..105);
+        assert_eq!(policy.plan(&miss(901..902)), 901..905);
+        assert_eq!(policy.plan(&miss(105..106)), 105..121);
         // A skip of no more than the last window continues the scan.
-        assert_eq!(policy.plan(&miss(905..906)), 905..909);
+        assert_eq!(policy.plan(&miss(907..908)), 905..921);
         // A read wider than the window is fetched whole.
-        assert_eq!(policy.plan(&miss(107..140)), 107..140);
+        assert_eq!(policy.plan(&miss(121..400)), 121..400);
+    }
+
+    #[test]
+    fn read_ahead_continues_the_longest_scan_near_a_read() {
+        let policy = from_one_block();
+        // A scan, and one block read a little ahead of it.
+        assert_eq!(policy.plan(&miss(100..101)), 100..101);
+        assert_eq!(policy.plan(&miss(110..111)), 110..111);
+        assert_eq!(policy.plan(&miss(101..102)), 101..105);
+        // A read near both is the scan's.
+        assert_eq!(policy.plan(&miss(109..110)), 105..121);
     }
 
     #[test]
     fn read_ahead_forgets_the_oldest_scan() {
-        let policy = ReadAhead::with_scans(1 << 20, 2);
+        let policy = from_one_block().scans(2);
         assert_eq!(policy.plan(&miss(100..101)), 100..101);
         assert_eq!(policy.plan(&miss(200..201)), 200..201);
         assert_eq!(policy.plan(&miss(300..301)), 300..301);
-        // The scan at 100 was forgotten; the one at 200 was not.
+        // The scan at 100 was forgotten; the one at 300 was not.
         assert_eq!(policy.plan(&miss(101..102)), 101..102);
-        assert_eq!(policy.plan(&miss(301..302)), 301..303);
-        assert_eq!(ReadAhead::with_scans(1, 0).limit, 1);
+        assert_eq!(policy.plan(&miss(301..302)), 301..305);
+        assert_eq!(ReadAhead::default().scans(0).limit, 1);
+    }
+
+    #[test]
+    fn read_ahead_takes_any_miss() {
+        // Sizes and positions at the limits neither wrap nor panic.
+        let policy = ReadAhead::new(u64::MAX).first(u64::MAX);
+        let all = Miss::new(u64::MAX - 1..u64::MAX, u64::MAX, 1);
+        assert_eq!(policy.plan(&all), u64::MAX - 1..u64::MAX);
+        assert_eq!(policy.plan(&Miss::new(0..1, u64::MAX, 1)), 0..u64::MAX);
+        assert_eq!(policy.plan(&Miss::new(5..6, u64::MAX, 0)), 5..u64::MAX);
+        // A miss that breaks its own rules gets an answer the caller can cut.
+        let policy = ReadAhead::default();
+        let empty = Range { start: 7, end: 7 };
+        let inverted = Range { start: 9, end: 3 };
+        assert_eq!(policy.plan(&Miss::new(empty, 10, 4096)), 7..10);
+        assert_eq!(policy.plan(&Miss::new(inverted, 10, 4096)), 9..10);
+        assert_eq!(policy.plan(&Miss::new(20..21, 10, 4096)), 20..21);
     }
 }

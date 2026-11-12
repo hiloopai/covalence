@@ -69,6 +69,7 @@ Measures what block sizes, fetch policies, caches and verifications cost.
                     bandwidth in megabytes a second; may be repeated
                     (local:0.2:1000, region:15:100 and wan:80:10)
   --sleep           the store waits as the first link would, for every request
+  --trace           print the offset and length of every request to the store
   --list            print the workloads and configurations, and stop
 ";
 
@@ -114,10 +115,15 @@ struct Remote {
     served: AtomicU64,
     /// The link whose time every request really waits.
     wait: Option<Link>,
+    /// Whether to print every request.
+    trace: bool,
 }
 
 impl Remote {
-    fn serve(&self, bytes: u64) {
+    fn serve(&self, start: u64, bytes: u64) {
+        if self.trace {
+            println!("request {start} {bytes}");
+        }
         self.requests.fetch_add(1, Relaxed);
         self.served.fetch_add(bytes, Relaxed);
         if let Some(link) = &self.wait {
@@ -133,12 +139,12 @@ impl Remote {
 
 impl Get for Remote {
     fn get_unchecked(&self, _key: &Cid) -> Result<Option<Bytes>, StoreError> {
-        self.serve(self.bytes.len() as u64);
+        self.serve(0, self.bytes.len() as u64);
         Ok(Some(self.bytes.clone()))
     }
 
     fn size_unchecked(&self, _key: &Cid) -> Result<Option<u64>, StoreError> {
-        self.serve(0);
+        self.serve(0, 0);
         Ok(Some(self.bytes.len() as u64))
     }
 
@@ -150,7 +156,7 @@ impl Get for Remote {
     ) -> Result<Option<Bytes>, StoreError> {
         let size = self.bytes.len() as u64;
         let (start, end) = (start.min(size), start.saturating_add(len).min(size));
-        self.serve(end - start);
+        self.serve(start, end - start);
         Ok(Some(self.bytes.slice(start as usize..end as usize)))
     }
 }
@@ -178,59 +184,46 @@ impl AsyncPut for Remote {
 /// Downloads use the trait's own `get_to`, which checks the bytes as stores do.
 impl Cas for Remote {}
 
-/// A read-ahead that is not in the library: variants are measured here first.
+/// The library's read-ahead with more to set: variants are measured here first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Trial {
-    /// The bytes fetched at a new place; 0 for only what the read needs.
+    /// The first window, in bytes.
     first: u64,
     /// What a window is multiplied by each time its scan continues.
     growth: u64,
     /// The largest window, in bytes.
     max: u64,
-    /// Whether scans towards the start of the file are followed too.
-    backward: bool,
 }
 
 struct TrialPolicy {
     trial: Trial,
     /// The last fetch of each scan followed, least recently continued first.
-    heads: Mutex<VecDeque<Range<u64>>>,
+    scans: Mutex<VecDeque<Range<u64>>>,
 }
 
 impl FetchPolicy for TrialPolicy {
     fn plan(&self, miss: &Miss) -> Range<u64> {
-        let Trial {
-            first,
-            growth,
-            max,
-            backward,
-        } = self.trial;
+        let Trial { first, growth, max } = self.trial;
         let blocks_in = |bytes: u64| (bytes / miss.block_size).max(1);
         let Range { start, end } = miss.need;
-        let need = end - start;
-        let mut heads = self.heads.lock().unwrap();
-        let grown = |head: &Range<u64>| {
-            let window = (head.end - head.start).saturating_mul(growth);
-            window.min(blocks_in(max)).max(need)
+        let len = |fetch: &Range<u64>| fetch.end - fetch.start;
+        let grown = |last: &Range<u64>| len(last).saturating_mul(growth).min(blocks_in(max));
+        let mut scans = self.scans.lock().unwrap();
+        let near =
+            |last: &Range<u64>| start <= last.end + len(last) && last.start <= end + len(last);
+        let nearest = scans.iter().enumerate().filter(|(_, last)| near(last));
+        let continued = nearest.max_by_key(|(_, last)| len(last)).map(|(at, _)| at);
+        let fetch = match continued.and_then(|at| scans.remove(at)) {
+            Some(last) if last.end <= start => last.end..last.end + grown(&last),
+            Some(last) if last.start <= start => start..start + len(&last),
+            Some(last) => last.start.saturating_sub(grown(&last))..last.start,
+            None => start..start + blocks_in(first).min(blocks_in(max)),
         };
-        let ahead = heads
-            .iter()
-            .position(|head| head.end <= start && start - head.end <= head.end - head.start);
-        let behind = heads.iter().position(|head| {
-            backward && end <= head.start && head.start - end <= head.end - head.start
-        });
-        let fetch = if let Some(head) = ahead.and_then(|at| heads.remove(at)) {
-            start..start.saturating_add(grown(&head)).min(miss.blocks).max(end)
-        } else if let Some(head) = behind.and_then(|at| heads.remove(at)) {
-            end.saturating_sub(grown(&head)).min(start)..end
-        } else {
-            let window = if first > 0 { blocks_in(first) } else { need };
-            start..start.saturating_add(window).min(miss.blocks).max(end)
-        };
-        if heads.len() >= ReadAhead::SCANS {
-            heads.pop_front();
+        let fetch = fetch.start.min(start)..fetch.end.min(miss.blocks).max(end);
+        if scans.len() >= ReadAhead::SCANS {
+            scans.pop_front();
         }
-        heads.push_back(fetch.clone());
+        scans.push_back(fetch.clone());
         fetch
     }
 }
@@ -239,7 +232,7 @@ impl FetchPolicy for TrialPolicy {
 enum Fetch {
     Exact,
     Aligned(u64),
-    ReadAhead { max: u64, scans: usize },
+    ReadAhead { first: u64, max: u64, scans: usize },
     Trial(Trial),
 }
 
@@ -284,7 +277,8 @@ impl Config {
     const DEFAULT: Self = Self {
         block: Options::BLOCK_SIZE,
         fetch: Fetch::ReadAhead {
-            max: MIB,
+            first: ReadAhead::FIRST,
+            max: ReadAhead::MAX,
             scans: ReadAhead::SCANS,
         },
         cache: Cache::Memory(Options::CACHE_BYTES),
@@ -296,16 +290,17 @@ impl Config {
         let fetch = match self.fetch {
             Fetch::Exact => "exact".to_owned(),
             Fetch::Aligned(bytes) => format!("aligned:{}", size(bytes)),
-            Fetch::ReadAhead { max, scans } if scans == ReadAhead::SCANS => {
-                format!("read-ahead:{}", size(max))
+            Fetch::ReadAhead { first, max, scans } if scans == ReadAhead::SCANS => {
+                format!("read-ahead:{}-{}", size(first), size(max))
             }
-            Fetch::ReadAhead { max, scans } => format!("read-ahead:{}:scans={scans}", size(max)),
+            Fetch::ReadAhead { first, max, scans } => {
+                format!("read-ahead:{}-{}:scans={scans}", size(first), size(max))
+            }
             Fetch::Trial(trial) => format!(
-                "trial:{}:first={}:x{}{}",
-                size(trial.max),
+                "trial:{}-{}:x{}",
                 size(trial.first),
-                trial.growth,
-                if trial.backward { ":backward" } else { "" }
+                size(trial.max),
+                trial.growth
             ),
         };
         let cache = match self.cache {
@@ -333,10 +328,12 @@ impl Config {
         let options = match self.fetch {
             Fetch::Exact => options.fetch(Exact),
             Fetch::Aligned(bytes) => options.fetch(Aligned::new(bytes)),
-            Fetch::ReadAhead { max, scans } => options.fetch(ReadAhead::with_scans(max, scans)),
+            Fetch::ReadAhead { first, max, scans } => {
+                options.fetch(ReadAhead::new(max).first(first).scans(scans))
+            }
             Fetch::Trial(trial) => options.fetch(TrialPolicy {
                 trial,
-                heads: Mutex::default(),
+                scans: Mutex::default(),
             }),
         };
         let options = match self.cache {
@@ -372,23 +369,18 @@ impl Config {
 /// The configurations to compare: each differs from the default in one or two ways.
 fn configs() -> Vec<Config> {
     let default = Config::DEFAULT;
-    let read_ahead = |max| Fetch::ReadAhead {
+    let read_ahead = |first, max| Fetch::ReadAhead {
+        first,
         max,
         scans: ReadAhead::SCANS,
     };
-    let trial = |first, growth, max, backward| {
-        Fetch::Trial(Trial {
-            first,
-            growth,
-            max,
-            backward,
-        })
-    };
+    let trial = |first, growth, max| Fetch::Trial(Trial { first, growth, max });
+    let (first, max) = (ReadAhead::FIRST, ReadAhead::MAX);
     let blocks = [4 * KIB, 16 * KIB, 64 * KIB, 256 * KIB, MIB];
     let mut all = vec![default];
     // Block sizes, each with every kind of fetch policy.
     for block in blocks {
-        for fetch in [Fetch::Exact, Fetch::Aligned(MIB), read_ahead(MIB)] {
+        for fetch in [Fetch::Exact, Fetch::Aligned(MIB), default.fetch] {
             all.push(Config {
                 block,
                 fetch,
@@ -402,20 +394,27 @@ fn configs() -> Vec<Config> {
         Fetch::Aligned(64 * KIB),
         Fetch::Aligned(256 * KIB),
         Fetch::Aligned(4 * MIB),
-        read_ahead(64 * KIB),
-        read_ahead(256 * KIB),
-        read_ahead(4 * MIB),
-        read_ahead(8 * MIB),
-        read_ahead(16 * MIB),
-        Fetch::ReadAhead { max: MIB, scans: 1 },
-        trial(0, 2, MIB, true),
-        trial(0, 2, 4 * MIB, true),
-        trial(0, 4, MIB, false),
-        trial(0, 4, 4 * MIB, true),
-        trial(16 * KIB, 2, MIB, false),
-        trial(64 * KIB, 2, MIB, false),
-        trial(64 * KIB, 2, MIB, true),
-        trial(64 * KIB, 4, 4 * MIB, true),
+        // The largest window.
+        read_ahead(first, 256 * KIB),
+        read_ahead(first, MIB),
+        read_ahead(first, 16 * MIB),
+        // The first window.
+        read_ahead(0, max),
+        read_ahead(16 * KIB, max),
+        read_ahead(256 * KIB, max),
+        // Small windows, as for a store that answers fast.
+        read_ahead(0, MIB),
+        read_ahead(16 * KIB, MIB),
+        Fetch::ReadAhead {
+            first,
+            max,
+            scans: 1,
+        },
+        // How fast windows grow. The second is the library's policy made
+        // here, to show that these trials are that policy but for the growth.
+        trial(first, 2, max),
+        trial(first, 4, max),
+        trial(first, 8, max),
     ];
     all.extend(fetches.map(|fetch| Config { fetch, ..default }));
     // Verifications: manifests of each chunk size, another hash function, and a download.
@@ -679,6 +678,7 @@ struct Subject<'a> {
     content: &'a Bytes,
     cid: Cid,
     wait: Option<&'a Link>,
+    trace: bool,
 }
 
 fn run(
@@ -693,10 +693,11 @@ fn run(
         requests: AtomicU64::new(0),
         served: AtomicU64::new(0),
         wait: subject.wait.cloned(),
+        trace: subject.trace,
     });
     if manifest_bytes > 0 {
         // A manifest is one more value to get before the database opens.
-        remote.serve(manifest_bytes);
+        remote.serve(0, manifest_bytes);
     }
     let start = Instant::now();
     let database = Database::open(Arc::clone(&remote) as Arc<dyn Cas>, &subject.cid, options)?;
@@ -749,6 +750,7 @@ struct Args {
     configs: Vec<String>,
     links: Vec<Link>,
     sleep: bool,
+    trace: bool,
     list: bool,
 }
 
@@ -774,6 +776,7 @@ impl Args {
                     args.links.push(link);
                 }
                 "--sleep" => args.sleep = true,
+                "--trace" => args.trace = true,
                 "--list" => args.list = true,
                 "--help" | "-h" => return Ok(None),
                 other => return Err(format!("unknown argument {other}\n\n{USAGE}").into()),
@@ -844,6 +847,7 @@ fn main() -> Outcome<()> {
         cid: Cid::new(format, blake3::hash(&content).as_bytes())?,
         content: &content,
         wait: args.links.first().filter(|_| args.sleep),
+        trace: args.trace,
     };
     println!(
         "database: {} bytes; {} workloads, {} configurations, {repeats} repeats",

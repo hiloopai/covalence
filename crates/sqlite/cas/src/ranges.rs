@@ -144,13 +144,19 @@ impl Ranges {
     }
 }
 
+/// The part of a cache that one fetch may fill: one in this many blocks.
+///
+/// A scan's next fetch can arrive while it still reads the last one, and
+/// several scans share the cache, so their fetches must fit in it together.
+const CACHE_SHARE: u64 = 4;
+
 /// The blocks to fetch for `miss`: `plan`, widened to hold `need`, and cut to
-/// the database, to the most bytes of one fetch and to the `room` of the
-/// cache, if it has a limit. An empty plan is `need`.
+/// the database, to the most bytes of one fetch and to a share of the `room`
+/// of the cache, if it has a limit. An empty plan is `need`.
 fn window(need: &Range<u64>, plan: Range<u64>, miss: &Miss, room: Option<u64>) -> Range<u64> {
     let plan = if plan.is_empty() { need.clone() } else { plan };
     let most = MAX_BLOCK_SIZE / miss.block_size.max(1);
-    let most = room.map_or(most, |room| most.min(room));
+    let most = room.map_or(most, |room| most.min(room / CACHE_SHARE));
     let most = most.max(need.end - need.start);
     let end = (plan.end.max(need.end).min(miss.blocks)).min(need.start.saturating_add(most));
     let start = plan.start.min(need.start).max(end.saturating_sub(most));
@@ -205,17 +211,19 @@ mod tests {
     }
 
     #[test]
-    fn windows_hold_no_more_than_the_cache_unless_the_read_does() {
+    fn windows_hold_no_more_than_a_quarter_of_the_cache_unless_the_read_does() {
         let miss = Miss::new(10..12, 1_000, 4096);
         let window = |plan: Range<u64>, room: u64| window(&miss.need, plan, &miss, Some(room));
-        // A cache that keeps nothing, or less than the read: only the read.
+        // A cache that keeps nothing, or whose quarter is less than the read:
+        // only the read.
         assert_eq!(window(0..1_000, 0), 10..12);
-        assert_eq!(window(0..1_000, 1), 10..12);
         assert_eq!(window(0..1_000, 2), 10..12);
-        // Else as many blocks as the cache holds, from the read on.
-        assert_eq!(window(0..1_000, 8), 10..18);
-        assert_eq!(window(0..12, 8), 4..12);
-        assert_eq!(window(8..14, 8), 8..14);
+        assert_eq!(window(0..1_000, 11), 10..12);
+        // Else a quarter of the blocks the cache holds, from the read on.
+        assert_eq!(window(0..1_000, 12), 10..13);
+        assert_eq!(window(0..1_000, 32), 10..18);
+        assert_eq!(window(0..12, 32), 4..12);
+        assert_eq!(window(8..14, 32), 8..14);
         assert_eq!(window(8..14, u64::MAX), 8..14);
     }
 }

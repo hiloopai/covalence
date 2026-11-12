@@ -92,9 +92,10 @@ pub trait BlockCache: Send + Sync {
     /// The most blocks the cache holds at once, or `None` if it has no such
     /// limit or cannot say.
     ///
-    /// One request to the store fetches no more blocks than this, unless a
-    /// single read needs more: blocks the cache cannot hold would be fetched
-    /// for nothing.
+    /// One request to the store fetches no more than a quarter of this many
+    /// blocks, unless a single read needs more. Blocks fetched ahead of a few
+    /// scans then fit in the cache together; larger fetches would push each
+    /// other out before they were read.
     fn capacity(&self) -> Option<u64> {
         None
     }
@@ -288,12 +289,12 @@ impl Arena for Heap {
 /// - The block in slot `i` lives at `i * layout.largest_block()` in the
 ///   arena, so the arena holds up to `capacity * layout.largest_block()`
 ///   bytes.
-/// - When full, a new block replaces one that has not been read since the
-///   cache last looked for a block to drop (the
+/// - When full, a new block replaces the block that arrived first. A block
+///   that was read since the cache last passed it is passed once more
+///   instead (the
 ///   [clock algorithm](https://en.wikipedia.org/wiki/Page_replacement_algorithm#Clock)).
-///   A block that is only ever fetched is dropped before one that is read
-///   again: SQLite keeps the pages it has read, so a second read means its
-///   own cache did not help.
+///   Blocks fetched ahead of a scan therefore stay until older blocks have
+///   gone, and a block that is read time and again stays longest.
 /// - A read or write the arena fails is a miss, or a block not kept.
 /// - Reads share a lock and run together; inserting a block excludes them.
 pub struct ClockCache<A> {
@@ -309,8 +310,9 @@ struct State<A> {
     slot_of: HashMap<u64, usize>,
     /// The block in each slot used so far, or `EMPTY`.
     block_of: Vec<u64>,
-    /// Whether each slot was read since the hand last passed it.
-    read: Vec<AtomicBool>,
+    /// Whether the block in each slot arrived or was read since the hand
+    /// last passed it.
+    marked: Vec<AtomicBool>,
     /// The next slot to consider dropping.
     hand: usize,
 }
@@ -328,7 +330,7 @@ impl<A: Arena> ClockCache<A> {
                 arena,
                 slot_of: HashMap::new(),
                 block_of: Vec::new(),
-                read: Vec::new(),
+                marked: Vec::new(),
                 hand: 0,
             }),
         }
@@ -354,7 +356,7 @@ impl<A: Arena> BlockCache for ClockCache<A> {
         if state.arena.read(at, buf).is_err() {
             return false;
         }
-        state.read[slot].store(true, Ordering::Relaxed);
+        state.marked[slot].store(true, Ordering::Relaxed);
         true
     }
 
@@ -372,24 +374,28 @@ impl<A: Arena> BlockCache for ClockCache<A> {
         }
         let slot = if state.block_of.len() < self.capacity {
             state.block_of.push(EMPTY);
-            state.read.push(AtomicBool::new(false));
+            state.marked.push(AtomicBool::new(false));
             state.block_of.len() - 1
         } else {
             // Each slot passed loses its mark, so the hand stops within two turns.
             loop {
                 let slot = state.hand;
                 state.hand = (slot + 1) % self.capacity;
-                if !state.read[slot].swap(false, Ordering::Relaxed) {
+                if !state.marked[slot].swap(false, Ordering::Relaxed) {
                     break slot;
                 }
             }
         };
         state.slot_of.remove(&state.block_of[slot]);
         state.block_of[slot] = EMPTY;
-        if state.arena.write(self.position(slot), bytes).is_ok() {
+        let kept = state.arena.write(self.position(slot), bytes).is_ok();
+        if kept {
             state.block_of[slot] = block;
             state.slot_of.insert(block, slot);
         }
+        // A new block is marked as one that was read is: it was fetched to be
+        // read, and must not go before the blocks that were read already.
+        state.marked[slot].store(kept, Ordering::Relaxed);
     }
 
     fn capacity(&self) -> Option<u64> {
@@ -506,19 +512,33 @@ mod tests {
     }
 
     #[test]
-    fn a_full_cache_drops_blocks_not_read_again() {
+    fn a_full_cache_drops_the_oldest_block_not_read_since_it_was_passed() {
         for policy in policies(3 * 8 + 7) {
             let cache = policy.build(LAYOUT).unwrap();
             fill(&*cache, LAYOUT, 0..3);
-            assert_eq!(held(&*cache, LAYOUT), [0, 1, 2]);
-            // All three were just read, so the hand passes each once and drops the first.
+            // The block that arrived first goes first.
             fill(&*cache, LAYOUT, [3]);
             assert_eq!(first(&*cache, 0), None);
-            // Block 2 is read again and survives; blocks 1 and 3 are dropped in turn.
-            assert_eq!(first(&*cache, 2), Some(3));
+            // Block 1 is next, but it is read again: block 2 goes in its place.
+            assert_eq!(first(&*cache, 1), Some(2));
             fill(&*cache, LAYOUT, [4]);
-            fill(&*cache, LAYOUT, [5]);
-            assert_eq!(held(&*cache, LAYOUT), [2, 4, 5]);
+            assert_eq!(held(&*cache, LAYOUT), [1, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn blocks_fetched_ahead_outlast_older_blocks_that_were_read() {
+        for policy in policies(4 * 8) {
+            let cache = policy.build(LAYOUT).unwrap();
+            // A scan has read four blocks, and two more are fetched ahead of it.
+            fill(&*cache, LAYOUT, 0..4);
+            assert_eq!(held(&*cache, LAYOUT), [0, 1, 2, 3]);
+            fill(&*cache, LAYOUT, [4, 5]);
+            // It reads the older blocks again, and two more arrive: the
+            // blocks it has not reached yet are still there.
+            assert_eq!((first(&*cache, 2), first(&*cache, 3)), (Some(3), Some(4)));
+            fill(&*cache, LAYOUT, [6, 7]);
+            assert_eq!(held(&*cache, LAYOUT), [4, 5, 6, 7]);
         }
     }
 
