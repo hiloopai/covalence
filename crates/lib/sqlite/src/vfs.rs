@@ -169,11 +169,12 @@ impl Registered {
     ///   reads through any VFS but this one.
     /// - The connection is not serialized (`SQLITE_OPEN_NO_MUTEX`): use it
     ///   from one thread at a time, as `rusqlite` enforces.
-    /// - SQL run on the connection can still reach files of other VFSes. A
-    ///   URI that names a VFS lets `ATTACH` read a local file and
-    ///   `VACUUM INTO` write a new one. Callers that run SQL they do not
-    ///   trust should set `SQLITE_LIMIT_ATTACHED` to 0 (the `limits`
-    ///   feature), which refuses both.
+    /// - SQL run on the connection can still reach other files. `ATTACH`
+    ///   with a plain name opens another file of this VFS. A URI that names
+    ///   another VFS lets `ATTACH` read a local file and `VACUUM INTO` write
+    ///   a new one. Callers that run SQL they do not trust should set
+    ///   `SQLITE_LIMIT_ATTACHED` to 0 (the `limits` feature), which refuses
+    ///   all three.
     pub fn open(&self, file: &str) -> Result<Connection, Error> {
         let uri = file
             .get(..5)

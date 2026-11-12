@@ -240,6 +240,30 @@ fn names_reach_the_vfs_as_given() {
 }
 
 #[test]
+fn sql_reaches_other_files_of_the_vfs_by_name() {
+    let bytes = Arc::new(database("CREATE TABLE t (x); INSERT INTO t VALUES (1)"));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let registered = vfs::register("test-attach", move |name: &str| {
+        log.lock().unwrap().push(name.to_owned());
+        Ok((name != "missing").then(|| Box::new(Memory(bytes.clone())) as Box<dyn File>))
+    })
+    .unwrap();
+    let connection = registered.open("db").unwrap();
+    // A plain name is another file of the same VFS, as read-only as the first.
+    connection.execute_batch("ATTACH 'other' AS other").unwrap();
+    assert_eq!(rows(&connection, "SELECT x FROM other.t"), ["[Integer(1)]"]);
+    let insert = connection.execute_batch("INSERT INTO other.t VALUES (2)");
+    assert_eq!(code(insert), ErrorCode::ReadOnly);
+    let attach = connection.execute_batch("ATTACH 'missing' AS missing");
+    assert_eq!(code(attach), ErrorCode::CannotOpen);
+    // A name that is not UTF-8 does not reach the VFS.
+    let attach = connection.execute_batch("ATTACH CAST(x'6eff' AS TEXT) AS bad");
+    assert_eq!(code(attach), ErrorCode::CannotOpen);
+    assert_eq!(*seen.lock().unwrap(), ["db", "other", "missing"]);
+}
+
+#[test]
 fn taken_and_malformed_vfs_names_are_refused() {
     /// A VFS that counts its drops.
     struct Counted(Arc<AtomicUsize>);
