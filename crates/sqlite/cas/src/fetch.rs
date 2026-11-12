@@ -22,16 +22,32 @@ pub struct Miss {
     pub blocks: u64,
     /// The size of a block in bytes; at least 1.
     pub block_size: u64,
+    /// The most blocks one request fetches, and never fewer than `need`.
+    ///
+    /// The cache sets it: see [`BlockCache::capacity`]. A longer plan is cut
+    /// to this many blocks, so a policy that remembers what it fetched plans
+    /// within it.
+    ///
+    /// [`BlockCache::capacity`]: crate::cache::BlockCache::capacity
+    pub most: u64,
 }
 
 impl Miss {
-    /// A miss of the blocks `need` in a database of `blocks` blocks of `block_size` bytes.
+    /// A miss of the blocks `need` in a database of `blocks` blocks of
+    /// `block_size` bytes, with no limit on what one request fetches.
     pub fn new(need: Range<u64>, blocks: u64, block_size: u64) -> Self {
         Self {
             need,
             blocks,
             block_size,
+            most: u64::MAX,
         }
+    }
+
+    /// The same miss, when one request fetches at most `blocks` blocks.
+    pub fn at_most(mut self, blocks: u64) -> Self {
+        self.most = blocks;
+        self
     }
 
     /// The number of whole blocks in `bytes`, at least one.
@@ -47,7 +63,8 @@ pub trait FetchPolicy: Send + Sync {
     /// The run of blocks to fetch for `miss`.
     ///
     /// The caller widens the answer to hold `miss.need` and cuts it to the
-    /// database, so any answer is safe; blocks outside `miss.need` are a hint.
+    /// database and to `miss.most` blocks, so any answer is safe; blocks
+    /// outside `miss.need` are a hint.
     fn plan(&self, miss: &Miss) -> Range<u64>;
 }
 
@@ -199,7 +216,7 @@ impl Default for ReadAhead {
 impl FetchPolicy for ReadAhead {
     fn plan(&self, miss: &Miss) -> Range<u64> {
         let Range { start, end } = miss.need;
-        let most = miss.blocks_in(self.max);
+        let most = miss.blocks_in(self.max).min(miss.most);
         let len = |fetch: &Range<u64>| fetch.end.saturating_sub(fetch.start);
         let grown = |last: &Range<u64>| len(last).saturating_mul(Self::GROWTH).min(most);
         let mut followed = self.followed.lock().unwrap_or_else(PoisonError::into_inner);
@@ -215,7 +232,7 @@ impl FetchPolicy for ReadAhead {
             // On from where the last fetch ended.
             Some(last) if last.end <= start => last.end..last.end.saturating_add(grown(&last)),
             // Blocks of the last fetch that the cache did not keep: as many again.
-            Some(last) if last.start <= start => start..start.saturating_add(len(&last)),
+            Some(last) if last.start <= start => start..start.saturating_add(len(&last).min(most)),
             // Back from where the last fetch started.
             Some(last) => last.start.saturating_sub(grown(&last))..last.start,
             // A new place.
@@ -393,6 +410,24 @@ mod tests {
         assert_eq!(policy.plan(&miss(101..102)), 101..102);
         assert_eq!(policy.plan(&miss(301..302)), 301..305);
         assert_eq!(ReadAhead::default().scans(0).limit, 1);
+    }
+
+    #[test]
+    fn read_ahead_plans_within_the_most_blocks_of_a_request() {
+        let miss = |need: Range<u64>| miss(need).at_most(8);
+        let policy = ReadAhead::default();
+        // The first window is 16 blocks, and a request at most 8.
+        assert_eq!(policy.plan(&miss(100..101)), 100..108);
+        assert_eq!(policy.plan(&miss(108..109)), 108..116);
+        // A read that skips ahead is continued from the fetch that was made,
+        // not from a longer one that was only planned.
+        assert_eq!(policy.plan(&miss(120..121)), 116..124);
+        assert_eq!(policy.plan(&miss(117..118)), 117..125);
+        // Towards the start as well.
+        assert_eq!(policy.plan(&miss(5_000..5_001)), 5_000..5_008);
+        assert_eq!(policy.plan(&miss(4_999..5_000)), 4_992..5_000);
+        // A read that needs more is planned whole.
+        assert_eq!(policy.plan(&miss(7_000..7_020)), 7_000..7_020);
     }
 
     #[test]

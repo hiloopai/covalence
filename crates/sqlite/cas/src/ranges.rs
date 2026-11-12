@@ -104,9 +104,10 @@ impl Ranges {
             actual: size.saturating_sub(at),
         })?;
         let need = at / block_size..end.div_ceil(block_size);
+        let most = most(need.end - need.start, block_size, self.cache.capacity());
+        let miss = Miss::new(need, self.layout.blocks(), block_size).at_most(most);
         let policy = Arc::clone(&self.policy.read().unwrap_or_else(PoisonError::into_inner));
-        let miss = Miss::new(need.clone(), self.layout.blocks(), block_size);
-        let blocks = window(&need, policy.plan(&miss), &miss, self.cache.capacity());
+        let blocks = window(policy.plan(&miss), &miss);
         let start = blocks.start * block_size;
         let len = (blocks.end.saturating_mul(block_size)).min(size) - start;
 
@@ -150,14 +151,22 @@ impl Ranges {
 /// several scans share the cache, so their fetches must fit in it together.
 const CACHE_SHARE: u64 = 4;
 
-/// The blocks to fetch for `miss`: `plan`, widened to hold `need`, and cut to
-/// the database, to the most bytes of one fetch and to a share of the `room`
-/// of the cache, if it has a limit. An empty plan is `need`.
-fn window(need: &Range<u64>, plan: Range<u64>, miss: &Miss, room: Option<u64>) -> Range<u64> {
-    let plan = if plan.is_empty() { need.clone() } else { plan };
-    let most = MAX_BLOCK_SIZE / miss.block_size.max(1);
+/// The most blocks of one fetch for a read that needs `need` blocks:
+/// `MAX_BLOCK_SIZE` bytes, and a share of the `room` of the cache if it has a
+/// limit, but never fewer than the read needs.
+fn most(need: u64, block_size: u64, room: Option<u64>) -> u64 {
+    let most = MAX_BLOCK_SIZE / block_size.max(1);
     let most = room.map_or(most, |room| most.min(room / CACHE_SHARE));
-    let most = most.max(need.end - need.start);
+    most.max(need)
+}
+
+/// The blocks to fetch for `miss`: `plan`, widened to hold the need, and cut
+/// to the database and to the most blocks of one fetch, from the need on. An
+/// empty plan is the need.
+fn window(plan: Range<u64>, miss: &Miss) -> Range<u64> {
+    let need = &miss.need;
+    let plan = if plan.is_empty() { need.clone() } else { plan };
+    let most = miss.most.max(need.end.saturating_sub(need.start));
     let end = (plan.end.max(need.end).min(miss.blocks)).min(need.start.saturating_add(most));
     let start = plan.start.min(need.start).max(end.saturating_sub(most));
     start..end
@@ -168,14 +177,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn windows_hold_the_need_and_stay_in_the_database_and_the_limit() {
-        let miss = |need: Range<u64>| Miss::new(need, 1_000, 4096);
+    fn windows_hold_the_need_and_stay_in_the_database() {
         let check = |need: Range<u64>, plan: Range<u64>, expected: Range<u64>| {
-            assert_eq!(
-                window(&need, plan.clone(), &miss(need.clone()), None),
-                expected,
-                "{plan:?}"
-            );
+            let miss = Miss::new(need, 1_000, 4096);
+            assert_eq!(window(plan.clone(), &miss), expected, "{plan:?}");
         };
         // A plan that holds the need is kept; others are widened to hold it.
         check(10..12, 8..20, 8..20);
@@ -191,39 +196,39 @@ mod tests {
         check(10..12, u64::MAX..u64::MAX, 10..12);
         check(10..12, 900..u64::MAX, 10..1_000);
         check(10..12, 0..u64::MAX, 0..1_000);
-
-        // A fetch is at most `MAX_BLOCK_SIZE` bytes, taken from the need on.
-        let most = MAX_BLOCK_SIZE / 4096;
-        let large = Miss::new(most..most + 2, 10 * most, 4096);
-        assert_eq!(
-            window(&large.need, 0..u64::MAX, &large, None),
-            most..2 * most
-        );
-        assert_eq!(window(&large.need, 0..most + 2, &large, None), 2..most + 2);
-        // A read that needs more than the limit is still fetched whole.
-        let wide = Miss::new(0..10, 10, MAX_BLOCK_SIZE);
-        assert_eq!(window(&wide.need, 0..0, &wide, None), 0..10);
-        let bytes = Miss::new(5..7, u64::MAX, 1);
-        assert_eq!(
-            window(&bytes.need, 0..u64::MAX, &bytes, None),
-            5..5 + MAX_BLOCK_SIZE
-        );
     }
 
     #[test]
-    fn windows_hold_no_more_than_a_quarter_of_the_cache_unless_the_read_does() {
-        let miss = Miss::new(10..12, 1_000, 4096);
-        let window = |plan: Range<u64>, room: u64| window(&miss.need, plan, &miss, Some(room));
+    fn windows_hold_no_more_than_the_most_blocks_unless_the_read_does() {
+        let cut = |plan: Range<u64>, most: u64| {
+            window(plan, &Miss::new(10..12, 1_000, 4096).at_most(most))
+        };
+        // Fewer than the read needs: only the read.
+        assert_eq!(cut(0..1_000, 0), 10..12);
+        assert_eq!(cut(0..1_000, 2), 10..12);
+        // Else that many blocks, from the read on.
+        assert_eq!(cut(0..1_000, 3), 10..13);
+        assert_eq!(cut(0..1_000, 8), 10..18);
+        assert_eq!(cut(0..12, 8), 4..12);
+        assert_eq!(cut(8..14, 8), 8..14);
+        assert_eq!(cut(8..14, u64::MAX), 8..14);
+    }
+
+    #[test]
+    fn a_fetch_is_a_quarter_of_the_cache_and_a_gibibyte_at_most_unless_the_read_is_more() {
+        // No cache limit: `MAX_BLOCK_SIZE` bytes.
+        assert_eq!(most(2, 4096, None), MAX_BLOCK_SIZE / 4096);
+        assert_eq!(most(2, 1, None), MAX_BLOCK_SIZE);
+        assert_eq!(most(1, MAX_BLOCK_SIZE, None), 1);
+        assert_eq!(most(1, 0, None), MAX_BLOCK_SIZE);
+        // A quarter of the cache, if that is less.
+        assert_eq!(most(2, 4096, Some(32)), 8);
+        assert_eq!(most(2, 4096, Some(35)), 8);
+        assert_eq!(most(2, 4096, Some(u64::MAX)), MAX_BLOCK_SIZE / 4096);
         // A cache that keeps nothing, or whose quarter is less than the read:
         // only the read.
-        assert_eq!(window(0..1_000, 0), 10..12);
-        assert_eq!(window(0..1_000, 2), 10..12);
-        assert_eq!(window(0..1_000, 11), 10..12);
-        // Else a quarter of the blocks the cache holds, from the read on.
-        assert_eq!(window(0..1_000, 12), 10..13);
-        assert_eq!(window(0..1_000, 32), 10..18);
-        assert_eq!(window(0..12, 32), 4..12);
-        assert_eq!(window(8..14, 32), 8..14);
-        assert_eq!(window(8..14, u64::MAX), 8..14);
+        assert_eq!(most(2, 4096, Some(0)), 2);
+        assert_eq!(most(2, 4096, Some(7)), 2);
+        assert_eq!(most(10, MAX_BLOCK_SIZE, None), 10);
     }
 }

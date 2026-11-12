@@ -5,8 +5,9 @@
 //! cache sits below those: it holds the blocks that were fetched ahead of
 //! need until SQLite asks for them, and it serves a page to every connection
 //! whose own cache lacks it. A page that SQLite holds is not asked for again
-//! soon, so a block cache much larger than the read-ahead mostly repeats
-//! SQLite's own.
+//! soon, so one connection needs a block cache of only a few fetches: one
+//! request fetches at most a quarter of the cache. A larger cache saves the
+//! requests of other and later connections.
 //!
 //! - A [`CachePolicy`] builds the cache of a database when it is opened:
 //!   [`NoCache`], [`MemoryCache`], [`FileCache`], or any function from a
@@ -95,7 +96,8 @@ pub trait BlockCache: Send + Sync {
     /// One request to the store fetches no more than a quarter of this many
     /// blocks, unless a single read needs more. Blocks fetched ahead of a few
     /// scans then fit in the cache together; larger fetches would push each
-    /// other out before they were read.
+    /// other out before they were read. Fetch policies see that limit as
+    /// [`Miss::most`](crate::fetch::Miss::most).
     fn capacity(&self) -> Option<u64> {
         None
     }

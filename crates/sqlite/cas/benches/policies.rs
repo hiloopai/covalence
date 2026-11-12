@@ -206,8 +206,9 @@ impl FetchPolicy for TrialPolicy {
         let Trial { first, growth, max } = self.trial;
         let blocks_in = |bytes: u64| (bytes / miss.block_size).max(1);
         let Range { start, end } = miss.need;
+        let most = blocks_in(max).min(miss.most);
         let len = |fetch: &Range<u64>| fetch.end - fetch.start;
-        let grown = |last: &Range<u64>| len(last).saturating_mul(growth).min(blocks_in(max));
+        let grown = |last: &Range<u64>| len(last).saturating_mul(growth).min(most);
         let mut scans = self.scans.lock().unwrap();
         let near =
             |last: &Range<u64>| start <= last.end + len(last) && last.start <= end + len(last);
@@ -215,9 +216,9 @@ impl FetchPolicy for TrialPolicy {
         let continued = nearest.max_by_key(|(_, last)| len(last)).map(|(at, _)| at);
         let fetch = match continued.and_then(|at| scans.remove(at)) {
             Some(last) if last.end <= start => last.end..last.end + grown(&last),
-            Some(last) if last.start <= start => start..start + len(&last),
+            Some(last) if last.start <= start => start..start + len(&last).min(most),
             Some(last) => last.start.saturating_sub(grown(&last))..last.start,
-            None => start..start + blocks_in(first).min(blocks_in(max)),
+            None => start..start + blocks_in(first).min(most),
         };
         let fetch = fetch.start.min(start)..fetch.end.min(miss.blocks).max(end);
         if scans.len() >= ReadAhead::SCANS {

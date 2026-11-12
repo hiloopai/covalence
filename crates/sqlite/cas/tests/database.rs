@@ -344,6 +344,8 @@ fn fetch_policies_size_the_requests_and_can_be_swapped_while_open() {
         for miss in misses.iter() {
             assert!(miss.need.start < miss.need.end && miss.need.end <= miss.blocks);
             assert_eq!((miss.blocks, miss.block_size), (size.div_ceil(4096), 4096));
+            // This cache names no limit, so a request is `MAX_BLOCK_SIZE` at most.
+            assert_eq!(miss.most, covalence_sqlite_cas::MAX_BLOCK_SIZE / 4096);
         }
         for (start, len) in store.take_ranges() {
             assert!(len > 0 && start + len <= size);
@@ -380,6 +382,14 @@ fn no_request_is_for_more_than_a_quarter_of_the_cache() {
     assert!(small.iter().all(|(_, len)| *len <= 8 * 4096), "{small:?}");
     assert!(small.iter().any(|(_, len)| *len == 8 * 4096), "{small:?}");
     assert!(small.len() < exact.len(), "{} {}", small.len(), exact.len());
+    // The policy is told so.
+    let policy = Arc::new(Recorded(Default::default(), |_: &Miss| 0..u64::MAX));
+    let options = Options::new()
+        .fetch(policy.clone())
+        .cache(MemoryCache::new(32 * 4096));
+    assert!(ranges(options).iter().all(|(_, len)| *len <= 8 * 4096));
+    let misses = policy.0.lock().unwrap();
+    assert!(!misses.is_empty() && misses.iter().all(|miss| miss.most == 8));
 }
 
 #[test]
