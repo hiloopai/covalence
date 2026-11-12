@@ -305,6 +305,17 @@ enum Fault {
     ReadPanic,
     /// Dropping the file panics.
     DropPanic,
+    /// `size` panics, and so does dropping the file.
+    SizeAndDropPanic,
+}
+
+/// A panic's payload whose drop panics.
+struct Bomb;
+
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        panic!("payload");
+    }
 }
 
 impl File for Faulty {
@@ -313,7 +324,7 @@ impl File for Faulty {
             Fault::SizeError => Err(io::Error::other("no size")),
             Fault::Huge => Ok(i64::MAX as u64 + 1),
             Fault::Longer => Ok(self.bytes.len() as u64 + 4096),
-            Fault::SizePanic => panic!("size"),
+            Fault::SizePanic | Fault::SizeAndDropPanic => panic!("size"),
             _ => Ok(self.bytes.len() as u64),
         }
     }
@@ -334,7 +345,7 @@ impl File for Faulty {
 
 impl Drop for Faulty {
     fn drop(&mut self) {
-        if matches!(self.fault, Fault::DropPanic) {
+        if matches!(self.fault, Fault::DropPanic | Fault::SizeAndDropPanic) {
             panic!("drop");
         }
     }
@@ -350,6 +361,7 @@ fn faults_and_panics_become_errors() {
                 "missing" => return Ok(None),
                 "open-error" => return Err(io::Error::other("no file")),
                 "open-panic" => panic!("open"),
+                "open-bomb" => std::panic::panic_any(Bomb),
                 "size-error" => Fault::SizeError,
                 "huge" => Fault::Huge,
                 "longer" => Fault::Longer,
@@ -360,6 +372,7 @@ fn faults_and_panics_become_errors() {
                 "size-panic" => Fault::SizePanic,
                 "read-panic" => Fault::ReadPanic,
                 "drop-panic" => Fault::DropPanic,
+                "size-and-drop-panic" => Fault::SizeAndDropPanic,
                 _ => unreachable!(),
             };
             let bytes = bytes.clone();
@@ -381,6 +394,12 @@ fn faults_and_panics_become_errors() {
     ] {
         assert_eq!(open_code(name), ErrorCode::SystemIoFailure, "{name}");
     }
+    // A second panic is one more error, where it could abort the process: in
+    // the drop of the first one's payload, or in the drop of the file whose
+    // `size` panicked.
+    for name in ["open-bomb", "size-and-drop-panic"] {
+        assert_eq!(open_code(name), ErrorCode::SystemIoFailure, "{name}");
+    }
     // SQLite reads the database header when it opens a file, so a file whose
     // every read fails does not open.
     for name in ["read-error", "fewer", "more", "read-panic"] {
@@ -398,14 +417,14 @@ fn faults_and_panics_become_errors() {
         rows(&connection, "PRAGMA integrity_check"),
         ["[Text(\"ok\")]"]
     );
-    // A file whose drop panics still answers, and closing it is an error
-    // that `rusqlite` reports, not a crash.
+    // A file whose drop panics still answers, and closing it is no crash.
+    // SQLite ignores what closing a file answers, so the connection closes.
     let connection = registered.open("drop-panic").unwrap();
     assert_eq!(
         rows(&connection, "PRAGMA integrity_check"),
         ["[Text(\"ok\")]"]
     );
-    let _ = connection.close();
+    assert!(connection.close().is_ok());
     // The VFS still works after every fault.
     assert_eq!(open_code("missing"), ErrorCode::CannotOpen);
 }

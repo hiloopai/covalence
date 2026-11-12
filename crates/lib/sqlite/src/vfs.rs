@@ -16,6 +16,11 @@
 //!   per database.
 //! - A panic in a [`Vfs`] or a [`File`] becomes an I/O error of the statement
 //!   that caused it. It never unwinds into SQLite.
+//! - SQLite finds a VFS by its name alone. [`register`] refuses a name that
+//!   is taken, but other code can still give the same name to a VFS of its
+//!   own by registering it with SQLite directly. [`Registered::open`] checks
+//!   which VFS serves the connection, and fails rather than open through
+//!   another one.
 //!
 //! ```
 //! use std::io;
@@ -49,11 +54,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use std::{
-    ffi::{CStr, CString},
-    io,
-    sync::Arc,
-};
+use std::{ffi::CString, io, sync::Arc};
 
 use covalence_lib_error::snafu::{ResultExt, Snafu, ensure};
 use rusqlite::{Connection, OpenFlags};
@@ -125,7 +126,7 @@ where
 /// A VFS registered with SQLite under a name, for the life of the process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Registered {
-    name: &'static CStr,
+    record: ffi::Record,
 }
 
 /// Register `vfs` with SQLite under `name`, for the life of the process.
@@ -140,15 +141,15 @@ pub fn register(name: &str, vfs: impl Vfs) -> Result<Registered, Error> {
     let Ok(name) = CString::new(name) else {
         return NameSnafu { name }.fail();
     };
-    let name = ffi::register(name, Box::new(vfs))?;
-    Ok(Registered { name })
+    let record = ffi::register(name, Box::new(vfs))?;
+    Ok(Registered { record })
 }
 
 impl Registered {
     /// The name the VFS is registered under.
     pub fn name(&self) -> &'static str {
         // The name was a `&str` when registered.
-        self.name.to_str().unwrap_or_default()
+        self.record.name.to_str().unwrap_or_default()
     }
 
     /// A read-only connection to the database file `file` of this VFS.
@@ -163,6 +164,9 @@ impl Registered {
     ///   read. SQLite checks what it reads lazily, so a file that is not a
     ///   database, or a later read that fails, is an error of the statement
     ///   that needed the bytes.
+    /// - Fails with [`Error::Shadowed`] if SQLite opened the connection
+    ///   through another VFS of the same name. No connection is returned that
+    ///   reads through any VFS but this one.
     /// - The connection is not serialized (`SQLITE_OPEN_NO_MUTEX`): use it
     ///   from one thread at a time, as `rusqlite` enforces.
     /// - SQL run on the connection can still reach files of other VFSes. A
@@ -177,7 +181,13 @@ impl Registered {
         let special = file.is_empty() || file == ":memory:" || uri || file.contains('\0');
         ensure!(!special, NameSnafu { name: file });
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        Connection::open_with_flags_and_vfs(file, flags, self.name).context(OpenSnafu)
+        let name = self.record.name;
+        let connection =
+            Connection::open_with_flags_and_vfs(file, flags, name).context(OpenSnafu)?;
+        // SQLite found a VFS by this name, which need not be this one.
+        let name = self.name();
+        ensure!(self.record.serves(&connection), ShadowedSnafu { name });
+        Ok(connection)
     }
 }
 
@@ -209,5 +219,14 @@ pub enum Error {
     Open {
         /// SQLite's error.
         source: rusqlite::Error,
+    },
+    /// SQLite opened the connection through another VFS of the same name.
+    ///
+    /// Other code registered that VFS with SQLite directly, where names are
+    /// not checked, after this one was registered.
+    #[snafu(display("SQLite finds another VFS under the name {name:?}"))]
+    Shadowed {
+        /// The name both VFSes are registered under.
+        name: String,
     },
 }

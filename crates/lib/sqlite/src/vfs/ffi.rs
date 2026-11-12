@@ -6,8 +6,11 @@
 //!   memory, and no pointer into a file's bytes outlives the read that fills
 //!   SQLite's buffer.
 //! - Callbacks that run Rust code able to panic (a [`Vfs::open`], a
-//!   [`File::read_at`] or a file's drop) catch the panic and return
-//!   `SQLITE_IOERR`, so no panic unwinds into C.
+//!   [`File::size`], a [`File::read_at`] or a file's drop) catch the panic and
+//!   return `SQLITE_IOERR`, so no panic unwinds into C. No value of the caller
+//!   is dropped while a panic unwinds, and a panic's payload is dropped under
+//!   a catch of its own, so that a drop that panics too is one more error and
+//!   not an abort.
 //! - What SQLite passes in is trusted to follow its VFS contract. What the
 //!   Rust side answers is checked before SQLite sees it.
 
@@ -17,7 +20,7 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-use rusqlite::ffi as sys;
+use rusqlite::{Connection, ffi as sys};
 
 use super::{Error, File, RegisterSnafu, TakenSnafu, Vfs};
 
@@ -63,9 +66,42 @@ struct Open {
     size: u64,
 }
 
+/// A VFS that [`register`] made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Record {
+    /// The name it is registered under.
+    pub(super) name: &'static CStr,
+    /// The address of its `sqlite3_vfs`: compared, never followed.
+    at: usize,
+}
+
+impl Record {
+    /// Whether `connection` reads its main database through this VFS.
+    ///
+    /// SQLite finds a VFS by name alone, and other code may register one
+    /// under a name that is taken, so the name a connection was opened with
+    /// does not say which VFS serves it.
+    pub(super) fn serves(&self, connection: &Connection) -> bool {
+        let mut vfs: *mut sys::sqlite3_vfs = ptr::null_mut();
+        // SAFETY: the handle is live while `connection` is borrowed, and a
+        // `Connection` is not `Sync`, so no other thread uses it meanwhile.
+        // `main` is NUL-terminated, and this file control only writes the
+        // connection's VFS pointer to `vfs`.
+        let code = unsafe {
+            sys::sqlite3_file_control(
+                connection.handle(),
+                c"main".as_ptr(),
+                sys::SQLITE_FCNTL_VFS_POINTER,
+                (&raw mut vfs).cast(),
+            )
+        };
+        code == sys::SQLITE_OK && vfs.addr() == self.at
+    }
+}
+
 /// Register `vfs` under `name` for the life of the process, unless SQLite
 /// already has a VFS of that name.
-pub(super) fn register(name: CString, vfs: Box<dyn Vfs>) -> Result<&'static CStr, Error> {
+pub(super) fn register(name: CString, vfs: Box<dyn Vfs>) -> Result<Record, Error> {
     let _guard = REGISTER.lock().unwrap_or_else(PoisonError::into_inner);
     // SAFETY: `name` is NUL-terminated. Finding a VFS initialises SQLite if
     // needed and only reads its list.
@@ -123,12 +159,30 @@ pub(super) fn register(name: CString, vfs: Box<dyn Vfs>) -> Result<&'static CStr
         return RegisterSnafu { code }.fail();
     }
     // SAFETY: `name` came from `CString::into_raw` and is never freed.
-    Ok(unsafe { CStr::from_ptr(name) })
+    let name = unsafe { CStr::from_ptr(name) };
+    let at = record.addr();
+    Ok(Record { name, at })
+}
+
+/// Run `f`, or give `None` if it panics.
+fn caught<T>(f: impl FnOnce() -> T) -> Option<T> {
+    match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
+        Ok(value) => Some(value),
+        Err(payload) => {
+            // Dropping a payload can panic in turn. That second payload is
+            // leaked: nothing says its drop would not panic as well.
+            let dropped = panic::catch_unwind(panic::AssertUnwindSafe(move || drop(payload)));
+            if let Err(second) = dropped {
+                mem::forget(second);
+            }
+            None
+        }
+    }
 }
 
 /// Run `f`, turning a panic into `SQLITE_IOERR`.
 fn guard(f: impl FnOnce() -> c_int) -> c_int {
-    panic::catch_unwind(panic::AssertUnwindSafe(f)).unwrap_or(sys::SQLITE_IOERR)
+    caught(f).unwrap_or(sys::SQLITE_IOERR)
 }
 
 /// The state of a VFS registered by [`register`].
@@ -195,10 +249,22 @@ unsafe extern "C" fn x_open(
             Ok(None) => return sys::SQLITE_CANTOPEN,
             Err(_) => return sys::SQLITE_IOERR,
         };
+        // Kept from the unwind of a panic in `size`: were the file dropped
+        // then and its drop panicked as well, the process would abort.
+        let opened = mem::ManuallyDrop::new(opened);
         // SQLite's offsets are signed, so a larger file could not be read.
-        let size = match opened.size() {
-            Ok(size) if i64::try_from(size).is_ok() => size,
-            _ => return sys::SQLITE_IOERR,
+        let size = caught(|| {
+            opened
+                .size()
+                .ok()
+                .filter(|size| i64::try_from(*size).is_ok())
+        });
+        let opened = mem::ManuallyDrop::into_inner(opened);
+        let Some(Some(size)) = size else {
+            return guard(move || {
+                drop(opened);
+                sys::SQLITE_IOERR
+            });
         };
         let open = Box::into_raw(Box::new(Open { file: opened, size }));
         let methods = &raw const IO_METHODS;
@@ -423,4 +489,61 @@ unsafe extern "C" fn x_sector_size(_file: *mut sys::sqlite3_file) -> c_int {
 /// need not be whole pages, so SQLite may read part of an overflow page.
 unsafe extern "C" fn x_device_characteristics(_file: *mut sys::sqlite3_file) -> c_int {
     sys::SQLITE_IOCAP_IMMUTABLE | sys::SQLITE_IOCAP_SUBPAGE_READ
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::OpenFlags;
+
+    use super::{super::register, *};
+
+    #[test]
+    fn a_connection_through_another_vfs_of_the_same_name_is_refused() {
+        // A local database, which the registered VFS does not have.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local.db");
+        let local = Connection::open(&path).unwrap();
+        local.execute_batch("CREATE TABLE t (x)").unwrap();
+        let path = path.to_str().unwrap();
+
+        let registered = register("test-shadowed", |_: &str| Ok(None)).unwrap();
+        assert!(matches!(registered.open(path), Err(Error::Open { .. })));
+
+        // What other code can do: register the default VFS once more, under
+        // the taken name and ahead of every other VFS.
+        let name = registered.record.name;
+        // SAFETY: a null name asks for the default VFS, which is live. No
+        // other thread of this test binary registers a VFS meanwhile.
+        let default = unsafe { *sys::sqlite3_vfs_find(ptr::null()) };
+        let other = Box::into_raw(Box::new(sys::sqlite3_vfs {
+            zName: name.as_ptr(),
+            pNext: ptr::null_mut(),
+            ..default
+        }));
+        // SAFETY: `other` is a whole VFS, a copy of a live one, and is leaked.
+        assert_eq!(
+            unsafe { sys::sqlite3_vfs_register(other, 1) },
+            sys::SQLITE_OK
+        );
+
+        // SQLite now reads the local file under that name.
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY;
+        let through = Connection::open_with_flags_and_vfs(path, flags, name).unwrap();
+        let tables = "SELECT count(*) FROM sqlite_schema";
+        assert_eq!(through.query_row(tables, [], |row| row.get(0)), Ok(1));
+        // The registration does not.
+        assert!(matches!(
+            registered.open(path),
+            Err(Error::Shadowed { name }) if name == "test-shadowed"
+        ));
+
+        // Without the other VFS, the name is this registration's again.
+        drop(through);
+        // SAFETY: `other` is registered and stays live; no connection uses it.
+        assert_eq!(
+            unsafe { sys::sqlite3_vfs_unregister(other) },
+            sys::SQLITE_OK
+        );
+        assert!(matches!(registered.open(path), Err(Error::Open { .. })));
+    }
 }
