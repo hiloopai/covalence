@@ -30,6 +30,7 @@ covalence-lib-config.workspace = true
 covalence-lib-dasl = { workspace = true, features = ["json"] }
 covalence-lib-data.workspace = true
 covalence-lib-python = { path = "../lib/python" }
+covalence-sqlite-cas.workspace = true
 pep440_rs = { version = "0.7.3", default-features = false }
 tempfile = "3"
 toml = "1.1"

@@ -1,5 +1,6 @@
 mod config;
 mod errors;
+mod sqlite;
 mod streams;
 
 use std::{
@@ -1540,6 +1541,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCas>()?;
     m.add_class::<PyBlob>()?;
     m.add_class::<PyBlobFact>()?;
+    sqlite::add(m)?;
     config::add(m)?;
     errors::add(m)
 }

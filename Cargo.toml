@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lib/error", "crates/lib/cli", "tools/glu", "crates/lib/serde", "crates/lib/config", "crates/lib/data", "crates/lib/python", "crates/python", "crates/lib/cid", "crates/lib/sqlite", "crates/lib/dasl", "crates/cas/trait", "crates/cas/memory", "crates/lib/rand", "crates/cas/sqlite", "crates/cas/prolly", "crates/kv/trait", "crates/kv/memory", "crates/kv/s3", "crates/cas/kv", "crates/blob/trait", "crates/lean/cache", "crates/lean/kernel-checker", "crates/lean/ltar"]
+members = ["crates/lib/error", "crates/lib/cli", "tools/glu", "crates/lib/serde", "crates/lib/config", "crates/lib/data", "crates/lib/python", "crates/python", "crates/lib/cid", "crates/lib/sqlite", "crates/lib/dasl", "crates/cas/trait", "crates/cas/memory", "crates/lib/rand", "crates/cas/sqlite", "crates/cas/prolly", "crates/kv/trait", "crates/kv/memory", "crates/kv/s3", "crates/cas/kv", "crates/blob/trait", "crates/sqlite/cas", "crates/lean/cache", "crates/lean/kernel-checker", "crates/lean/ltar"]
 resolver = "3"
 
 [workspace.package]
@@ -35,6 +35,7 @@ covalence-lib-error = { path = "crates/lib/error", version = "=0.1.0-dev.8" }
 covalence-lib-rand = { path = "crates/lib/rand", version = "=0.1.0-dev.8" }
 covalence-lib-serde = { path = "crates/lib/serde", version = "=0.1.0-dev.8" }
 covalence-lib-sqlite = { path = "crates/lib/sqlite", version = "=0.1.0-dev.8" }
+covalence-sqlite-cas = { path = "crates/sqlite/cas", version = "=0.1.0-dev.8" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -12,6 +12,7 @@ on:
       - 'crates/blob/**'
       - 'crates/cas/**'
       - 'crates/kv/**'
+      - 'crates/sqlite/**'
       - 'vendor/**'
     # v<version> releases to GitHub, PyPI and crates.io (crates.yml);
     # python-v<version> only attaches the wheels to a GitHub release.
@@ -26,6 +27,7 @@ on:
       - 'crates/blob/**'
       - 'crates/cas/**'
       - 'crates/kv/**'
+      - 'crates/sqlite/**'
       - 'vendor/**'
   workflow_dispatch:
 

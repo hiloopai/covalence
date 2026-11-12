@@ -81,6 +81,11 @@ Stores:
 - `crates/kv/memory`: an in-memory key-value store.
 - `crates/kv/s3`: a key-value store on S3.
 
+Databases:
+
+- [`crates/sqlite/cas`](crates/sqlite/cas/README.md): read-only SQLite
+  databases opened from a content-addressed store, whole or by range.
+
 Python:
 
 - [`crates/python`](crates/python/README.md): the `covalence` Python package.
@@ -97,7 +102,8 @@ Internal facades, which re-export other crates for the workspace's own use:
 - `crates/lib/python`: PyO3 facade.
 - `crates/lib/rand`: rand facade.
 - `crates/lib/serde`: serialization traits and derives.
-- `crates/lib/sqlite`: rusqlite facade, with SQLite bundled.
+- `crates/lib/sqlite`: rusqlite facade, with SQLite bundled, and `vfs`:
+  read-only SQLite file systems defined in safe Rust.
 
 Tools:
 

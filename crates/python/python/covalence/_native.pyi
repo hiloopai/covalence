@@ -1,4 +1,4 @@
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from os import PathLike
 from typing import Any, BinaryIO, Literal, Self, TypeAlias, final
 
@@ -19,8 +19,13 @@ __all__ = [
     "Cas",
     "Blob",
     "BlobFact",
+    "ChunkManifest",
+    "SqliteDatabase",
+    "SqliteConnection",
+    "SqliteCursor",
     "Error",
     "IntegrityError",
+    "SqliteError",
     "StoreError",
     "UnsupportedError",
     "config",
@@ -31,11 +36,15 @@ __version__: str
 _BytesLike: TypeAlias = bytes | bytearray
 _NativeInput: TypeAlias = None | bool | int | str | _BytesLike | Cid | Value | list[Any] | tuple[Any, ...] | dict[str, Any]
 _Native: TypeAlias = None | bool | int | str | bytes | Cid | list["_Native"] | dict[str, "_Native"]
+_SqlValue: TypeAlias = None | int | float | str | bytes
+_SqlParameters: TypeAlias = Sequence[_SqlValue | bytearray] | Mapping[str, _SqlValue | bytearray]
 
 class Error(Exception):
-    """The base class of IntegrityError, StoreError and UnsupportedError."""
+    """The base class of IntegrityError, SqliteError, StoreError and UnsupportedError."""
 class IntegrityError(Error, ValueError):
     """Data does not match its CID."""
+class SqliteError(Error):
+    """SQLite refused a statement or a database."""
 class StoreError(Error, OSError):
     """The storage under a store failed."""
 class UnsupportedError(Error, NotImplementedError):
@@ -609,3 +618,273 @@ class Cas:
         """What the store says about itself, for debugging: None or a dict."""
     def stats(self) -> _Native:
         """Whatever the store counts, for debugging: None or a dict."""
+
+@final
+class ChunkManifest:
+    """The digests of the chunks of some bytes, to check ranges of the bytes with.
+
+    A CID can be checked only with all of its bytes at hand. A manifest
+    splits the bytes into chunks of `chunk_size` bytes and keeps the digest of
+    each, so any chunk can be checked alone. `SqliteDatabase.open` takes one
+    as `verify`, to read a database by range from a store it does not trust.
+
+    A manifest vouches for the bytes, so it must come from somewhere trusted:
+    make it from bytes that are, or `load` it by a CID that is.
+
+    >>> from covalence import Cas, ChunkManifest
+    >>> manifest = ChunkManifest.of(bytes(100_000), chunk_size=65536)
+    >>> manifest
+    ChunkManifest(size=100000, chunk_size=65536, hash='blake3')
+    >>> cas = Cas.memory()
+    >>> ChunkManifest.load(cas, manifest.put(cas)).chunks
+    2
+    """
+    @staticmethod
+    def of(data: _BytesLike, *, chunk_size: int = 65536, hash: Hash | str | None = None) -> ChunkManifest:
+        """The manifest of `data` in chunks of `chunk_size` bytes.
+
+        - `chunk_size` is from 1 to 2**30; another size raises ValueError.
+          Reading with the manifest fetches and checks whole chunks.
+        - `hash` is the hash function of the digests: "blake3" (the default),
+          "sha256", "sha512" or "sha1". Another raises UnsupportedError.
+        """
+    @staticmethod
+    def of_file(path: str | PathLike[str], *, chunk_size: int = 65536, hash: Hash | str | None = None) -> ChunkManifest:
+        """The manifest of the file at `path`, as `of` makes it.
+
+        The file is read in pieces, so it need not fit in memory. A file that
+        cannot be read raises OSError.
+        """
+    @staticmethod
+    def load(cas: Cas, cid: Cid) -> ChunkManifest | None:
+        """The manifest that `cas` holds under `cid`, or None if missing.
+
+        - Bytes that do not hash to `cid` raise IntegrityError.
+        - Bytes that are not a manifest raise ValueError.
+        """
+    def put(self, cas: Cas) -> Cid:
+        """Store the manifest in `cas` and return the CID that `load` takes.
+
+        The manifest is stored as DRISL: a map of the hash function's code,
+        the size, the chunk size and the digests.
+        """
+    @property
+    def size(self) -> int:
+        """The size in bytes of the content the manifest is of."""
+    @property
+    def chunk_size(self) -> int:
+        """The size in bytes of each chunk but the last, which may be shorter."""
+    @property
+    def chunks(self) -> int:
+        """The number of chunks."""
+    @property
+    def hash(self) -> Hash:
+        """The hash function of the digests."""
+
+@final
+class SqliteDatabase:
+    """A SQLite database held in a store, opened read-only.
+
+    `SqliteDatabase.open` makes the bytes under a CID ready for SQLite, and
+    `connect` gives connections that run SQL on them. The database is the
+    bytes of its CID and never changes: every write to it raises SqliteError.
+
+    >>> import sqlite3
+    >>> from covalence import Cas, SqliteDatabase
+    >>> source = sqlite3.connect(':memory:')
+    >>> _ = source.execute('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)')
+    >>> _ = source.execute("INSERT INTO notes (body) VALUES ('first'), ('second')")
+    >>> source.commit()
+    >>> cas = Cas.memory()
+    >>> cid = cas.put(source.serialize())
+    >>> source.close()
+    >>> database = SqliteDatabase.open(cas, cid)
+    >>> with database.connect() as connection:
+    ...     connection.execute('SELECT id, body FROM notes WHERE id > ?', (1,)).fetchall()
+    [(2, 'second')]
+    """
+    @staticmethod
+    def open(cas: Cas, cid: Cid, *, verify: Literal["download", "trusted-ranges", "blake3-ranges"] | ChunkManifest | None = None, max_bytes: int | None = None, block_size: int | None = None, fetch: Literal["read-ahead", "aligned", "exact"] = "read-ahead", fetch_bytes: int | None = None, cache: Literal["memory", "file", "none"] = "memory", cache_bytes: int | None = None, dir: str | PathLike[str] | None = None) -> SqliteDatabase | None:
+        """Open the database whose bytes `cas` holds under `cid`, or None if missing.
+
+        `verify` says how far the store is trusted:
+
+        - "download", the default, does not trust it. All the bytes are
+          downloaded to a private temporary file, and must hash to `cid` or
+          IntegrityError is raised. At most `max_bytes` bytes are accepted,
+          1 GiB by default; a larger database raises ValueError. A `cid` whose
+          hash function is not BLAKE3, SHA-256 or SHA-1 raises UnsupportedError.
+        - "trusted-ranges" reads byte ranges as queries need them, and trusts
+          them: nothing checks the bytes against `cid`. Use it only for a
+          store trusted as much as a local file.
+        - A `ChunkManifest` reads byte ranges and checks every chunk against
+          the manifest before SQLite sees it, so the store need not be
+          trusted. What is read is the content the manifest is of; `cid` only
+          says where to fetch. A stored size that is not the manifest's raises
+          IntegrityError.
+        - "blake3-ranges", ranges checked against a BLAKE3 `cid` itself, is
+          not supported yet. It raises UnsupportedError before the store is
+          asked anything, and never falls back to another mode.
+
+        The other options matter only when ranges are read:
+
+        - `block_size` is the size in bytes of the blocks that are fetched and
+          cached: 4096 by default, from 1 to 2**30, or ValueError is raised.
+          With a manifest the blocks are its chunks.
+        - `fetch` sizes the request when a read misses the cache. "read-ahead",
+          the default, fetches 64 KiB where reads begin, and four times as
+          much each time reads go on from there, up to `fetch_bytes` (4 MiB by
+          default). "aligned" fetches whole windows of `fetch_bytes` bytes,
+          which it needs. "exact" fetches only what is read.
+        - `cache` keeps fetched blocks for every connection: "memory" (the
+          default), "file" for a private temporary file, or "none". It holds
+          up to `cache_bytes` bytes, 32 MiB by default. A cache smaller than
+          the database keeps a request to a quarter of what it holds, unless
+          one read needs more: with "none", only what is read is fetched.
+
+        `dir` is the directory of the local files, the download and the file
+        cache: the system's temporary directory by default. The files are
+        private: they have no name on Unix, and on Windows nothing else can
+        read or write them. The system removes them once the database and its
+        connections are gone.
+
+        A store that fails raises StoreError. Whether the bytes are a SQLite
+        database is found by `connect`.
+        """
+    def connect(self) -> SqliteConnection:
+        """A new read-only connection to the database.
+
+        - Connections share the database's cache, and each has SQLite's own
+          page cache.
+        - A connection opens no other database: `ATTACH` and `VACUUM INTO`
+          raise SqliteError.
+        - Bytes that do not start as a SQLite database does raise SqliteError;
+          other damage raises it from the statement that reads it.
+        - A read that fails raises its cause: IntegrityError for bytes that
+          were refused, StoreError for a store that failed.
+        """
+    @property
+    def cid(self) -> Cid:
+        """The CID the database was opened with."""
+    @property
+    def size(self) -> int:
+        """The size of the database in bytes."""
+    def stats(self) -> dict[str, int]:
+        """Counts of what has been read so far, by every connection.
+
+        - "reads" and "read_bytes": the reads SQLite made of the database, and
+          their bytes.
+        - "fetches" and "fetched_bytes": the requests to the store for the
+          database's bytes, and the bytes it gave. A download is one fetch.
+
+        `reads - fetches` reads were answered by the cache or the local file.
+        """
+    def set_fetch(self, fetch: Literal["read-ahead", "aligned", "exact"], fetch_bytes: int | None = None) -> None:
+        """Size requests from now on with `fetch` and `fetch_bytes`, as in `open`.
+
+        This holds for every connection, and the cache keeps its blocks. It
+        does nothing for a database that was downloaded.
+        """
+
+@final
+class SqliteConnection:
+    """A read-only connection to a `SqliteDatabase`, from `SqliteDatabase.connect`.
+
+    `execute`, `cursor` and `close` are those of a DB-API connection (PEP
+    249). There is nothing to commit: the database cannot change.
+
+    - A connection can be used from any thread; it runs one statement at a
+      time.
+    - As a context manager it closes itself on exit.
+
+    >>> import sqlite3
+    >>> from covalence import Cas, SqliteDatabase
+    >>> source = sqlite3.connect(':memory:')
+    >>> _ = source.execute('CREATE TABLE t AS SELECT 1 AS x')
+    >>> source.commit()
+    >>> cas = Cas.memory()
+    >>> connection = SqliteDatabase.open(cas, cas.put(source.serialize())).connect()
+    >>> source.close()
+    >>> list(connection.execute('SELECT x, :y FROM t', {'y': 'two'}))
+    [(1, 'two')]
+    >>> connection.close()
+    """
+    def execute(self, sql: str, parameters: _SqlParameters | None = None) -> SqliteCursor:
+        """Run one SQL statement and return a cursor over its rows.
+
+        - `parameters` fills the statement's placeholders: a sequence such as
+          a tuple or a list for `?`, or a mapping such as a dict for `:name`,
+          `@name` and `$name`, keyed by the name without its first character.
+          Values are None, bool, int, float, str, bytes or bytearray. Another
+          type raises TypeError, as do str and bytes in place of a sequence;
+          an int outside 64 bits raises OverflowError.
+        - A wrong number of values, a name without a value, more than one
+          statement and no statement raise ValueError.
+        - The statement runs to its end here. Its rows stay in memory until
+          they are fetched: tuples of None, int, float, str and bytes.
+        - SQL that SQLite refuses raises SqliteError, as do every write to
+          the database, `ATTACH` and `VACUUM INTO`. Temporary tables can be
+          written.
+        - A read that fails raises its cause: IntegrityError for bytes that
+          were refused, StoreError for a store that failed.
+        """
+    def cursor(self) -> SqliteCursor:
+        """A new cursor, with no rows until it runs a statement."""
+    def close(self) -> None:
+        """Close the connection. Closing again does nothing.
+
+        Statements raise SqliteError from then on. Cursors keep the rows they
+        have.
+        """
+    def __enter__(self) -> Self:
+        """The connection itself, for `with`."""
+    def __exit__(self, *_exception: object) -> None:
+        """Close the connection at the end of `with`, whatever was raised."""
+
+@final
+class SqliteCursor:
+    """The rows of a statement, from `SqliteConnection.execute`.
+
+    `description` and the `fetch` methods are those of a DB-API cursor (PEP
+    249). Iterating a cursor gives its remaining rows.
+
+    >>> import sqlite3
+    >>> from covalence import Cas, SqliteDatabase
+    >>> source = sqlite3.connect(':memory:')
+    >>> _ = source.execute('CREATE TABLE t AS SELECT 1 AS x UNION SELECT 2 UNION SELECT 3')
+    >>> source.commit()
+    >>> cas = Cas.memory()
+    >>> connection = SqliteDatabase.open(cas, cas.put(source.serialize())).connect()
+    >>> source.close()
+    >>> cursor = connection.execute('SELECT x, x * 1.5 AS y FROM t ORDER BY x')
+    >>> [column[0] for column in cursor.description]
+    ['x', 'y']
+    >>> cursor.fetchone(), cursor.fetchall()
+    ((1, 1.5), [(2, 3.0), (3, 4.5)])
+    """
+    def execute(self, sql: str, parameters: _SqlParameters | None = None) -> Self:
+        """Run one SQL statement and return this cursor over its rows.
+
+        The statement runs as in `SqliteConnection.execute`. The rows of the
+        cursor's earlier statement are dropped, unless this one raises.
+        """
+    @property
+    def description(self) -> tuple[tuple[str, None, None, None, None, None, None], ...] | None:
+        """The columns of the last statement, or None if it has none.
+
+        Each column is a tuple of its name and six None, as DB-API has it.
+        It is None before any statement too.
+        """
+    def fetchone(self) -> tuple[_SqlValue, ...] | None:
+        """The next row, or None when there are no more."""
+    def fetchmany(self, size: int = 1) -> list[tuple[_SqlValue, ...]]:
+        """The next `size` rows, or as many as are left."""
+    def fetchall(self) -> list[tuple[_SqlValue, ...]]:
+        """All the rows that are left."""
+    def close(self) -> None:
+        """Close the cursor and drop its rows. Closing again does nothing.
+
+        The cursor raises SqliteError from then on.
+        """
+    def __iter__(self) -> Self: ...
+    def __next__(self) -> tuple[_SqlValue, ...]: ...

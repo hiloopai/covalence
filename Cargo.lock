@@ -1105,7 +1105,9 @@ dependencies = [
 name = "covalence-lib-sqlite"
 version = "0.1.0-dev.8"
 dependencies = [
+ "covalence-lib-error",
  "rusqlite",
+ "tempfile",
 ]
 
 [[package]]
@@ -1126,9 +1128,27 @@ dependencies = [
  "covalence-lib-dasl",
  "covalence-lib-data",
  "covalence-lib-python",
+ "covalence-sqlite-cas",
  "pep440_rs",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "covalence-sqlite-cas"
+version = "0.1.0-dev.8"
+dependencies = [
+ "blake3",
+ "covalence-cas-memory",
+ "covalence-cas-trait",
+ "covalence-lib-cid",
+ "covalence-lib-dasl",
+ "covalence-lib-data",
+ "covalence-lib-error",
+ "covalence-lib-sqlite",
+ "sha1 0.11.0",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

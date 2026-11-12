@@ -15,6 +15,24 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+### Added
+
+- `covalence-sqlite-cas`, a new crate, opens a SQLite database kept in a
+  content-addressed store, read-only. By default it downloads the database
+  and checks it against its CID before SQLite reads a byte. It can instead
+  fetch only the byte ranges that queries read: from a store you trust, or
+  from any store when a manifest of chunk digests that you trust checks
+  every chunk. Fetch sizes, block caches and range verifiers are small
+  traits with defaults, and a benchmark measures them on your own database.
+  Ranges checked against a BLAKE3 CID itself are not supported yet: asking
+  for them fails, and never falls back to another mode.
+- Python: `SqliteDatabase.open` opens such a database from a `Cas` and gives
+  read-only connections and cursors in the style of DB-API (`SqliteConnection`,
+  `SqliteCursor`). `ChunkManifest` makes, stores and loads manifests, and
+  SQLite's failures raise `SqliteError`.
+- `covalence_lib_sqlite::vfs` defines read-only SQLite file systems in safe
+  Rust: implement `Vfs` and `File`, and `register` the VFS under a name.
+
 ### Changed
 
 - `cov-lake-cache build`, and `get` or `dependencies` with targets, fail when a
