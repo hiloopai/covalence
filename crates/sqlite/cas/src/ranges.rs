@@ -104,7 +104,7 @@ impl Ranges {
             actual: size.saturating_sub(at),
         })?;
         let need = at / block_size..end.div_ceil(block_size);
-        let most = most(need.end - need.start, block_size, self.cache.capacity());
+        let most = most(need.end - need.start, self.layout, self.cache.capacity());
         let miss = Miss::new(need, self.layout.blocks(), block_size).at_most(most);
         let policy = Arc::clone(&self.policy.read().unwrap_or_else(PoisonError::into_inner));
         let blocks = window(policy.plan(&miss), &miss);
@@ -152,11 +152,15 @@ impl Ranges {
 const CACHE_SHARE: u64 = 4;
 
 /// The most blocks of one fetch for a read that needs `need` blocks:
-/// `MAX_BLOCK_SIZE` bytes, and a share of the `room` of the cache if it has a
-/// limit, but never fewer than the read needs.
-fn most(need: u64, block_size: u64, room: Option<u64>) -> u64 {
-    let most = MAX_BLOCK_SIZE / block_size.max(1);
-    let most = room.map_or(most, |room| most.min(room / CACHE_SHARE));
+/// `MAX_BLOCK_SIZE` bytes, and a share of the `room` of a cache that cannot
+/// hold the whole database, but never fewer than the read needs.
+fn most(need: u64, layout: Layout, room: Option<u64>) -> u64 {
+    let most = MAX_BLOCK_SIZE / layout.block_size();
+    let most = match room {
+        Some(room) if room < layout.blocks() => most.min(room / CACHE_SHARE),
+        // A cache with room for every block drops none, whatever is fetched.
+        _ => most,
+    };
     most.max(need)
 }
 
@@ -216,19 +220,23 @@ mod tests {
 
     #[test]
     fn a_fetch_is_a_quarter_of_the_cache_and_a_gibibyte_at_most_unless_the_read_is_more() {
+        // A database of 1,000 blocks of 4 KiB.
+        let layout = Layout::new(1_000 * 4096, 4096);
         // No cache limit: `MAX_BLOCK_SIZE` bytes.
-        assert_eq!(most(2, 4096, None), MAX_BLOCK_SIZE / 4096);
-        assert_eq!(most(2, 1, None), MAX_BLOCK_SIZE);
-        assert_eq!(most(1, MAX_BLOCK_SIZE, None), 1);
-        assert_eq!(most(1, 0, None), MAX_BLOCK_SIZE);
-        // A quarter of the cache, if that is less.
-        assert_eq!(most(2, 4096, Some(32)), 8);
-        assert_eq!(most(2, 4096, Some(35)), 8);
-        assert_eq!(most(2, 4096, Some(u64::MAX)), MAX_BLOCK_SIZE / 4096);
+        assert_eq!(most(2, layout, None), MAX_BLOCK_SIZE / 4096);
+        assert_eq!(most(2, Layout::new(u64::MAX, 1), None), MAX_BLOCK_SIZE);
+        assert_eq!(most(1, Layout::new(u64::MAX, MAX_BLOCK_SIZE), None), 1);
+        // A quarter of a cache that cannot hold the database.
+        assert_eq!(most(2, layout, Some(32)), 8);
+        assert_eq!(most(2, layout, Some(35)), 8);
+        assert_eq!(most(2, layout, Some(999)), 249);
+        // A cache that holds all of it drops nothing: no limit of its own.
+        assert_eq!(most(2, layout, Some(1_000)), MAX_BLOCK_SIZE / 4096);
+        assert_eq!(most(2, layout, Some(u64::MAX)), MAX_BLOCK_SIZE / 4096);
         // A cache that keeps nothing, or whose quarter is less than the read:
         // only the read.
-        assert_eq!(most(2, 4096, Some(0)), 2);
-        assert_eq!(most(2, 4096, Some(7)), 2);
-        assert_eq!(most(10, MAX_BLOCK_SIZE, None), 10);
+        assert_eq!(most(2, layout, Some(0)), 2);
+        assert_eq!(most(2, layout, Some(7)), 2);
+        assert_eq!(most(10, Layout::new(u64::MAX, MAX_BLOCK_SIZE), None), 10);
     }
 }

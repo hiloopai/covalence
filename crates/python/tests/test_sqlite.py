@@ -330,7 +330,8 @@ class S3Tests(unittest.TestCase):
             stats = database.stats()
             self.assertEqual(self.gets(), stats["fetches"])
             self.assertLess(stats["fetches"], 10)
-            self.assertLess(stats["fetched_bytes"], len(DATA) // 10)
+            # Read-ahead starts with 64 KiB wherever a read begins.
+            self.assertLess(stats["fetched_bytes"], len(DATA) // 4)
             # A scan reads ahead: far fewer requests than blocks.
             self.assertEqual(connection.execute(QUERIES[0]).fetchall(), expected(QUERIES[0]))
             self.assertLess(self.gets(), len(DATA) // 4096 // 4)

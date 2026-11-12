@@ -356,6 +356,7 @@ fn fetch_policies_size_the_requests_and_can_be_swapped_while_open() {
 #[test]
 fn no_request_is_for_more_than_a_quarter_of_the_cache() {
     let (bytes, expected) = expected();
+    let size = bytes.len() as u64;
     let store = Store::new(bytes);
     let ranges = |options: Options| {
         let options = options.verification(Verification::TrustedRanges);
@@ -390,6 +391,11 @@ fn no_request_is_for_more_than_a_quarter_of_the_cache() {
     assert!(ranges(options).iter().all(|(_, len)| *len <= 8 * 4096));
     let misses = policy.0.lock().unwrap();
     assert!(!misses.is_empty() && misses.iter().all(|miss| miss.most == 8));
+    // A cache with room for every block drops none, so it sets no limit.
+    let options = Options::new()
+        .fetch(Aligned::new(1 << 30))
+        .cache(MemoryCache::new(size));
+    assert_eq!(ranges(options), [(0, size)]);
 }
 
 #[test]

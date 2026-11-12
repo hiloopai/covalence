@@ -376,7 +376,7 @@ bytes at hand. `verify=` says what to do about that:
   >>> connection.execute("SELECT count(*) FROM notes").fetchone()
   (2,)
   >>> checked.stats()["fetches"]
-  2
+  1
 
   ```
 
@@ -390,12 +390,14 @@ the reads and the requests, to compare them on your own queries:
 - `block_size=` is the unit that is fetched and cached: 4096 bytes by
   default, or the manifest's chunk size.
 - `fetch=` sizes a request when a read misses the cache: `"read-ahead"` (the
-  default) grows requests while reads are sequential, up to `fetch_bytes=`;
-  `"aligned"` fetches fixed windows of `fetch_bytes=`; `"exact"` fetches only
-  what is read. `set_fetch` changes it on an open database, such as before a
-  scan.
+  default) fetches 64 KiB where reads begin and four times as much each time
+  they go on from there, up to `fetch_bytes=` (4 MiB by default); `"aligned"`
+  fetches fixed windows of `fetch_bytes=`; `"exact"` fetches only what is
+  read. `set_fetch` changes it on an open database, such as before a scan.
 - `cache=` keeps fetched blocks for all connections: `"memory"` (the
-  default, 32 MiB), `"file"` or `"none"`, holding up to `cache_bytes=`.
+  default, 32 MiB), `"file"` or `"none"`, holding up to `cache_bytes=`. A
+  cache smaller than the database keeps a request to a quarter of what it
+  holds.
 
 Connections and cursors follow DB-API (PEP 249) where a read-only database
 has use for it: `execute`, `fetchone`, `fetchmany`, `fetchall`, `description`,

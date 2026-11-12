@@ -732,14 +732,15 @@ class SqliteDatabase:
           cached: 4096 by default, from 1 to 2**30, or ValueError is raised.
           With a manifest the blocks are its chunks.
         - `fetch` sizes the request when a read misses the cache. "read-ahead",
-          the default, fetches what is read, and doubles its requests while
-          reads are sequential, up to `fetch_bytes` (1 MiB by default).
-          "aligned" fetches whole windows of `fetch_bytes` bytes, which it
-          needs. "exact" fetches only what is read.
+          the default, fetches 64 KiB where reads begin, and four times as
+          much each time reads go on from there, up to `fetch_bytes` (4 MiB by
+          default). "aligned" fetches whole windows of `fetch_bytes` bytes,
+          which it needs. "exact" fetches only what is read.
         - `cache` keeps fetched blocks for every connection: "memory" (the
           default), "file" for a local file with no name, or "none". It holds
-          up to `cache_bytes` bytes, 32 MiB by default. Blocks it cannot hold
-          are not fetched ahead: with "none", only what is read is fetched.
+          up to `cache_bytes` bytes, 32 MiB by default. A cache smaller than
+          the database keeps a request to a quarter of what it holds, unless
+          one read needs more: with "none", only what is read is fetched.
 
         `dir` is the directory of the local files, the download and the file
         cache: the system's temporary directory by default.
