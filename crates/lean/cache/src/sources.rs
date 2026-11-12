@@ -106,6 +106,27 @@ fn pack_key(url: &str, commit: &str) -> Result<String> {
     Ok(format!("lake/git/{}/{commit}.pack", repository_of(url)?))
 }
 
+/// Where the pool keeps that pack's Git index, which `git index-pack` would
+/// otherwise compute on every host by hashing every object: seconds of CPU
+/// for a large pin on a small runner.
+fn index_key(url: &str, commit: &str) -> Result<String> {
+    Ok(format!("lake/git/{}/{commit}.idx", repository_of(url)?))
+}
+
+/// Index `pack` with Git, as a reader would, and return the index's bytes.
+fn index(pack: &Path) -> Result<Vec<u8>> {
+    let index = pack.with_extension("idx");
+    run(
+        "git index-pack",
+        Command::new("git")
+            .arg("index-pack")
+            .arg("-o")
+            .arg(&index)
+            .arg(pack),
+    )?;
+    fs::read(&index).operation("read Git pack index")
+}
+
 fn store_error(
     operation: &'static str,
 ) -> impl FnOnce(covalence_kv_trait::Error) -> crate::error::Error {
@@ -123,57 +144,81 @@ pub(crate) fn publish_packs(project: &Project, kv: &dyn Kv) -> Result<usize> {
         .collect::<Vec<_>>();
     let published = storage::parallel(&pins, |_, pin| {
         let key = pack_key(&pin.url, &pin.commit)?;
+        let index_key = index_key(&pin.url, &pin.commit)?;
+        let staging = tempfile::tempdir().operation("stage Git pack")?;
+        let pack = staging.path().join("pack.pack");
+        // A pack published before its index gets one, from the same bytes.
         if kv
             .exists(key.as_bytes())
             .map_err(store_error("check Git pack"))?
         {
-            return Ok(false);
+            if kv
+                .exists(index_key.as_bytes())
+                .map_err(store_error("check Git pack index"))?
+            {
+                return Ok(false);
+            }
+            let mut file = File::create(&pack).operation("stage Git pack")?;
+            kv.get_to(key.as_bytes(), &mut file)
+                .map_err(store_error("read Git pack"))?
+                .ok_or_else(|| invalid("Git pack vanished from the pool"))?;
+        } else {
+            write_pack(pin, &pack)?;
+            let mut file = File::open(&pack).operation("open Git pack")?;
+            let bytes = file.metadata().operation("read Git pack size")?.len();
+            kv.put_from(key.as_bytes(), &mut file, bytes)
+                .map_err(store_error("publish Git pack"))?;
         }
-        // The commit and everything its tree holds, without its history.
-        let objects = git(&pin.destination)
-            .args(["rev-list", "--objects", "--no-walk", &pin.commit])
-            .output()
-            .operation("start git rev-list")?;
-        if !objects.status.success() {
-            return Err(crate::error::Error::Process {
-                program: "git rev-list",
-                status: objects.status,
-            });
-        }
-        let mut pack = tempfile::tempfile().operation("stage Git pack")?;
-        let mut child = git(&pin.destination)
-            .args(["pack-objects", "-q", "--stdout"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .operation("start git pack-objects")?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| invalid("git pack-objects has no input"))?;
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| invalid("git pack-objects has no output"))?;
-        let writer = std::thread::spawn(move || stdin.write_all(&objects.stdout));
-        let bytes = io::copy(&mut stdout, &mut pack).operation("read Git pack")?;
-        writer
-            .join()
-            .map_err(|_| crate::error::Error::Worker)?
-            .operation("write Git object list")?;
-        let status = child.wait().operation("wait for git pack-objects")?;
-        if !status.success() {
-            return Err(crate::error::Error::Process {
-                program: "git pack-objects",
-                status,
-            });
-        }
-        pack.rewind().operation("rewind Git pack")?;
-        kv.put_from(key.as_bytes(), &mut pack, bytes)
-            .map_err(store_error("publish Git pack"))?;
+        // The index goes after its pack, so a reader that finds it finds both.
+        kv.put(index_key.as_bytes(), index(&pack)?.into())
+            .map_err(store_error("publish Git pack index"))?;
         Ok(true)
     })?;
     Ok(published.into_iter().filter(|published| *published).count())
+}
+
+/// Write the pack of `pin`'s commit and everything its tree holds, without
+/// its history, to `path`.
+fn write_pack(pin: &Pin, path: &Path) -> Result<()> {
+    let objects = git(&pin.destination)
+        .args(["rev-list", "--objects", "--no-walk", &pin.commit])
+        .output()
+        .operation("start git rev-list")?;
+    if !objects.status.success() {
+        return Err(crate::error::Error::Process {
+            program: "git rev-list",
+            status: objects.status,
+        });
+    }
+    let mut pack = File::create(path).operation("stage Git pack")?;
+    let mut child = git(&pin.destination)
+        .args(["pack-objects", "-q", "--stdout"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .operation("start git pack-objects")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| invalid("git pack-objects has no input"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| invalid("git pack-objects has no output"))?;
+    let writer = std::thread::spawn(move || stdin.write_all(&objects.stdout));
+    io::copy(&mut stdout, &mut pack).operation("read Git pack")?;
+    writer
+        .join()
+        .map_err(|_| crate::error::Error::Worker)?
+        .operation("write Git object list")?;
+    let status = child.wait().operation("wait for git pack-objects")?;
+    if !status.success() {
+        return Err(crate::error::Error::Process {
+            program: "git pack-objects",
+            status,
+        });
+    }
+    Ok(())
 }
 
 fn materialize_in(project: &Project, kv: &dyn Kv, cache: &Path) -> Result<()> {
@@ -307,6 +352,62 @@ enum Source {
 /// Make `mirror` hold `commit`: from the pool's pack of it if there is one,
 /// which Git checks object by object as it indexes it, else fetching only
 /// that commit from `url`.
+/// Put the pool's pack of `commit` into `mirror`; `false` when the pool has
+/// none. With the pool's index the pack goes in as it is, named by its own
+/// checksum, as `git index-pack` names it; without, Git indexes it, hashing
+/// every object. Either way the pack only adds the objects it names, and the
+/// caller checks that the commit is among them.
+fn install_pack(kv: &dyn Kv, mirror: &Path, url: &str, commit: &str) -> Result<bool> {
+    let packs = mirror.join("objects/pack");
+    fs::create_dir_all(&packs).operation("create Git pack directory")?;
+    let staging = tempfile::tempdir_in(&packs).operation("stage Git pack")?;
+    let pack = staging.path().join("pack");
+    let index = staging.path().join("idx");
+    let found = {
+        let mut file = File::create(&pack).operation("stage Git pack")?;
+        kv.get_to(pack_key(url, commit)?.as_bytes(), &mut file)
+            .map_err(store_error("read Git pack"))?
+    };
+    if found.is_none() {
+        return Ok(false);
+    }
+    let indexed = {
+        let mut file = File::create(&index).operation("stage Git pack index")?;
+        kv.get_to(index_key(url, commit)?.as_bytes(), &mut file)
+            .map_err(store_error("read Git pack index"))?
+    };
+    if indexed.is_none() {
+        let status = git(mirror)
+            .args(["index-pack", "--stdin"])
+            .stdin(File::open(&pack).operation("open Git pack")?)
+            .stdout(Stdio::null())
+            .status()
+            .operation("start git index-pack")?;
+        if !status.success() {
+            return Err(crate::error::Error::Process {
+                program: "git index-pack",
+                status,
+            });
+        }
+        return Ok(true);
+    }
+    // A pack's last 20 bytes are its checksum, which names it and which its
+    // index repeats; Git checks the pair when it opens the pack.
+    let checksum = {
+        let mut file = File::open(&pack).operation("open Git pack")?;
+        file.seek(io::SeekFrom::End(-20))
+            .operation("read Git pack checksum")?;
+        let mut checksum = [0; 20];
+        io::Read::read_exact(&mut file, &mut checksum).operation("read Git pack checksum")?;
+        data_encoding::HEXLOWER.encode(&checksum)
+    };
+    let name = packs.join(format!("pack-{checksum}"));
+    fs::rename(&pack, name.with_extension("pack")).operation("install Git pack")?;
+    // Git sees a pack once its index is in place, so the index goes last.
+    fs::rename(&index, name.with_extension("idx")).operation("install Git pack index")?;
+    Ok(true)
+}
+
 fn fetch(kv: &dyn Kv, mirror: &Path, url: &str, commit: &str) -> Result<Source> {
     fs::create_dir_all(mirror).operation("create Git mirror")?;
     // Worktrees on one host may restore at once; Git's own ref and shallow
@@ -325,26 +426,7 @@ fn fetch(kv: &dyn Kv, mirror: &Path, url: &str, commit: &str) -> Result<Source> 
     if present {
         return Ok(Source::Mirror);
     }
-    let mut pack = tempfile::tempfile().operation("stage Git pack")?;
-    let found = kv
-        .get_to(pack_key(url, commit)?.as_bytes(), &mut pack)
-        .map_err(store_error("read Git pack"))?;
-    let source = if found.is_some() {
-        pack.rewind().operation("rewind Git pack")?;
-        // `index-pack` hashes every object, so a pack can only add the
-        // objects it names; the shallow boundary is the commit itself.
-        let status = git(mirror)
-            .args(["index-pack", "--stdin"])
-            .stdin(pack)
-            .stdout(Stdio::null())
-            .status()
-            .operation("start git index-pack")?;
-        if !status.success() {
-            return Err(crate::error::Error::Process {
-                program: "git index-pack",
-                status,
-            });
-        }
+    let source = if install_pack(kv, mirror, url, commit)? {
         let shallow = mirror.join("shallow");
         let mut boundary = fs::read_to_string(&shallow).unwrap_or_default();
         if !boundary.lines().any(|line| line == commit) {
@@ -445,13 +527,82 @@ mod tests {
         fs::remove_dir_all(&upstream).unwrap();
         let (_, second) = checkout("second", &cache);
         assert_eq!(git_ok(&second, &["rev-parse", "HEAD"]), commit);
-        // Nor does a fresh host: the pool's pack fills its mirror.
+        // Nor does a fresh host: the pool's pack and its index fill its
+        // mirror as they are, without Git indexing the pack again.
         let (_, third) = checkout("third", &temporary.path().join("fresh-cache"));
         assert_eq!(git_ok(&third, &["rev-parse", "HEAD"]), commit);
+        let fresh_mirror = temporary
+            .path()
+            .join("fresh-cache/covalence/git")
+            .join(format!("{}.git", repository_of(&url).unwrap()));
+        let packs = fs::read_dir(fresh_mirror.join("objects/pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("pack-"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(packs.len(), 2, "{packs:?}");
+        git_ok(&fresh_mirror, &["fsck", "--no-dangling"]);
         assert_eq!(
             fs::read_to_string(third.join("A.lean")).unwrap(),
             "-- two\n"
         );
         assert_eq!(git_ok(&third, &["status", "--porcelain"]), "");
+    }
+    #[test]
+    fn a_pack_without_its_index_is_indexed_by_git() {
+        let temporary = tempfile::tempdir().unwrap();
+        let upstream = temporary.path().join("upstream");
+        fs::create_dir(&upstream).unwrap();
+        git_ok(&upstream, &["init", "-q"]);
+        fs::write(upstream.join("A.lean"), "-- one\n").unwrap();
+        git_ok(&upstream, &["add", "."]);
+        git_ok(
+            &upstream,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "one"],
+        );
+        let commit = git_ok(&upstream, &["rev-parse", "HEAD"]);
+        let url = "https://example.invalid/o/dep.git";
+        let pin = Pin {
+            name: "dep".into(),
+            url: url.into(),
+            commit: commit.clone(),
+            destination: upstream.clone(),
+            sub_dir: None,
+        };
+        let pack = temporary.path().join("pack.pack");
+        write_pack(&pin, &pack).unwrap();
+        for with_index in [false, true] {
+            let kv = covalence_kv_memory::MemoryKv::default();
+            kv.put(
+                pack_key(url, &commit).unwrap().as_bytes(),
+                fs::read(&pack).unwrap().into(),
+            )
+            .unwrap();
+            if with_index {
+                kv.put(
+                    index_key(url, &commit).unwrap().as_bytes(),
+                    index(&pack).unwrap().into(),
+                )
+                .unwrap();
+            }
+            let mirror = temporary.path().join(format!("mirror-{with_index}"));
+            git_ok(
+                temporary.path(),
+                &["init", "-q", "--bare", mirror.to_str().unwrap()],
+            );
+            assert!(install_pack(&kv, &mirror, url, &commit).unwrap());
+            git_ok(
+                &mirror,
+                &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+            );
+            git_ok(&mirror, &["fsck", "--no-dangling"]);
+        }
+        let empty = covalence_kv_memory::MemoryKv::default();
+        let mirror = temporary.path().join("mirror-none");
+        git_ok(
+            temporary.path(),
+            &["init", "-q", "--bare", mirror.to_str().unwrap()],
+        );
+        assert!(!install_pack(&empty, &mirror, url, &commit).unwrap());
     }
 }
