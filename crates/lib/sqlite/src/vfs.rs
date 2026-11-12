@@ -153,7 +153,7 @@ impl Registered {
 
     /// A read-only connection to the database file `file` of this VFS.
     ///
-    /// - `file` reaches [`Vfs::open`] as given. Names of at most 1023 bytes
+    /// - `file` reaches [`Vfs::open`] as given. Names of at most 1024 bytes
     ///   are supported; longer ones fail to open.
     /// - Fails with [`Error::Name`] if `file` is empty, is `:memory:`, starts
     ///   with `file:` or has a NUL byte: SQLite would read such a name as a

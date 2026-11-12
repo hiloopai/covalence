@@ -21,8 +21,12 @@ use rusqlite::ffi as sys;
 
 use super::{Error, File, RegisterSnafu, TakenSnafu, Vfs};
 
-/// The longest file name, in bytes, NUL included.
-const MAX_PATHNAME: c_int = 1024;
+/// The longest name of a database file, in bytes.
+const MAX_NAME: c_int = 1024;
+
+/// The part of `mxPathname` that SQLite keeps for the suffix of a journal's
+/// name: it opens no database whose name comes closer to the limit.
+const JOURNAL_SUFFIX: c_int = 8;
 
 /// Serialises the check for a taken name with registration.
 static REGISTER: Mutex<()> = Mutex::new(());
@@ -84,7 +88,7 @@ pub(super) fn register(name: CString, vfs: Box<dyn Vfs>) -> Result<&'static CStr
     let record = Box::into_raw(Box::new(sys::sqlite3_vfs {
         iVersion: 1,
         szOsFile: default_size.max(size_of::<Handle>() as c_int),
-        mxPathname: MAX_PATHNAME,
+        mxPathname: MAX_NAME + JOURNAL_SUFFIX,
         pNext: ptr::null_mut(),
         zName: name,
         pAppData: state.cast(),

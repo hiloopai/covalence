@@ -226,12 +226,17 @@ fn names_reach_the_vfs_as_given() {
             "{name}"
         );
     }
-    let long = "x".repeat(2000);
-    let Err(Error::Open { source }) = registered.open(&long) else {
-        panic!("a 2000-byte name opened");
-    };
-    assert_eq!(source.sqlite_error_code(), Some(ErrorCode::CannotOpen));
-    assert_eq!(seen.lock().unwrap().len(), names.len());
+    // A name of 1024 bytes is the longest that reaches the VFS.
+    let longest = "x".repeat(1024);
+    assert!(matches!(registered.open(&longest), Err(Error::Open { .. })));
+    assert_eq!(seen.lock().unwrap().last(), Some(&longest));
+    for len in [1025, 2000] {
+        let Err(Error::Open { source }) = registered.open(&"x".repeat(len)) else {
+            panic!("a {len}-byte name opened");
+        };
+        assert_eq!(source.sqlite_error_code(), Some(ErrorCode::CannotOpen));
+    }
+    assert_eq!(seen.lock().unwrap().len(), names.len() + 1);
 }
 
 #[test]
