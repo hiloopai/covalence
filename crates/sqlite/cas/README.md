@@ -129,20 +129,61 @@ that costs, and each can be replaced or measured alone:
 
 - `Options::block_size` sets the block size: 4 KiB unless set, or the
   verifier's chunk size.
-- A `fetch::FetchPolicy` chooses how many blocks one request fetches when a
-  read misses the cache. `Exact` fetches what is read, `Aligned` fetches
-  fixed windows, and `ReadAhead`, the default, grows its requests while reads
-  are sequential. `Database::set_fetch_policy` swaps the policy of an open
+- A `fetch::FetchPolicy` chooses the blocks of one request when a read misses
+  the cache. `Database::set_fetch_policy` swaps the policy of an open
   database, such as before a scan.
+  - `Exact` fetches only what is read.
+  - `Aligned` fetches the fixed window that holds the read.
+  - `ReadAhead`, the default, fetches 64 KiB where reads begin, and four
+    times as much each time they go on from there, up to 4 MiB. It follows
+    scans towards either end of the database, and several at once.
 - A `cache::CachePolicy` builds the cache that keeps fetched blocks for one
   database: `NoCache`, `MemoryCache` (the default, 32 MiB), `FileCache`, or a
   `ClockCache` over storage of your own, such as a memory-mapped file.
   SQLite keeps the pages it has read in its own page cache, so this cache
-  mostly holds what was fetched ahead and serves other connections.
+  mostly holds what was fetched ahead and serves other connections. A cache
+  smaller than the database keeps one request to a quarter of what it holds,
+  so that blocks fetched ahead are still there when they are read.
 
 A policy only chooses what to fetch or keep. It cannot change what SQLite
 reads, and with verified ranges every fetched chunk is checked whatever the
 policy asked for. `Database::stats` counts reads and fetches.
+
+### Measure the choices
+
+Fetching ahead spends bytes to save round trips, so the best sizes depend on
+the store and on the queries. The `policies` benchmark runs queries against
+each choice and counts the requests and the bytes, for a database that it
+generates or for one of yours:
+
+```text
+cargo bench -p covalence-sqlite-cas --bench policies -- --help
+cargo bench -p covalence-sqlite-cas --bench policies -- \
+    --db my.db --sql "SELECT count(*) FROM notes" --link store:15:100
+```
+
+`--link` describes a store by its round trip in milliseconds and its
+bandwidth in megabytes a second. The time that the benchmark gives for a link
+is the time it measured with the store in memory, plus a round trip for each
+request and the time of the bytes at that bandwidth. It is a model, not a
+measurement of a network.
+
+These are the requests, and the bytes they fetch, of the first connection to
+the generated database of 109 MiB, read as trusted ranges in blocks of 4 KiB
+with the default cache:
+
+| Query                   | `Exact`        | `Aligned::new(1 << 20)` | `ReadAhead::default()` |
+| ----------------------- | -------------- | ----------------------- | ---------------------- |
+| 100 rows by primary key | 147, 0.6 MiB   | 84, 83 MiB              | 138, 11 MiB            |
+| 1% of a table, in order | 241, 0.9 MiB   | 4, 3 MiB                | 6, 1.4 MiB             |
+| A whole table           | 23,592, 92 MiB | 94, 93 MiB              | 28, 93 MiB             |
+
+- Scattered lookups need about one request each whatever is fetched, and
+  `ReadAhead` fetches its first window for each. `ReadAhead::first` sets that
+  window: with 0 a lookup fetches what `Exact` does, and a scan takes a few
+  more requests to reach its largest window.
+- A scan makes fewer requests the larger the largest window is, and fetches
+  up to one such window beyond where it stops. `ReadAhead::new` sets it.
 
 ## Errors
 

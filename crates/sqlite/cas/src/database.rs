@@ -96,9 +96,9 @@ impl Database {
     ///   bytes, the most SQLite can address.
     /// - [`Error::Length`] if the store's size is not the verifier's, or the
     ///   store miscounts a download.
-    /// - [`Error::Unsupported`] if `cid` has a hash function that a download
-    ///   cannot be checked with: this crate computes BLAKE3, SHA-256, SHA-512
-    ///   and SHA-1.
+    /// - [`Error::Unsupported`] if `cid` has a hash function that this crate
+    ///   does not compute, so that a download cannot be checked. BLAKE3,
+    ///   SHA-256 and SHA-1 CIDs can.
     /// - [`Error::Options`] if the block size, or a verifier's chunk size, is
     ///   not between 1 and [`MAX_BLOCK_SIZE`](crate::MAX_BLOCK_SIZE).
     /// - [`Error::Io`] if the local file or the cache cannot be made.
