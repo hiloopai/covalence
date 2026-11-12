@@ -62,7 +62,12 @@ impl Ticket {
 
 impl Drop for Ticket {
     fn drop(&mut self) {
-        lock(&FILES).open.remove(&self.name);
+        // The lock is released at the end of this statement, before the file
+        // is dropped. The file may be the last owner of a store, a verifier,
+        // a fetch policy and a cache, whose drops may take long or drop a
+        // database of their own.
+        let file = lock(&FILES).open.remove(&self.name);
+        drop(file);
     }
 }
 

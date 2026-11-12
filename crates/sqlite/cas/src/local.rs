@@ -17,8 +17,11 @@ use crate::{
     pio,
 };
 
-/// A database's bytes in a local file that has no name: nothing else can open
-/// it, and it is gone when it is closed.
+/// A database's bytes in a private temporary file: it is gone when it is
+/// closed.
+///
+/// On Unix the file has no name. On Windows it has one, and nothing else can
+/// read or write it while it is open.
 pub(crate) struct Local {
     file: File,
     size: u64,
@@ -171,9 +174,15 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(error, Error::Io { .. }), "{error}");
-        // The file has no name: the directory it is in stays empty.
         let local = Local::download(&cas, &cid, 100, Some(dir.path())).unwrap();
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         assert_eq!(local.size(), 5);
+        let files = || std::fs::read_dir(dir.path()).unwrap().count();
+        // On Unix the file has no name: the directory it is in stays empty.
+        if cfg!(unix) {
+            assert_eq!(files(), 0);
+        }
+        // Everywhere, nothing is left once it is closed.
+        drop(local);
+        assert_eq!(files(), 0);
     }
 }

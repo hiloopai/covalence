@@ -153,11 +153,10 @@ impl Database {
     ///   database's block cache and fetch policy with the others.
     /// - A connection is used from one thread at a time; open one for each
     ///   thread that reads.
-    /// - The schema is not trusted to run application-defined SQL functions
-    ///   or virtual tables (`trusted_schema` is off), and page contents are
-    ///   checked as they are read (`cell_size_check` is on), as SQLite
-    ///   advises for database files from elsewhere. Both can be changed on
-    ///   the connection.
+    /// - The schema is not trusted (`trusted_schema` is off), and page
+    ///   contents are checked as they are read (`cell_size_check` is on), as
+    ///   SQLite advises for database files from elsewhere. Both can be
+    ///   changed on the connection.
     /// - No other database can be attached: `SQLITE_LIMIT_ATTACHED` is 0, so
     ///   `ATTACH` and `VACUUM INTO` fail. SQLite would let either name
     ///   another VFS in a URI, and so read a local file or write a new one.
@@ -165,13 +164,39 @@ impl Database {
     ///   [`Connection::set_limit`].
     /// - SQLite's temporary files, such as the spill of a large sort, are
     ///   local files of the system's default VFS.
+    /// - Only the header is read here. The connection's first statement
+    ///   reads the schema.
+    ///
+    /// # SQL functions of the application
+    ///
+    /// The schema is the database's, and may name any function. With
+    /// `trusted_schema` off, SQLite lets it call only functions registered as
+    /// [innocuous]. For any other function that the application registers:
+    ///
+    /// - A view or trigger that names it fails when it is used.
+    /// - A generated column or index that names it makes every statement
+    ///   fail, as a malformed schema, if the function is registered before
+    ///   the connection's first statement.
+    /// - Registered later, it is not checked there: SQLite checks generated
+    ///   columns and indexes only while it reads the schema. Reading a
+    ///   virtual column then calls the function, as does
+    ///   `PRAGMA integrity_check` for an index, whatever the function's
+    ///   flags.
+    ///
+    /// So register functions before the connection's first statement.
+    ///
+    /// [SQLite's documentation] lists what else the setting refuses.
     ///
     /// # Errors
     ///
-    /// - [`Error::Sqlite`] if the bytes are not a SQLite database.
+    /// - [`Error::Sqlite`] if the bytes do not start as a SQLite database
+    ///   does.
     /// - The error of the read, such as [`Error::Corrupt`] or
     ///   [`Error::Store`], if reading the start of the database failed.
     /// - [`Error::Vfs`] if SQLite could not open the connection otherwise.
+    ///
+    /// [SQLite's documentation]: https://www.sqlite.org/c3ref/c_dbconfig_defensive.html#sqlitedbconfigtrustedschema
+    /// [innocuous]: rusqlite::functions::FunctionFlags::SQLITE_INNOCUOUS
     pub fn connect(&self) -> Result<Connection, Error> {
         let connection = match self.inner.ticket.connect() {
             Ok(connection) => connection,
@@ -182,8 +207,11 @@ impl Database {
             connection.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
             connection.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
             connection.pragma_update(None, "cell_size_check", true)?;
-            // Reads the schema, so that a file that is no database fails here.
-            connection.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
+            // Reads the header, so that a file that is no database fails here.
+            // The schema is left to the first statement: SQLite checks the
+            // functions that indexes and generated columns name only while it
+            // reads the schema, so the application registers its own first.
+            connection.query_row("PRAGMA schema_version", [], |_| Ok(()))
         };
         prepare().map_err(|error| self.explain(error))?;
         Ok(connection)
@@ -360,7 +388,10 @@ impl vfs::File for Shared {
             Err(error) => {
                 // SQLite keeps only a result code: the cause waits here.
                 let summary = io::Error::other(error.to_string());
-                *self.failed() = Some(error);
+                // The error it takes the place of is a store's or a
+                // verifier's, and is dropped once the lock is released.
+                let old = self.failed().replace(error);
+                drop(old);
                 Err(summary)
             }
         }

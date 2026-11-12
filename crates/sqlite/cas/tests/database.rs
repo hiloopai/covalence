@@ -3,18 +3,28 @@
 
 mod common;
 
-use std::{ops::Range, sync::Arc};
+use std::{
+    fmt,
+    ops::Range,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering::Relaxed},
+        mpsc,
+    },
+    time::Duration,
+};
 
 use common::{Call, QUERIES, Store, answers, rows, sample, sample_file};
 use covalence_cas_memory::MemoryCas;
 use covalence_cas_trait::Put;
 use covalence_lib_cid::{Cid, Multicodec};
+use covalence_lib_error::BoxError;
 use covalence_sqlite_cas::{
     Database, Error, Options,
     cache::{BlockCache, FileCache, Layout, MemoryCache, NoCache},
     fetch::{Aligned, Exact, FetchPolicy, Miss, ReadAhead},
-    rusqlite::Connection,
-    verify::{Manifest, Verification},
+    rusqlite::{self, Connection, functions::FunctionFlags},
+    verify::{Manifest, RangeVerifier, Verification},
 };
 
 const ROWS: u32 = 2_000;
@@ -149,6 +159,24 @@ fn bytes_that_are_no_database_fail_to_connect() {
         let error = database.connect().unwrap_err();
         assert!(matches!(error, Error::Sqlite { .. }), "{error}");
         assert!(error.to_string().contains("not a database"), "{error}");
+    }
+}
+
+#[test]
+fn damage_after_the_header_fails_the_statement_that_reads_it() {
+    // The first page holds the header, then the root of the schema's table.
+    let mut bytes = sample(10);
+    bytes[100..200].fill(0xff);
+    let store = Store::new(bytes);
+    for verification in [Verification::Download, Verification::TrustedRanges] {
+        let options = Options::new().verification(verification);
+        let database = Database::open(store.clone(), &store.blake3(), options).unwrap();
+        // Connecting reads only the header.
+        let connection = database.connect().unwrap();
+        let error = connection
+            .query_row("SELECT count(*) FROM items", [], |_| Ok(()))
+            .unwrap_err();
+        assert!(error.to_string().contains("malformed"), "{error}");
     }
 }
 
@@ -433,7 +461,320 @@ fn caches_save_fetches_and_each_database_has_its_own() {
     assert_eq!(answers(&first.connect().unwrap()), expected);
 }
 
+/// A part of a database that does its work when it is dropped.
+struct OnDrop(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+impl OnDrop {
+    fn new(work: impl FnOnce() + Send + 'static) -> Self {
+        Self(Mutex::new(Some(Box::new(work))))
+    }
+}
+
+impl Drop for OnDrop {
+    fn drop(&mut self) {
+        if let Some(work) = self.0.get_mut().unwrap().take() {
+            work();
+        }
+    }
+}
+
+impl FetchPolicy for OnDrop {
+    fn plan(&self, miss: &Miss) -> Range<u64> {
+        miss.need.clone()
+    }
+}
+
+impl fmt::Debug for OnDrop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OnDrop")
+    }
+}
+
+impl fmt::Display for OnDrop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("refused")
+    }
+}
+
+impl std::error::Error for OnDrop {}
+
+/// A verifier that checks nothing, and refuses one fetch for each error it is
+/// given.
+struct Refusing {
+    size: u64,
+    errors: Mutex<Vec<BoxError>>,
+}
+
+impl Refusing {
+    fn refuse(&self, error: impl Into<BoxError>) {
+        self.errors.lock().unwrap().push(error.into());
+    }
+}
+
+impl RangeVerifier for Refusing {
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn chunk_size(&self) -> u64 {
+        4096
+    }
+    fn verify(&self, _chunk: u64, _bytes: &[u8]) -> Result<(), BoxError> {
+        self.errors.lock().unwrap().pop().map_or(Ok(()), Err)
+    }
+}
+
+/// Whether `work` ends on another thread while this one waits for it.
+///
+/// A thread that waits for a lock this one holds does not, so this gives up
+/// after half a minute.
+fn finishes(work: impl FnOnce() + Send + 'static) -> bool {
+    let (done, wait) = mpsc::channel();
+    std::thread::spawn(move || {
+        work();
+        let _ = done.send(());
+    });
+    wait.recv_timeout(Duration::from_secs(30)).is_ok()
+}
+
+#[test]
+fn a_part_is_dropped_with_no_lock_of_this_crate_held() {
+    let bytes = sample(100);
+    let size = bytes.len() as u64;
+    let store = Store::new(bytes);
+    let cid = store.blake3();
+    // No cache, so that every read asks the fetch policy and the verifier.
+    let ranges = || {
+        Options::new()
+            .verification(Verification::TrustedRanges)
+            .cache(NoCache)
+    };
+    let count = |connection: &Connection| {
+        connection.query_row("SELECT count(*) FROM items", [], |row| row.get::<_, i64>(0))
+    };
+    let (said, heard) = mpsc::channel();
+
+    // A fetch policy that is dropped with its database, as a store, a
+    // verifier and a cache are: another database opens, answers and closes
+    // meanwhile. So a part may hold a database of its own.
+    let (other, say) = (store.clone(), said.clone());
+    let policy = OnDrop::new(move || {
+        let free = finishes(move || {
+            let database = Database::open(other, &cid, ranges()).unwrap();
+            assert_eq!(count(&database.connect().unwrap()).unwrap(), 100);
+        });
+        say.send(free).unwrap();
+    });
+    drop(Database::open(store.clone(), &cid, ranges().fetch(policy)).unwrap());
+    assert_eq!(heard.try_recv(), Ok(true));
+
+    // A fetch policy that another takes the place of: a connection to the
+    // same database fetches meanwhile.
+    let database = Database::open(store.clone(), &cid, ranges()).unwrap();
+    let connection = database.connect().unwrap();
+    let say = said.clone();
+    database.set_fetch_policy(OnDrop::new(move || {
+        let free = finishes(move || assert_eq!(count(&connection).unwrap(), 100));
+        say.send(free).unwrap();
+    }));
+    assert!(heard.try_recv().is_err());
+    database.set_fetch_policy(Exact);
+    assert_eq!(heard.try_recv(), Ok(true));
+
+    // The error of a failed read that the next one takes the place of:
+    // `explain` answers meanwhile.
+    let verifier = Arc::new(Refusing {
+        size,
+        errors: Mutex::default(),
+    });
+    let options = Options::new()
+        .verification(Verification::VerifiedRanges(verifier.clone()))
+        .cache(NoCache);
+    let database = Database::open(store.clone(), &cid, options).unwrap();
+    let connection = database.connect().unwrap();
+    let (asked, say) = (database.clone(), said.clone());
+    verifier.refuse(OnDrop::new(move || {
+        let failure = rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR);
+        let failure = rusqlite::Error::SqliteFailure(failure, None);
+        let free = finishes(move || drop(asked.explain(failure)));
+        say.send(free).unwrap();
+    }));
+    count(&connection).unwrap_err();
+    assert!(heard.try_recv().is_err());
+    verifier.refuse("refused again");
+    count(&connection).unwrap_err();
+    assert_eq!(heard.try_recv(), Ok(true));
+}
+
 #[cfg(unix)]
+/// Register `touch` on `connection`: a function of the application, which
+/// counts its calls.
+fn touch(connection: &Connection, flags: FunctionFlags) -> Arc<AtomicU64> {
+    let calls = Arc::new(AtomicU64::new(0));
+    let count = Arc::clone(&calls);
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC | flags;
+    connection
+        .create_scalar_function("touch", 1, flags, move |_| {
+            count.fetch_add(1, Relaxed);
+            Ok(1i64)
+        })
+        .unwrap();
+    calls
+}
+
+/// A store of a database of two rows in `t (id, x)`, and of `schema`, which
+/// names `touch`.
+fn naming_touch(schema: &str) -> Arc<Store> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("named.db");
+    let origin = Connection::open(&path).unwrap();
+    touch(&origin, FunctionFlags::empty());
+    origin
+        .execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x); INSERT INTO t (x) VALUES (1), (2);",
+        )
+        .unwrap();
+    origin.execute_batch(schema).unwrap();
+    drop(origin);
+    Store::new(std::fs::read(path).unwrap())
+}
+
+const NOT_INNOCUOUS: [FunctionFlags; 2] =
+    [FunctionFlags::empty(), FunctionFlags::SQLITE_DIRECTONLY];
+
+#[test]
+fn a_view_or_trigger_calls_only_innocuous_functions_of_the_application() {
+    let store = naming_touch(
+        "CREATE VIEW v AS SELECT touch(x) AS r FROM t;
+         CREATE TRIGGER v_insert INSTEAD OF INSERT ON v BEGIN SELECT touch(new.r); END;",
+    );
+    for verification in [Verification::Download, Verification::TrustedRanges] {
+        let options = Options::new().verification(verification);
+        let database = Database::open(store.clone(), &store.blake3(), options).unwrap();
+        // Whether the function is registered before the schema is read or after.
+        for read_first in [false, true] {
+            for flags in NOT_INNOCUOUS {
+                let connection = database.connect().unwrap();
+                if read_first {
+                    assert_eq!(rows(&connection, "SELECT count(*) FROM t"), ["2"]);
+                }
+                let calls = touch(&connection, flags);
+                for sql in ["SELECT r FROM v", "INSERT INTO v VALUES (1)"] {
+                    let error = connection.execute_batch(sql).unwrap_err();
+                    assert!(
+                        error.to_string().contains("unsafe use of touch()"),
+                        "{error}"
+                    );
+                }
+                assert_eq!(calls.load(Relaxed), 0);
+                // The application's own statements call it.
+                assert_eq!(rows(&connection, "SELECT touch(x) FROM t"), ["1", "1"]);
+                assert_eq!(calls.load(Relaxed), 2);
+            }
+            let connection = database.connect().unwrap();
+            if read_first {
+                assert_eq!(rows(&connection, "SELECT count(*) FROM t"), ["2"]);
+            }
+            let calls = touch(&connection, FunctionFlags::SQLITE_INNOCUOUS);
+            assert_eq!(rows(&connection, "SELECT r FROM v"), ["1", "1"]);
+            assert_eq!(calls.load(Relaxed), 2);
+        }
+    }
+}
+
+/// Schemas of a table `g` of one row that name `touch` where SQLite checks
+/// functions only while it reads the schema, each with a statement that
+/// computes what the schema says.
+const NAMED_IN_TABLES: [(&str, &str); 4] = [
+    (
+        "CREATE TABLE g (id INTEGER PRIMARY KEY, x, y AS (touch(x)));
+         INSERT INTO g (x) VALUES (1);",
+        "SELECT y FROM g",
+    ),
+    (
+        "CREATE TABLE g (id INTEGER PRIMARY KEY, x, y AS (touch(x)) STORED);
+         INSERT INTO g (x) VALUES (1);",
+        "SELECT y FROM g",
+    ),
+    (
+        "CREATE TABLE g (id INTEGER PRIMARY KEY, x);
+         INSERT INTO g (x) VALUES (1);
+         CREATE INDEX g_touch ON g (touch(x));",
+        "PRAGMA integrity_check",
+    ),
+    (
+        "CREATE TABLE g (id INTEGER PRIMARY KEY, x);
+         INSERT INTO g (x) VALUES (1);
+         CREATE INDEX g_some ON g (x) WHERE touch(x);",
+        "PRAGMA integrity_check",
+    ),
+];
+
+#[test]
+fn a_schema_that_names_a_function_registered_before_the_first_statement_is_refused() {
+    for (schema, computing) in NAMED_IN_TABLES {
+        let store = naming_touch(schema);
+        for verification in [Verification::Download, Verification::TrustedRanges] {
+            let options = Options::new().verification(verification);
+            let database = Database::open(store.clone(), &store.blake3(), options).unwrap();
+            for flags in NOT_INNOCUOUS {
+                // `connect` has not read the schema: SQLite reads it for the
+                // first statement, and finds the function registered.
+                let connection = database.connect().unwrap();
+                let calls = touch(&connection, flags);
+                for sql in [computing, "SELECT x FROM t", "SELECT 1 FROM sqlite_schema"] {
+                    let error = connection.execute_batch(sql).unwrap_err();
+                    let text = error.to_string();
+                    assert!(
+                        text.contains("malformed database schema"),
+                        "{schema}: {text}"
+                    );
+                    assert!(text.contains("unsafe use of touch()"), "{schema}: {text}");
+                }
+                assert_eq!(calls.load(Relaxed), 0, "{schema}");
+            }
+            // An innocuous function is what a schema may name.
+            let connection = database.connect().unwrap();
+            let calls = touch(&connection, FunctionFlags::SQLITE_INNOCUOUS);
+            assert_eq!(rows(&connection, "SELECT x FROM t"), ["1", "2"], "{schema}");
+            let answer = if computing.starts_with("PRAGMA") {
+                "ok"
+            } else {
+                "1"
+            };
+            assert_eq!(rows(&connection, computing), [answer], "{schema}");
+            // A stored column is computed when it is written, not here.
+            let stored = schema.contains("STORED");
+            assert_eq!(calls.load(Relaxed), u64::from(!stored), "{schema}");
+        }
+    }
+}
+
+/// The limit that the documentation of `Database::connect` states: SQLite
+/// 3.53 checks the functions of generated columns and indexes only while it
+/// reads the schema. If it comes to refuse the function here, the limit is
+/// gone, and the documentation can say so.
+#[test]
+fn a_function_registered_after_the_schema_is_read_is_not_checked_in_tables() {
+    for (schema, computing) in NAMED_IN_TABLES {
+        let stored = schema.contains("STORED");
+        let store = naming_touch(schema);
+        let database = Database::open(store.clone(), &store.blake3(), Options::new()).unwrap();
+        for flags in NOT_INNOCUOUS {
+            let connection = database.connect().unwrap();
+            // The first statement reads the schema: `touch` is yet to come.
+            assert_eq!(rows(&connection, "SELECT x FROM g"), ["1"], "{schema}");
+            let calls = touch(&connection, flags);
+            let answer = if computing.starts_with("PRAGMA") {
+                "ok"
+            } else {
+                "1"
+            };
+            assert_eq!(rows(&connection, computing), [answer], "{schema}");
+            assert_eq!(calls.load(Relaxed), u64::from(!stored), "{schema}");
+        }
+    }
+}
+
 #[test]
 fn sql_reaches_no_other_file_unless_the_connection_allows() {
     use covalence_sqlite_cas::rusqlite::limits::Limit;

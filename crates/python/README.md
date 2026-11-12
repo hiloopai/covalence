@@ -354,7 +354,7 @@ A CID is the hash of all the bytes, so it can be checked only with all the
 bytes at hand. `verify=` says what to do about that:
 
 - `"download"`, the default, does not trust the store. It downloads all the
-  bytes to a local file with no name and checks them against `cid` before
+  bytes to a private temporary file and checks them against `cid` before
   SQLite reads any; other bytes raise `IntegrityError`. It accepts at most
   `max_bytes=` bytes, 1 GiB by default, and needs a BLAKE3, SHA-256 or SHA-1
   CID.

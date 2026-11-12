@@ -62,7 +62,11 @@ impl Ranges {
 
     /// Use `policy` for the fetches that start from now on.
     pub(crate) fn set_policy(&self, policy: Arc<dyn FetchPolicy>) {
-        *self.policy.write().unwrap_or_else(PoisonError::into_inner) = policy;
+        let mut current = self.policy.write().unwrap_or_else(PoisonError::into_inner);
+        let old = std::mem::replace(&mut *current, policy);
+        // Fetches go on while the old policy is dropped, however long it takes.
+        drop(current);
+        drop(old);
     }
 
     /// The requests made to the store, and the bytes it gave.

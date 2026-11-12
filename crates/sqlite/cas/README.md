@@ -23,8 +23,8 @@ and checking all of it, or by fetching only the byte ranges that queries read.
 ## Open a database
 
 `Database::open` takes a store, a CID and `Options`. `Database::connect` gives
-`rusqlite` connections. The default options download the database to a local
-file with no name and check it against the CID before SQLite reads a byte.
+`rusqlite` connections. The default options download the database to a private
+temporary file and check it against the CID before SQLite reads a byte.
 
 ```rust
 use std::sync::Arc;
@@ -62,9 +62,11 @@ A CID is the hash of all the bytes, so it can be checked only with all the
 bytes at hand. `verify::Verification` says what to do about that:
 
 - `Download`, the default, does not trust the store. It downloads everything
-  to a local file, hashes the bytes itself whatever the store checks, and
-  fails unless they hash to the CID. It accepts at most
-  `Options::max_download` bytes, 1 GiB unless set.
+  to a private temporary file, hashes the bytes itself whatever the store
+  checks, and fails unless they hash to the CID. It accepts at most
+  `Options::max_download` bytes, 1 GiB unless set. The file has no name on
+  Unix, and on Windows nothing else can read or write it; the system removes
+  it when it is closed.
 - `TrustedRanges` reads ranges and trusts them. Nothing checks the bytes
   against the CID. Use it only for a store trusted as much as a local file.
 - `VerifiedRanges` reads ranges and checks each with a `verify::RangeVerifier`
@@ -197,7 +199,9 @@ refused, `Error::Length` for a short answer, or `Error::Store`.
   SQLite keeps them in local temporary files or memory.
 - The schema comes from the database, so connections open with
   `trusted_schema` off and `cell_size_check` on, as SQLite advises for files
-  from elsewhere.
+  from elsewhere. SQLite checks the functions that generated columns and
+  indexes name only while it reads the schema: register SQL functions before
+  a connection's first statement, as `Database::connect` explains.
 - No other database can be attached. SQLite lets `ATTACH` and `VACUUM INTO`
   name another VFS in a URI, and so read a local file or write a new one.
   Connections therefore open with `SQLITE_LIMIT_ATTACHED` at 0, and both
@@ -209,7 +213,9 @@ refused, `Error::Length` for a short answer, or `Error::Store`.
   value. Reading ranges from such a store costs more than one download.
 - Two reads that miss the same block at the same time both fetch it.
 - One request fetches at most 1 GiB (`MAX_BLOCK_SIZE`), which is also the
-  largest block and chunk.
+  largest block and chunk, unless a single read of SQLite's needs more. Only
+  blocks of more than 512 MiB allow that: a read that lies in two of them
+  fetches both.
 - A download can be checked only if this crate computes the CID's hash
   function, and a CID holds digests of at most 32 bytes: BLAKE3, SHA-256 and
   SHA-1 work.

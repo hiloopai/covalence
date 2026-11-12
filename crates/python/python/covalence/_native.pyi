@@ -710,7 +710,7 @@ class SqliteDatabase:
         `verify` says how far the store is trusted:
 
         - "download", the default, does not trust it. All the bytes are
-          downloaded to a local file with no name, and must hash to `cid` or
+          downloaded to a private temporary file, and must hash to `cid` or
           IntegrityError is raised. At most `max_bytes` bytes are accepted,
           1 GiB by default; a larger database raises ValueError. A `cid` whose
           hash function is not BLAKE3, SHA-256 or SHA-1 raises UnsupportedError.
@@ -737,13 +737,16 @@ class SqliteDatabase:
           default). "aligned" fetches whole windows of `fetch_bytes` bytes,
           which it needs. "exact" fetches only what is read.
         - `cache` keeps fetched blocks for every connection: "memory" (the
-          default), "file" for a local file with no name, or "none". It holds
+          default), "file" for a private temporary file, or "none". It holds
           up to `cache_bytes` bytes, 32 MiB by default. A cache smaller than
           the database keeps a request to a quarter of what it holds, unless
           one read needs more: with "none", only what is read is fetched.
 
         `dir` is the directory of the local files, the download and the file
-        cache: the system's temporary directory by default.
+        cache: the system's temporary directory by default. The files are
+        private: they have no name on Unix, and on Windows nothing else can
+        read or write them. The system removes them once the database and its
+        connections are gone.
 
         A store that fails raises StoreError. Whether the bytes are a SQLite
         database is found by `connect`.
@@ -755,7 +758,8 @@ class SqliteDatabase:
           page cache.
         - A connection opens no other database: `ATTACH` and `VACUUM INTO`
           raise SqliteError.
-        - Bytes that are not a SQLite database raise SqliteError.
+        - Bytes that do not start as a SQLite database does raise SqliteError;
+          other damage raises it from the statement that reads it.
         - A read that fails raises its cause: IntegrityError for bytes that
           were refused, StoreError for a store that failed.
         """

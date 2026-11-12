@@ -167,16 +167,23 @@ fn a_download_with_a_hash_that_cannot_be_computed_is_refused_unasked() {
 }
 
 #[test]
-fn a_download_leaves_no_file_with_a_name() {
+fn a_download_leaves_no_file_behind() {
     let dir = tempfile::tempdir().unwrap();
     let files = || std::fs::read_dir(dir.path()).unwrap().count();
     let store = Store::careless(sample(ROWS));
     let options = Options::new().dir(dir.path());
     let database = Database::open(store.clone(), &store.blake3(), options.clone()).unwrap();
     let connection = database.connect().unwrap();
-    assert_eq!(files(), 0);
+    // On Unix the file has no name, so the directory stays empty.
+    if cfg!(unix) {
+        assert_eq!(files(), 0);
+    }
+    // A connection keeps the file after its database is dropped.
     drop(database);
     assert_eq!(scan(&connection).unwrap(), SCANNED);
+    // Everywhere, nothing is left once the last of them is closed.
+    drop(connection);
+    assert_eq!(files(), 0);
     store.set(Fault::Flip(5));
     Database::open(store.clone(), &store.blake3(), options.clone()).unwrap_err();
     assert_eq!(files(), 0);

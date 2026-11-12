@@ -180,9 +180,10 @@ impl CachePolicy for MemoryCache {
 
 /// Keeps blocks in a temporary file, up to a number of bytes.
 ///
-/// The file has no name: only this process can read it, and the system frees
-/// it when the database and its connections are gone. It grows as blocks
-/// arrive. See [`ClockCache`] for what is dropped when the cache is full.
+/// The file is private: it has no name on Unix, and on Windows nothing else
+/// can read or write it. The system frees it when the database and its
+/// connections are gone. It grows as blocks arrive. See [`ClockCache`] for
+/// what is dropped when the cache is full.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileCache {
     bytes: u64,
@@ -599,8 +600,14 @@ mod tests {
         let cache = FileCache::new(64).in_dir(dir.path()).build(LAYOUT).unwrap();
         fill(&*cache, LAYOUT, 0..2);
         assert_eq!(held(&*cache, LAYOUT), [0, 1]);
-        // The file has no name in the directory.
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let files = || std::fs::read_dir(dir.path()).unwrap().count();
+        // On Unix the file has no name in the directory.
+        if cfg!(unix) {
+            assert_eq!(files(), 0);
+        }
+        // Everywhere, nothing is left once it is closed.
+        drop(cache);
+        assert_eq!(files(), 0);
         let missing = dir.path().join("missing");
         assert!(FileCache::new(64).in_dir(missing).build(LAYOUT).is_err());
 

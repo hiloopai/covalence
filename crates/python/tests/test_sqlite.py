@@ -121,7 +121,7 @@ class OpenTests(Stored):
                             with database.connect() as connection:
                                 for sql in QUERIES:
                                     self.assertEqual(connection.execute(sql).fetchall(), expected(sql))
-            # The local files have no names: nothing is left behind, or to clean up.
+            # The local files are private and temporary: nothing is left behind, or to clean up.
             self.assertEqual(os.listdir(dir), [])
 
     def test_ranges_fetch_only_what_queries_read(self):

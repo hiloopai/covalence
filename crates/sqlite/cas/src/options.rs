@@ -113,7 +113,8 @@ impl Options {
     /// The directory for the file of [`Verification::Download`]: the system's
     /// directory for temporary files unless set.
     ///
-    /// The file has no name, and is gone when the database and its
+    /// The file is private: it has no name on Unix, and on Windows nothing
+    /// else can read or write it. It is gone when the database and its
     /// connections are.
     pub fn dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.dir = Some(dir.into());
