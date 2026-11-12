@@ -70,6 +70,19 @@ pub(crate) struct Project {
     pub record: PathBuf,
     /// The Lake this command runs, which waits for its toolchain.
     pub lean: Lean,
+    /// Whether Lake may take outputs from the internal scope.
+    pub lookups: Lookups,
+}
+
+/// Where Lake looks for the outputs of an input its cache lacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lookups {
+    /// Nowhere: it builds them.
+    None,
+    /// The internal scope (see `internal`).
+    Internal,
+    /// The internal scope, listing what it takes for `put`'s adoption check.
+    Adopt,
 }
 
 /// `LAKE_CACHE_DIR`, else `$XDG_CACHE_HOME/lake`, else `~/.cache/lake`.
@@ -446,6 +459,7 @@ impl Project {
     pub fn build(&self, kv: &Arc<dyn Kv>, targets: &[String]) -> Result<()> {
         let receipt = self.record.join("success.json");
         remove(&receipt)?;
+        remove(&crate::internal::adoption_list(self))?;
         remove(&self.build_manifest())?;
         remove(&self.published())?;
         let packages_dir = self.record.join("packages");
@@ -512,6 +526,7 @@ impl Project {
                 continue;
             }
             let mut command = self.lake()?;
+            crate::internal::lookups(&mut command, self, &identity.scope)?;
             command
                 .args(["build", "--wfail", "-o"])
                 .arg(&mapping)
@@ -801,6 +816,7 @@ mod tests {
             repository: "o/r".into(),
             record: root.path().join("record"),
             lean: Lean::default(),
+            lookups: crate::project::Lookups::None,
         };
         assert_eq!(project("").namespace(), "o/r");
         let nested = project("projects/smt-axioms");
@@ -854,6 +870,7 @@ mod tests {
             repository: "o/moria-lean".into(),
             record: root.path().join("record"),
             lean: Lean::default(),
+            lookups: crate::project::Lookups::None,
         };
         let names = project
             .packages()

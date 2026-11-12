@@ -199,6 +199,49 @@ still checks every trace against the sources. A seed that is missing, or fails
 its check because a publish overwrote it mid-read, is reported and the restore
 continues from the pool.
 
+## Internal scope
+
+Prove workers, pull requests and people's machines are internal hosts. Each
+publishes the outputs its Lake built itself, committed or not, keyed by Lake's
+own input hash, and takes any other internal host's:
+
+```sh
+lake build Demo                          # any build, with LAKE_ARTIFACT_CACHE=true
+cov-lake-cache put --internal            # publish what this host built
+cov-lake-cache get --internal -- Demo    # elsewhere: Lake takes them instead of building
+```
+
+They live under `lake-int/<os>-<arch>/<toolchain scope>/`: `out/<package>/<input>.json`
+holds Lake's output record and each artifact's content ID, and `cas/` the
+artifacts `main`'s store lacks. A lifecycle rule deletes them 14 days after they
+are written; a missing entry or artifact only makes Lake build. `--internal`
+writes nothing else: no revision map, seed, build manifest, source tree, Git
+pack or toolchain, and it is refused in `main`'s CI.
+
+Lake asks for the outputs of each input its cache lacks through the bundled
+overlay, which reads `LAKE_OUTPUTS_ENDPOINT`; stock Lake never asks, and builds.
+
+### Adoption on `main`
+
+`main`'s CI reads the internal scope only by adopting outputs:
+
+```sh
+cov-lake-cache build --adopt -- Demo     # Lake takes internal outputs; lists them
+cov-kernel-checker lean-check replay-built --project . --modules modules.txt
+cov-lake-cache put --replayed .lake/declaration-replay/last-run.json
+```
+
+`put` publishes a build that adopted outputs only when that replay ran after the
+build and passed for every module an adopted input belongs to. The replay proves
+each adopted `.olean`'s declarations sound in the Lean kernel. It does not prove:
+
+- that the `.olean` is what `main`'s source elaborates to: an internal host could
+  publish other statements, with valid proofs, for the same input;
+- anything about native code: an adopted input's `.c`, `.ir` and objects reach
+  `main`'s pool, and executables linked from them, as an internal host built them.
+
+Both are accepted under the internal hosts' trust.
+
 ## Toolchain
 
 A `lean-toolchain` naming a Lean release or nightly

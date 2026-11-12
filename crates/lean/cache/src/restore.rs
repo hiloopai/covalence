@@ -35,7 +35,7 @@ use crate::{
     sources, storage,
 };
 
-const BASE: &str = "https://covalence-lake.invalid";
+pub(crate) const BASE: &str = "https://covalence-lake.invalid";
 const SERVICE: &str = "covalence";
 const FORMAT: &str = "%{stderr}%{json}\n";
 
@@ -118,6 +118,7 @@ impl Session {
                 "COVALENCE_LAKE_INDEX",
                 self.directory.path().join("index.json"),
             );
+        crate::internal::lookups(&mut command, project, &self.scope)?;
         Ok(command)
     }
 
@@ -626,7 +627,11 @@ pub(crate) fn download(args: &[String]) -> Result<ExitCode> {
             .map_or(ExitCode::FAILURE, ExitCode::from));
     }
     if args.len() == file.len() + 3 && args[..file.len()] == file && args[file.len() + 1] == "-L" {
-        return download_file(&scope, url, Path::new(&args[file.len()]));
+        let path = Path::new(&args[file.len()]);
+        if let Some(rest) = url.strip_prefix(&format!("{BASE}/o/")) {
+            return crate::internal::serve_request(rest, path, &artifact_directory()?);
+        }
+        return download_file(&scope, url, path);
     }
     let Some(config) = bulk else {
         return Err(invalid("unsupported Lake download protocol"));

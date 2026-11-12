@@ -980,6 +980,7 @@ mod tests {
             repository: REPOSITORY.into(),
             record: dir.path().join("record"),
             lean: Default::default(),
+            lookups: crate::project::Lookups::None,
         };
         let receipt = Receipt {
             identity: Identity {

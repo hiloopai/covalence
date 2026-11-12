@@ -780,6 +780,7 @@ mod tests {
             workspace: String::new(),
             record: dir.path().join("record"),
             lean: Default::default(),
+            lookups: crate::project::Lookups::None,
         };
         let package = Package {
             name: "demo".into(),

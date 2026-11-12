@@ -8,6 +8,7 @@ mod builds;
 mod dependencies;
 pub mod error;
 mod gc;
+mod internal;
 mod local;
 mod mapping;
 mod modules;
@@ -67,6 +68,19 @@ struct Cli {
     /// never reads, such as `docs/**`.
     #[arg(long)]
     exclude: Vec<String>,
+    /// With `get`, `build` and `put` on a prove worker, a pull request or
+    /// another internal host: take and publish outputs any internal build
+    /// made, by Lake's input hash. `main` never reads them but by `--adopt`.
+    #[arg(long)]
+    internal: bool,
+    /// With `build` on `main`: let Lake take internal outputs, which `put`
+    /// publishes only with a kernel replay of every adopted module.
+    #[arg(long)]
+    adopt: bool,
+    /// With `put` after `build --adopt`: the `last-run.json` of a
+    /// `cov-kernel-checker lean-check replay-built` run after the build.
+    #[arg(long)]
+    replayed: Option<PathBuf>,
     #[arg(last = true, allow_hyphen_values = true)]
     targets: Vec<String>,
 }
@@ -89,7 +103,34 @@ fn execute(cli: Cli) -> Result<()> {
             .or_else(|| env::var("GITHUB_REPOSITORY").ok())
             .unwrap_or_default(),
         workspace,
+        lookups: if cli.internal {
+            project::Lookups::Internal
+        } else if cli.adopt {
+            project::Lookups::Adopt
+        } else {
+            project::Lookups::None
+        },
     };
+    let main_ci = env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+        && env::var("GITHUB_REPOSITORY").as_deref() == Ok(&project.repository)
+        && env::var("GITHUB_REF").as_deref() == Ok("refs/heads/main")
+        && matches!(
+            env::var("GITHUB_EVENT_NAME").as_deref(),
+            Ok("push" | "workflow_dispatch")
+        );
+    // `main` reads the internal scope only through adoption's check.
+    if cli.internal && (main_ci || !matches!(cli.action, Action::Get | Action::Build | Action::Put))
+    {
+        return Err(invalid(
+            "--internal applies to get, build and put outside main's CI",
+        ));
+    }
+    if cli.adopt && !(main_ci && matches!(cli.action, Action::Build)) {
+        return Err(invalid("--adopt applies to build in a trusted main CI run"));
+    }
+    if cli.replayed.is_some() && (cli.internal || !matches!(cli.action, Action::Put)) {
+        return Err(invalid("--replayed applies to put of main's build"));
+    }
     if !matches!(cli.action, Action::Scope) && (cli.base.is_some() || !cli.exclude.is_empty()) {
         return Err(invalid("--base and --exclude apply to scope"));
     }
@@ -104,15 +145,7 @@ fn execute(cli: Cli) -> Result<()> {
             "put publishes a recorded build and accepts no targets",
         ));
     }
-    if matches!(cli.action, Action::Put)
-        && !(env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
-            && env::var("GITHUB_REPOSITORY").as_deref() == Ok(&project.repository)
-            && env::var("GITHUB_REF").as_deref() == Ok("refs/heads/main")
-            && matches!(
-                env::var("GITHUB_EVENT_NAME").as_deref(),
-                Ok("push" | "workflow_dispatch")
-            ))
-    {
+    if matches!(cli.action, Action::Put) && !cli.internal && !main_ci {
         return Err(invalid("publication requires a trusted main CI run"));
     }
     if project.repository.is_empty()
@@ -129,7 +162,10 @@ fn execute(cli: Cli) -> Result<()> {
         .then(|| gc::in_use(&cache))
         .transpose()?;
     let store = || {
-        let kv = storage::store()?;
+        let mut kv = storage::store()?;
+        if cli.internal {
+            kv = std::sync::Arc::new(internal::InternalKv::new(kv));
+        }
         // A restore checks the dependencies out while its seed downloads.
         if !matches!(cli.action, Action::Put | Action::Get) {
             sources::materialize(&project, &*kv)?;
@@ -152,9 +188,13 @@ fn execute(cli: Cli) -> Result<()> {
         match cli.action {
             Action::Dependencies => dependencies::fetch(&project, &store()?, &cli.targets),
             Action::Build => project.build(&store()?, &cli.targets),
+            Action::Put if cli.internal => {
+                let scope = project.identity()?.scope;
+                internal::publish(&project, store()?, &scope, &project.packages()?)
+            }
             Action::Put => {
                 let kv = store()?;
-                storage::publish(&project, &kv)?;
+                storage::publish(&project, &kv, cli.replayed.as_deref())?;
                 project.lean.publish(&kv)
             }
             Action::Get => {

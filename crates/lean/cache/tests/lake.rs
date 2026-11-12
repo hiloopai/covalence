@@ -1233,6 +1233,96 @@ fn a_published_tree_restores_and_records_again_without_lake() {
 }
 
 #[test]
+fn internal_builds_share_outputs_and_main_adopts_them_after_a_kernel_replay() {
+    let fixture = Fixture::new();
+    // A worker builds a change no main build published: no CI, so internal.
+    let path = fixture.root.join("Demo/A.lean");
+    fs::write(
+        &path,
+        format!(
+            "{}public theorem internal (n : Nat) : n = n := rfl\n",
+            fs::read_to_string(&path).unwrap()
+        ),
+    )
+    .unwrap();
+    fixture.commit();
+    let internal = |action: &str| {
+        let mut command = fixture.cli(action);
+        command
+            .arg("--internal")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_REF")
+            .env_remove("GITHUB_EVENT_NAME");
+        command
+    };
+    checked(fixture.lake().args(["build", "--wfail", "Demo"]));
+    let writes = fixture.server.writes.lock().unwrap().len();
+    let published = log(&checked(&mut internal("put")));
+    assert!(published.contains("to the internal scope"), "{published}");
+    let written = fixture.server.writes.lock().unwrap()[writes..].to_vec();
+    assert!(!written.is_empty());
+    assert!(
+        written.iter().all(|key| key.contains("/lake-int/")),
+        "{written:?}"
+    );
+    // Main's CI never reads the internal scope but by adoption.
+    assert!(
+        !fixture
+            .cli("get")
+            .arg("--internal")
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        !fixture
+            .cli("get")
+            .arg("--adopt")
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Another internal host takes those outputs through Lake's lookups.
+    fixture.reset_local();
+    let restored = log(&checked(internal("get").args(["--", "Demo"])));
+    assert!(!restored.contains("Built Demo"), "rebuilt: {restored}");
+    // Main adopts them, and publishes only with a later kernel replay of
+    // every adopted module.
+    fixture.reset_local();
+    let recorded = log(&checked(
+        fixture.cli("build").arg("--adopt").args(["--", "Demo"]),
+    ));
+    assert!(!recorded.contains("Built Demo"), "rebuilt: {recorded}");
+    assert!(fixture.record("adopted.list").is_file());
+    let refused = fixture.cli("put").output().unwrap();
+    assert!(!refused.status.success());
+    assert!(log(&refused).contains("--replayed"), "{}", log(&refused));
+    let modules = fs::read_dir(fixture.root.join(".lake/build/lib/lean/Demo"))
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            name.strip_suffix(".trace")
+                .map(|module| serde_json::json!({"status": "kernel_replayed", "module": format!("Demo.{module}")}))
+        })
+        .chain([serde_json::json!({"status": "kernel_replayed", "module": "Demo"})])
+        .collect::<Vec<_>>();
+    let report = fixture.temporary.path().join("last-run.json");
+    fs::write(
+        &report,
+        serde_json::to_vec(&serde_json::json!({"status": "kernel_replayed", "results": modules}))
+            .unwrap(),
+    )
+    .unwrap();
+    checked(fixture.cli("put").arg("--replayed").arg(&report));
+    let publication: Value =
+        serde_json::from_slice(&fs::read(fixture.record("publication.json")).unwrap()).unwrap();
+    assert!(
+        publication["adopted"].as_u64().unwrap() > 0,
+        "{publication}"
+    );
+}
+
+#[test]
 fn restores_into_a_workspace_lake_has_not_configured_install_without_lock_failures() {
     // Several packages' mappings install at once; on a fresh checkout each
     // Lake run would otherwise reconfigure the workspace concurrently.
