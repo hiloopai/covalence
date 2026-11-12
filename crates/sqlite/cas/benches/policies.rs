@@ -696,11 +696,11 @@ fn run(
         wait: subject.wait.cloned(),
         trace: subject.trace,
     });
+    let start = Instant::now();
     if manifest_bytes > 0 {
         // A manifest is one more value to get before the database opens.
         remote.serve(0, manifest_bytes);
     }
-    let start = Instant::now();
     let database = Database::open(Arc::clone(&remote) as Arc<dyn Cas>, &subject.cid, options)?;
     let (requests, bytes) = remote.counts();
     let open = Cost {
