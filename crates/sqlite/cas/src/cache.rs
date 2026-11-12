@@ -409,7 +409,7 @@ impl<A: Arena> BlockCache for ClockCache<A> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicUsize};
+    use std::sync::{Arc, Barrier, atomic::AtomicUsize};
 
     use super::*;
 
@@ -668,20 +668,25 @@ mod tests {
         let layout = Layout::new(200 * 64, 64);
         for policy in policies(16 * 64) {
             let cache: Arc<dyn BlockCache> = Arc::from(policy.build(layout).unwrap());
+            let start = Arc::new(Barrier::new(4));
             let threads: Vec<_> = (0..4u64)
                 .map(|thread| {
-                    let cache = cache.clone();
+                    let (cache, start) = (cache.clone(), start.clone());
                     std::thread::spawn(move || {
+                        start.wait();
                         let mut hits = 0;
                         for round in 0..2_000u64 {
                             let index = (round * 7 + thread * 13) % 200;
                             let mut buf = [0; 64];
-                            if cache.read(index, 0, &mut buf) {
-                                assert_eq!(buf, [index as u8 + 1; 64]);
-                                hits += 1;
-                            } else {
+                            if !cache.read(index, 0, &mut buf) {
                                 cache.insert(index, &block(layout, index));
+                                // Another thread may put a block in its place before the read.
+                                if !cache.read(index, 0, &mut buf) {
+                                    continue;
+                                }
                             }
+                            assert_eq!(buf, [index as u8 + 1; 64]);
+                            hits += 1;
                         }
                         hits
                     })
@@ -691,6 +696,8 @@ mod tests {
                 .into_iter()
                 .map(|thread| thread.join().unwrap())
                 .sum();
+            // However the threads are scheduled, the read after the last insert finds
+            // its block: only an insert takes a block out.
             assert!(hits > 0);
         }
     }
