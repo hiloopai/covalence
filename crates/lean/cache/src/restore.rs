@@ -356,22 +356,21 @@ pub(crate) fn restore(
                 modules::prefetch(project, &**kv, &scope, packages, commit.as_deref(), targets)
             })
         });
-        let mut installs = Vec::new();
-        if lazy {
-            let phase = Instant::now();
-            if !covered.is_empty() {
-                println!(
-                    "Lake cache: the seed holds {} upstream snapshots, which upstream need not send",
-                    covered.len()
-                );
-            }
-            dependencies::upstream(project, &session.local, true, &covered)?;
-            installs = dependencies::pins(project, kv, &session)?;
+        // A target-less `get` installs the dependencies' mappings too, so a
+        // build after it takes their outputs instead of compiling them.
+        let phase = Instant::now();
+        if !covered.is_empty() {
             println!(
-                "Lake cache: upstream snapshots and dependency pins in {:.1} s",
-                phase.elapsed().as_secs_f64()
+                "Lake cache: the seed holds {} upstream snapshots, which upstream need not send",
+                covered.len()
             );
         }
+        dependencies::upstream(project, &session.local, true, &covered)?;
+        let mut installs = dependencies::pins(project, kv, &session)?;
+        println!(
+            "Lake cache: upstream snapshots and dependency pins in {:.1} s",
+            phase.elapsed().as_secs_f64()
+        );
         // Upstream installs rewrite their packages' mappings, so the seed's
         // go in after them.
         let seeded = match seeded(seeding, &cache)? {
@@ -385,7 +384,7 @@ pub(crate) fn restore(
             }
             None => {
                 // Without the seed, upstream sends the snapshots it held.
-                if lazy && !covered.is_empty() {
+                if !covered.is_empty() {
                     dependencies::upstream(project, &session.local, true, &BTreeSet::new())?;
                 }
                 Seeded::new()

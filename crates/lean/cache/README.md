@@ -226,11 +226,15 @@ overlay, which reads `LAKE_OUTPUTS_ENDPOINT`; stock Lake never asks, and builds.
 `main`'s CI reads the internal scope only by adopting outputs:
 
 ```sh
+cov-lake-cache get                       # the pool's mappings only: no targets, so no build
 cov-lake-cache build --adopt -- Demo     # Lake takes internal outputs; lists them
 cov-lake-cache adopted > modules.txt     # the modules those outputs belong to
 cov-kernel-checker lean-check replay-built --project . --modules modules.txt
 cov-lake-cache put --replayed .lake/declaration-replay/last-run.json
 ```
+
+The restore names no targets: `get -- Demo` builds every module the pool
+lacks before `build --adopt` runs, which then finds nothing to adopt.
 
 `put` publishes a build that adopted outputs only when that replay ran after the
 build and passed for every module an adopted input belongs to. The replay proves
