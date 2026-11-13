@@ -114,13 +114,7 @@ fn execute(cli: Cli) -> Result<()> {
             project::Lookups::None
         },
     };
-    let main_ci = env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
-        && env::var("GITHUB_REPOSITORY").as_deref() == Ok(&project.repository)
-        && env::var("GITHUB_REF").as_deref() == Ok("refs/heads/main")
-        && matches!(
-            env::var("GITHUB_EVENT_NAME").as_deref(),
-            Ok("push" | "workflow_dispatch")
-        );
+    let main_ci = project.main_ci();
     // `main` reads the internal scope only through adoption's check.
     if cli.internal && (main_ci || !matches!(cli.action, Action::Get | Action::Build | Action::Put))
     {
