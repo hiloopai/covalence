@@ -986,7 +986,6 @@ mod tests {
             identity: Identity {
                 scope: SCOPE.into(),
                 revision: commit(1),
-                run: ["1".into(), "1".into()],
             },
             packages: BTreeMap::from([("p".into(), String::new())]),
             artifacts: dir.path().join("cache/artifacts"),

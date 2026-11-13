@@ -25,7 +25,6 @@ use crate::{
 pub(crate) struct Identity {
     pub scope: String,
     pub revision: String,
-    pub run: [String; 2],
 }
 
 #[derive(Deserialize, Serialize)]
@@ -457,14 +456,7 @@ impl Project {
             &scope,
             toolchain.as_deref().map(str::trim),
         )?;
-        Ok(Identity {
-            scope,
-            revision,
-            run: [
-                env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".into()),
-                env::var("GITHUB_RUN_ATTEMPT").unwrap_or_else(|_| "local".into()),
-            ],
-        })
+        Ok(Identity { scope, revision })
     }
 
     pub fn mapping(&self, package: &str) -> PathBuf {
@@ -617,7 +609,7 @@ impl Project {
         )?;
         if receipt.identity != self.identity()? {
             return Err(invalid(
-                "cache receipt does not match this revision, platform, toolchain and run",
+                "cache receipt does not match this revision, platform and toolchain",
             ));
         }
         for (package, sha256) in &receipt.packages {

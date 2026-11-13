@@ -118,12 +118,7 @@ impl Fixture {
             .env_remove("COVALENCE_LAKE_SCOPE")
             .env_remove("CURL")
             .env("LAKE_CI_BUCKET", "bucket")
-            .env("GITHUB_ACTIONS", "true")
-            .env("GITHUB_REPOSITORY", REPOSITORY)
-            .env("GITHUB_EVENT_NAME", "push")
-            .env("GITHUB_REF", "refs/heads/main")
-            .env("GITHUB_RUN_ID", "1")
-            .env("GITHUB_RUN_ATTEMPT", "1");
+            .env("GITHUB_REPOSITORY", REPOSITORY);
     }
 
     fn lake(&self) -> Command {
@@ -552,14 +547,6 @@ fn restore_uses_the_nearest_published_ancestor_and_worktrees_share_one_cache() {
 fn unsuccessful_or_stale_receipts_cannot_publish() {
     let fixture = Fixture::new();
     fixture.build();
-    assert!(
-        !fixture
-            .cli("put")
-            .env("GITHUB_RUN_ID", "other")
-            .status()
-            .unwrap()
-            .success()
-    );
     let mapping = fixture.record("packages/demo.jsonl");
     let original = fs::read(&mapping).unwrap();
     fs::write(

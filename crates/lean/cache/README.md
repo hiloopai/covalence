@@ -87,7 +87,7 @@ runs.
   requires a clean checkout; put generated output under an ignored directory.
 - `put` never builds. It publishes each output this host's Lake built itself
   by input hash (below), with or without a receipt. With a receipt from the
-  same revision, toolchain, platform and CI run, it also publishes the
+  same revision, toolchain and platform, it also publishes the
   commit's records; a stale or changed receipt publishes nothing. For each
   recorded package it builds the revision
   map locally, diffs it against the nearest published ancestor's map, uploads
