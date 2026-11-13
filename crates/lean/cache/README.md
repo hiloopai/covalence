@@ -26,24 +26,33 @@ cov-lake-cache put --seed --repository example/proofs
 The pool is shared by platform and toolchain, never by repository. Its scope
 is `<os>-<arch>/<toolchain>`, where `<toolchain>` is the SHA-256 of this
 layout's version (`cov-lake/v1`), `lean --version` and the toolchain's
-`leantar` executable. Under `lake/<scope>/`:
+`leantar` executable. Everything lives under `lake/` in one bucket:
 
-- `cas/sha2-256/<digest>/bytes.zst` holds each artifact as a Zstandard frame,
-  under the SHA-256 CID of its raw bytes, the hash of Covalence receipts and of
-  Lake's planned content hashes. Every read checks it.
-- `cas/blake3/<digest>/bytes.zst` holds map nodes in Covalence's key-value CAS
-  with Zstandard; Prolly names its nodes by BLAKE3.
-- `rev/<owner>/<repo>/<commit>/<package>` holds, as text, the root CID of a
-  Prolly map from Lake input hash to that input's output descriptor and the
-  CID of each artifact it names. That map is the only place Lake artifact IDs
-  meet CIDs. The root and path packages use this repository and commit; a Git
-  dependency uses its own pinned repository and commit.
+| Prefix | Keyed by | Holds | Written by |
+|---|---|---|---|
+| `<scope>/cas/sha2-256/<digest>/bytes.zst` | SHA-256 of the raw bytes | each artifact, as a Zstandard frame; every read checks the hash | any `put` |
+| `<scope>/cas/blake3/<digest>/bytes.zst` | BLAKE3 of the node | the nodes of revision maps (Prolly) | `put` of a recorded build |
+| `<scope>/out/<package>/<input>.json` | Lake input hash | Lake's output record and each artifact's CID | any `put`: what that host's Lake built since the last `put` |
+| `<scope>/rev/<repo>/<commit>/<package>` | commit | the root CID of a map from Lake input to outputs and artifact CIDs | `put` after `build` recorded that clean commit |
+| `<scope>/modules/<repo>/<commit>/<package>` | commit | each module's input in that build, for a targeted `get` to prefetch | the same |
+| `<scope>/builds/<repo>/<lake>/<tree>` | Git tree and Lake | a build manifest: the files to place without running Lake | the same |
+| `<scope>/seed/<repo>/{a,b}/` | two slots, oldest overwritten | a recorded build, unpacked, as 16 tar streams | `put --seed` |
+| `src/rev/<repo>/<commit>`, `src/cas/` | commit; BLAKE3 of each blob | the commit's source tree and the targets it built | `put` of a recorded build, root workspace only |
+| `git/<owner>/<dependency>/<commit>.{pack,idx}` | pinned commit | a Git dependency's pin | `put` |
+| `toolchains/<os>-<arch>/<toolchain>`, `toolchains/cas/` | Lean release | the release archive | `put`, when the pool lacks it |
 
-- `modules/<owner>/<repo>/<commit>/<package>` holds, as Zstandard JSON
-  `{"modules": {<module>: <input>}}`, the Lake input each module of that
-  package revision had in the recorded build, read from the module traces
-  Lake left in the build folder. It is written before the revision pointer.
-  A targeted `get` uses it to prefetch (below); nothing else reads it.
+`<repo>` is `<owner>/<repo>`, plus the workspace's folder below the
+repository's root. A Git dependency's `rev/` and `modules/` entries use its
+own repository and pinned commit.
+
+Every Lake run of `get` and `build` sets `LAKE_OUTPUTS_ENDPOINT`: the bundled
+overlay's Lake asks it for `out/<package>/<input>.json` of each input its
+cache lacks, and one process per command answers from the pool (stock Lake
+never asks). `COVALENCE_LAKE_COMMITS` names the commits `get` searches for a
+published build, nearest first, instead of `HEAD` and its ancestors.
+`COVALENCE_LAKE_COMMIT` names the commit `build` records and `put` publishes
+under instead of `HEAD`, for a remote build of a client's tree; where the
+checkout has that commit, its tree must be `HEAD`'s.
 
 A repository can hold several Lake workspaces. One below the repository's
 root, such as `projects/smt-axioms`, keeps its revision maps, module indexes
