@@ -349,6 +349,46 @@ impl Project {
             .collect()
     }
 
+    /// The commit this checkout's build is recorded and published under:
+    /// [`COMMIT`]'s, else `HEAD`.
+    pub fn commit(&self) -> Result<String> {
+        let named = env::var_os(COMMIT)
+            .map(|named| {
+                named
+                    .into_string()
+                    .map_err(|_| invalid(format!("{COMMIT} is not UTF-8")))
+            })
+            .transpose()?;
+        self.commit_named(named.as_deref())
+    }
+
+    /// `named`, which must hold `HEAD`'s tree where this checkout has it,
+    /// else `HEAD`.
+    fn commit_named(&self, named: Option<&str>) -> Result<String> {
+        let Some(named) = named else {
+            let head = self.git(&["rev-parse", "HEAD"])?;
+            if !mapping::hex(&head, 40) {
+                return Err(invalid("expected a 40-digit Git revision"));
+            }
+            return Ok(head);
+        };
+        if !mapping::hex(named, 40) {
+            return Err(invalid(format!(
+                "{COMMIT} names a 40-digit lowercase Git revision, not {named:?}"
+            )));
+        }
+        // A remote build's checkout lacks the commit; the caller vouches
+        // for its tree there.
+        if let Ok(tree) = self.git(&["rev-parse", "--verify", "-q", &format!("{named}^{{tree}}")])
+            && tree != self.git(&["rev-parse", "HEAD^{tree}"])?
+        {
+            return Err(invalid(format!(
+                "{COMMIT} {named} holds another tree than HEAD"
+            )));
+        }
+        Ok(named.to_owned())
+    }
+
     pub fn identity(&self) -> Result<Identity> {
         if !self.repository.is_empty() {
             mapping::segment_path(&self.repository)?;
@@ -392,10 +432,7 @@ impl Project {
         // executable identifies the codec.
         hash.update(b"\0leantar\0");
         hash.update(digest(&leantar)?);
-        let revision = self.git(&["rev-parse", "HEAD"])?;
-        if !mapping::hex(&revision, 40) {
-            return Err(invalid("expected a 40-digit Git revision"));
-        }
+        let revision = self.commit()?;
         let arch = env::consts::ARCH;
         let os = match env::consts::OS {
             "macos" => "darwin",
@@ -668,6 +705,11 @@ pub(crate) fn files(directory: &Path, extension: &str) -> Result<Vec<PathBuf>> {
 /// How many commits a restore searches for a published build.
 const ANCESTORS: usize = 64;
 
+/// The commit `build` records and `put` publishes under, instead of `HEAD`:
+/// for a checkout whose `HEAD` holds that commit's tree but is another
+/// commit, such as a remote build's synthetic commit of a client's tree.
+const COMMIT: &str = "COVALENCE_LAKE_COMMIT";
+
 /// The commits a restore searches instead of the checkout's history,
 /// nearest first: for a checkout that has none of its own, such as a remote
 /// build's copy of a client's tree.
@@ -714,6 +756,46 @@ mod tests {
         for bad in ["", " ,\n", "HEAD", &"A".repeat(40), &"a".repeat(39)] {
             assert!(named_commits(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_named_commit_must_hold_heads_tree_where_the_checkout_has_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(root)
+                .args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        fs::write(root.join("a"), "1").unwrap();
+        git(&["add", "a"]);
+        git(&["commit", "-q", "-m", "one"]);
+        let other = git(&["rev-parse", "HEAD"]);
+        fs::write(root.join("a"), "2").unwrap();
+        git(&["commit", "-q", "-am", "two"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        // Main's commit of HEAD's tree, as a remote build names it.
+        let same = git(&["commit-tree", "HEAD^{tree}", "-m", "main"]);
+        let project = Project {
+            root: root.to_owned(),
+            workspace: String::new(),
+            repository: "o/r".into(),
+            record: root.join("record"),
+            lean: crate::toolchain::Lean::default(),
+        };
+        assert_eq!(project.commit_named(None).unwrap(), head);
+        assert_eq!(project.commit_named(Some(&same)).unwrap(), same);
+        assert!(project.commit_named(Some(&other)).is_err());
+        let absent = "a".repeat(40);
+        assert_eq!(project.commit_named(Some(&absent)).unwrap(), absent);
+        assert!(project.commit_named(Some("HEAD")).is_err());
     }
 
     #[test]

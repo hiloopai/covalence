@@ -32,14 +32,14 @@ use crate::{
     storage,
 };
 
-/// The archive an entry's output is, if it is only one.
-fn archive(entry: &Entry) -> Option<&Sha256> {
+/// The archive an entry's output is, if it is only one: its name in Lake's
+/// cache and its content ID.
+fn archive(entry: &Entry) -> Option<(String, &Sha256)> {
     let Ok(Value::String(name)) = serde_json::from_str(&entry.output) else {
         return None;
     };
-    name.ends_with(".ltar")
-        .then(|| entry.artifacts.get(&name))
-        .flatten()
+    let cid = entry.artifacts.get(&name)?;
+    name.ends_with(".ltar").then_some((name, cid))
 }
 
 /// What an eager restore puts in the artifact directory: an archive's files,
@@ -64,10 +64,12 @@ pub(crate) fn install(
 ) -> Result<BTreeMap<String, String>> {
     let started = Instant::now();
     let mut jobs = BTreeSet::new();
+    let mut names = BTreeMap::new();
     for entry in entries.values() {
         match archive(entry) {
-            Some(cid) => {
+            Some((name, cid)) => {
                 jobs.insert(Job::Archive(cid));
+                names.insert(cid, name);
             }
             None => jobs.extend(
                 entry
@@ -82,7 +84,7 @@ pub(crate) fn install(
         fs::create_dir_all(artifacts).operation("create Lake artifact directory")?;
     }
     let done = storage::parallel_with(storage::ARCHIVE_WORKERS, &jobs, |_, job| match job {
-        Job::Archive(cid) => unpack_one(blobs, artifacts, cid).map(Some),
+        Job::Archive(cid) => unpack_one(blobs, artifacts, cid, &names[cid]).map(Some),
         Job::File(name, cid) => fetch(blobs, &artifacts.join(name), cid).map(|()| None),
     })?;
     let descriptors: BTreeMap<_, _> = jobs
@@ -105,7 +107,7 @@ pub(crate) fn install(
         .iter()
         .map(|(input, entry)| {
             let output = archive(entry)
-                .and_then(|cid| descriptors.get(cid))
+                .and_then(|(_, cid)| descriptors.get(cid))
                 .unwrap_or(&entry.output);
             (input.clone(), output.clone())
         })
@@ -124,12 +126,16 @@ fn fetch(blobs: &Blobs, path: &Path, cid: &Sha256) -> Result<()> {
     save(path, &bytes)
 }
 
-/// Writes an archive's files and returns the outputs its trace names.
-fn unpack_one(blobs: &Blobs, artifacts: &Path, cid: &Sha256) -> Result<String> {
+/// Writes an archive's files and returns the outputs its trace names. The
+/// archive itself stays in the cache as `name`: recording an unchanged
+/// module takes it again (`modules::reuse_archives`), which would otherwise
+/// download it a second time.
+fn unpack_one(blobs: &Blobs, artifacts: &Path, cid: &Sha256, name: &str) -> Result<String> {
     let mut bytes = Vec::new();
     blobs
         .get_to(cid, &mut bytes)?
         .ok_or_else(|| invalid(format!("{cid} is missing from the pool")))?;
+    save(&artifacts.join(name), &bytes)?;
     place(artifacts, &bytes, &cid.to_string())
 }
 
@@ -346,6 +352,8 @@ mod tests {
                 "5555555555555555.ir.sig",
                 "6666666666666666.ir",
                 "7777777777777777.c",
+                // Kept for recording, which takes the archive again.
+                "89abcdef01234567.ltar",
             ]
         );
         for (name, _) in &first {

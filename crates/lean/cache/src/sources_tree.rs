@@ -315,8 +315,10 @@ pub(crate) fn publish(
     pointer(repository, commit)?;
     let cas = KvCas::with_prefix(kv.clone(), "lake/src/cas")
         .map_err(|_| invalid("invalid source CAS prefix"))?;
-    let (entries, by_object) = snapshot(&project.root, commit)?;
-    let ancestors = project.git(&["rev-list", "--first-parent", "--max-count=65", commit])?;
+    // `HEAD` holds the commit's tree, whether or not the checkout has the
+    // commit (see `Project::commit`).
+    let (entries, by_object) = snapshot(&project.root, "HEAD")?;
+    let ancestors = project.git(&["rev-list", "--first-parent", "--max-count=65", "HEAD"])?;
     let ancestors = ancestors
         .lines()
         .skip(1)

@@ -310,17 +310,7 @@ credential chain (`AWS_REGION`, `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, web identity, profiles or machine
 roles). Do not pass credentials on the command line.
 
-Outside AWS, transfers go through the bucket's
-[Transfer Acceleration](https://docs.aws.amazon.com/AmazonS3/latest/userguide/transfer-acceleration.html)
-endpoint, `<bucket>.s3-accelerate.amazonaws.com`, which must be enabled on the
-bucket. Inside AWS they keep the regional endpoint, where acceleration would
-only add its fee. `COVALENCE_S3_ACCELERATE` is `auto` (the default), `on` or
-`off`. `auto` counts a host as in AWS when an AWS runtime's variables are set
-(`AWS_EXECUTION_ENV`, ECS task metadata or roles, EKS Pod Identity) or when
-instance metadata answers as EC2's does within 40 ms. A web identity token
-counts only when an EKS cluster issued it (`https://oidc.eks.<region>.amazonaws.com`),
-since CI and clusters elsewhere federate into AWS with their own issuers. An `AWS_ENDPOINT_URL` or
-profile `endpoint_url` overrides acceleration. Bucket permissions decide who
+Transfers use the bucket's regional endpoint. Bucket permissions decide who
 writes.
 
 While Lake runs under this command, it stands in for `curl`. It serves pool
