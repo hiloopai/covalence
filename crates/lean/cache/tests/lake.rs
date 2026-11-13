@@ -1286,6 +1286,17 @@ fn internal_builds_share_outputs_and_main_adopts_them_after_a_kernel_replay() {
     fixture.reset_local();
     let restored = log(&checked(internal("get").args(["--", "Demo"])));
     assert!(!restored.contains("Built Demo"), "rebuilt: {restored}");
+    let fetched = |log: &str| {
+        log.lines()
+            .find_map(|line| {
+                line.strip_prefix("Lake cache: fetched ")?
+                    .strip_suffix(" outputs from the internal scope")?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .unwrap_or_else(|| panic!("no internal fetch count: {log}"))
+    };
+    assert!(fetched(&restored) > 0, "{restored}");
     // Main adopts them, and publishes only with a later kernel replay of
     // every adopted module.
     fixture.reset_local();
@@ -1293,7 +1304,8 @@ fn internal_builds_share_outputs_and_main_adopts_them_after_a_kernel_replay() {
         fixture.cli("build").arg("--adopt").args(["--", "Demo"]),
     ));
     assert!(!recorded.contains("Built Demo"), "rebuilt: {recorded}");
-    assert!(fixture.record("adopted.list").is_file());
+    let adopted = fs::read_to_string(fixture.record("adopted.list")).unwrap();
+    assert_eq!(fetched(&recorded), adopted.lines().count(), "{recorded}");
     let refused = fixture.cli("put").output().unwrap();
     assert!(!refused.status.success());
     assert!(log(&refused).contains("--replayed"), "{}", log(&refused));

@@ -184,7 +184,11 @@ fn execute(cli: Cli) -> Result<()> {
         }
         match cli.action {
             Action::Dependencies => dependencies::fetch(&project, &store()?, &cli.targets),
-            Action::Build => project.build(&store()?, &cli.targets),
+            Action::Build => {
+                internal::count_fetches(&project)?;
+                project.build(&store()?, &cli.targets)?;
+                internal::report_fetches(&project)
+            }
             Action::Put if cli.internal => {
                 let scope = project.identity()?.scope;
                 internal::publish(&project, store()?, &scope, &project.packages()?)
@@ -195,7 +199,9 @@ fn execute(cli: Cli) -> Result<()> {
                 project.lean.publish(&kv)
             }
             Action::Get => {
+                internal::count_fetches(&project)?;
                 restore::restore(&project, &store()?, &cli.targets, cli.seed, started)?;
+                internal::report_fetches(&project)?;
                 drop(in_use);
                 gc::after_restore(&cache)
             }

@@ -327,8 +327,8 @@ fn store_error(
 /// Serve Lake's request for the outputs of `input`: from the internal scope,
 /// with each artifact the entry names placed in Lake's `artifacts` folder
 /// first, written to `path`, Lake's own outputs file for it. `false` on a
-/// miss, which writes nothing. With `adopted`, `main`'s adoption list, the
-/// input joins it once its outputs are in place.
+/// miss, which writes nothing. The input joins each of `lists` once its
+/// outputs are in place.
 pub(crate) fn serve(
     kv: Arc<dyn Kv>,
     scope: &str,
@@ -336,7 +336,7 @@ pub(crate) fn serve(
     input: &str,
     path: &Path,
     artifacts: &Path,
-    adopted: Option<&Path>,
+    lists: &[PathBuf],
 ) -> Result<bool> {
     let key = key(scope, package, input)?;
     let Some(bytes) = kv
@@ -394,15 +394,15 @@ pub(crate) fn serve(
         .persist(path)
         .map_err(|error| error.error)
         .operation("place Lake outputs")?;
-    if let Some(adopted) = adopted {
+    for list in lists {
         let mut list = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(adopted)
-            .operation("open adoption list")?;
+            .open(list)
+            .operation(format!("open {}", list.display()))?;
         // One short append, whole, however many downloads run at once.
         list.write_all(format!("{package}\t{input}\n").as_bytes())
-            .operation("record adopted output")?;
+            .operation("list a fetched internal output")?;
     }
     Ok(true)
 }
@@ -540,6 +540,7 @@ impl Adoption {
 /// adoption, the list it keeps.
 const OUTPUTS: &str = "COVALENCE_LAKE_OUTPUTS";
 const ADOPTED: &str = "COVALENCE_LAKE_ADOPTED";
+const FETCHED: &str = "COVALENCE_LAKE_FETCHED";
 
 /// Point Lake's lookups of the outputs its cache lacks at the internal
 /// scope, through this executable, as `project.lookups` allows; the overlay's
@@ -566,7 +567,8 @@ pub(crate) fn lookups(
             "LAKE_OUTPUTS_ENDPOINT",
             format!("{}/o/{scope}", crate::restore::BASE),
         )
-        .env(OUTPUTS, "1");
+        .env(OUTPUTS, "1")
+        .env(FETCHED, fetched_list(project));
     if project.lookups == Lookups::Adopt {
         command.env(ADOPTED, adoption_list(project));
     }
@@ -609,17 +611,13 @@ pub(crate) fn serve_request(
         return Err(invalid("unsafe Lake outputs destination"));
     }
     let kv: Arc<dyn Kv> = Arc::new(InternalKv::new(crate::storage::store()?));
-    let adopted = std::env::var_os(ADOPTED).map(PathBuf::from);
+    // The adoption list and the fetch list each take every output served.
+    let lists: Vec<PathBuf> = [ADOPTED, FETCHED]
+        .into_iter()
+        .filter_map(|name| std::env::var_os(name).map(PathBuf::from))
+        .collect();
     Ok(
-        if serve(
-            kv,
-            &scope,
-            package,
-            input,
-            path,
-            artifacts,
-            adopted.as_deref(),
-        )? {
+        if serve(kv, &scope, package, input, path, artifacts, &lists)? {
             std::process::ExitCode::SUCCESS
         } else {
             std::process::ExitCode::from(22)
@@ -630,6 +628,40 @@ pub(crate) fn serve_request(
 /// Where `build --adopt` lists the inputs Lake took from the internal scope.
 pub(crate) fn adoption_list(project: &Project) -> PathBuf {
     project.record.join("adopted.list")
+}
+
+/// Where a `get` or `build` that reads the internal scope lists the outputs
+/// Lake fetched from it.
+fn fetched_list(project: &Project) -> PathBuf {
+    project.record.join("internal-fetched.list")
+}
+
+/// Start counting the outputs this run fetches from the internal scope.
+pub(crate) fn count_fetches(project: &Project) -> Result<()> {
+    if project.lookups == Lookups::None {
+        return Ok(());
+    }
+    fs::create_dir_all(&project.record).operation("create build record folder")?;
+    match fs::remove_file(fetched_list(project)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error).operation("reset the internal fetch list")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Say how many outputs this run fetched from the internal scope.
+pub(crate) fn report_fetches(project: &Project) -> Result<()> {
+    if project.lookups == Lookups::None {
+        return Ok(());
+    }
+    let fetched = match fs::read_to_string(fetched_list(project)) {
+        Ok(list) => list.lines().count(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error).operation("read the internal fetch list"),
+    };
+    println!("Lake cache: fetched {fetched} outputs from the internal scope");
+    Ok(())
 }
 
 #[cfg(test)]
