@@ -69,7 +69,7 @@ pub(crate) fn upstream(
         Installed::Artifacts
     };
     for snapshot in snapshots(project)? {
-        if seeded.contains(&snapshot) || local.upstream_installed(level, &snapshot.request()) {
+        if seeded.contains(&snapshot) || installed(local, level, &snapshot)? {
             continue;
         }
         let mut command = project.lake()?;
@@ -90,6 +90,31 @@ pub(crate) fn upstream(
         local.set_upstream_installed(level, &snapshot.request())?;
     }
     Ok(())
+}
+
+/// Whether this host installed `level` of `snapshot` and Lake's cache still
+/// holds it: the mappings Lake downloaded, and with artifacts, every
+/// artifact they name.
+fn installed(local: &Local, level: Installed, snapshot: &Snapshot) -> Result<bool> {
+    if !local.upstream_installed(level, &snapshot.request()) {
+        return Ok(false);
+    }
+    let revisions = snapshot.revisions(local.directory());
+    let mut intact = revisions.is_file();
+    if intact && matches!(level, Installed::Artifacts) {
+        let artifacts = local.directory().join("artifacts");
+        intact = mapping::rows(&revisions)?
+            .values()
+            .flat_map(|(_, names)| names)
+            .all(|name| artifacts.join(name).is_file());
+    }
+    if !intact {
+        println!(
+            "Lake cache: Lake's cache lacks the installed {} snapshot; installing it again",
+            snapshot.package
+        );
+    }
+    Ok(intact)
 }
 
 /// One upstream Mathlib/CSLib snapshot: a package's mappings at a revision

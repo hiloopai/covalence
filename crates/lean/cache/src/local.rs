@@ -119,6 +119,47 @@ impl Local {
         fs::write(&path, request.join("\n") + "\n").operation("write upstream marker")
     }
 
+    /// Whether what a record of `level` claims for `package` is still in
+    /// Lake's cache: an output record for each of `inputs`, and with
+    /// artifacts, every artifact those records name. A record outlives what
+    /// it describes when someone empties Lake's cache by hand, and trusting
+    /// it then restores nothing.
+    pub fn intact<'a>(
+        &self,
+        level: Installed,
+        package: &str,
+        inputs: impl IntoIterator<Item = &'a str>,
+    ) -> Result<bool> {
+        let outputs = self.directory.join("outputs").join(package);
+        let artifacts = self.directory.join("artifacts");
+        for input in inputs {
+            let path = outputs.join(format!("{input}.json"));
+            if matches!(level, Installed::Mappings) {
+                if !path.is_file() {
+                    return Ok(false);
+                }
+                continue;
+            }
+            let record = match fs::read(&path) {
+                Ok(record) => record,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(source) => {
+                    return Err(Error::Io {
+                        operation: format!("read {}", path.display()),
+                        source,
+                    });
+                }
+            };
+            let record: serde_json::Value = crate::error::json(&record)?;
+            for name in mapping::names(&record["data"])? {
+                if !artifacts.join(name).is_file() {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// The root whose `level` was last installed for `package` in `scope`.
     pub fn installed(
         &self,
@@ -162,5 +203,36 @@ impl Local {
             .map_err(|error| error.error)
             .operation("save installed root")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_install_record_holds_only_while_lakes_cache_has_what_it_names() {
+        let cache = tempfile::tempdir().unwrap();
+        let local = Local::at(cache.path().to_owned()).unwrap();
+        let outputs = cache.path().join("outputs/demo");
+        let artifacts = cache.path().join("artifacts");
+        fs::create_dir_all(&outputs).unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        let input = "0123456789abcdef";
+        let check = |level| local.intact(level, "demo", [input]).unwrap();
+        assert!(!check(Installed::Mappings));
+        fs::write(
+            outputs.join(format!("{input}.json")),
+            r#"{"schemaVersion": "2026-02-25", "service": null, "data": {"o": ["1111111111111111.olean"], "i": "2222222222222222.ilean"}}"#,
+        )
+        .unwrap();
+        assert!(check(Installed::Mappings));
+        assert!(!check(Installed::Artifacts));
+        fs::write(artifacts.join("1111111111111111.olean"), "o").unwrap();
+        fs::write(artifacts.join("2222222222222222.ilean"), "i").unwrap();
+        assert!(check(Installed::Artifacts));
+        // Lake's artifacts emptied by hand: the record no longer holds.
+        fs::remove_dir_all(&artifacts).unwrap();
+        assert!(!check(Installed::Artifacts));
     }
 }

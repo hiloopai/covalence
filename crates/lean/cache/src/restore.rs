@@ -145,8 +145,19 @@ impl Session {
             let local = &self.local;
             let nodes = pool::copy_nodes(&self.remote, &*local.nodes(), *root)?;
             let target = Map::open(local.nodes(), *root);
-            let installed = local.installed(level, &self.scope, &package.name)?;
-            let base = installed.map(|root| target.at(root));
+            let mut base = local
+                .installed(level, &self.scope, &package.name)?
+                .map(|root| target.at(root));
+            if let Some(installed) = &base {
+                let entries = pool::entries(installed)?;
+                if !local.intact(level, &package.name, entries.keys().map(String::as_str))? {
+                    println!(
+                        "Lake cache: {}: Lake's cache lacks what the last install recorded; installing the whole map",
+                        package.name
+                    );
+                    base = None;
+                }
+            }
             let transfer = pool::transfer(base.as_ref(), &target)?;
             println!(
                 "Lake cache: {}: {} changed entries naming {} new artifacts, {nodes} map nodes fetched",
