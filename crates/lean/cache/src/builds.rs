@@ -284,13 +284,49 @@ impl Manifest {
             return Ok(None);
         }
         let mut cached = BTreeMap::new();
+        let mut by_hash: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for entry in fs::read_dir(artifacts).operation("read Lake artifact cache")? {
             let entry = entry.operation("read Lake artifact cache")?;
             let metadata = entry.metadata().operation("read Lake artifact metadata")?;
             if let Some(name) = entry.file_name().to_str() {
                 cached.insert((metadata.dev(), metadata.ino()), name.to_owned());
+                if let Some((hash, _)) = name.split_once('.') {
+                    by_hash
+                        .entry(hash.to_owned())
+                        .or_default()
+                        .push(name.to_owned());
+                }
             }
         }
+        // Lake links an output it built into its cache only when the cache
+        // lacks that artifact. One rebuilt with the bytes of an artifact the
+        // cache already holds stays a separate file: it is recorded as that
+        // artifact, found by the hash Lake wrote beside it.
+        let same_artifact = |path: &Path, len: u64| -> Result<Option<String>> {
+            let Ok(hash) = fs::read_to_string(format!("{}.hash", path.display())) else {
+                return Ok(None);
+            };
+            let Some(names) = by_hash.get(hash.trim()) else {
+                return Ok(None);
+            };
+            let mut bytes = None;
+            for name in names {
+                let candidate = artifacts.join(name);
+                if fs::metadata(&candidate).is_ok_and(|metadata| metadata.len() == len) {
+                    let built = match &bytes {
+                        Some(built) => built,
+                        None => bytes
+                            .insert(fs::read(path).operation(format!("read {}", path.display()))?),
+                    };
+                    let cached =
+                        fs::read(&candidate).operation(format!("read {}", candidate.display()))?;
+                    if cached == *built {
+                        return Ok(Some(name.clone()));
+                    }
+                }
+            }
+            Ok(None)
+        };
         let mut files = BTreeMap::new();
         let mut executables = 0;
         for folder in packages.iter().filter_map(folder) {
@@ -332,8 +368,12 @@ impl Manifest {
                     executables += 1;
                     continue;
                 }
-                let content = match cached.get(&(metadata.dev(), metadata.ino())) {
-                    Some(name) => Content::Link(name.clone()),
+                let linked = match cached.get(&(metadata.dev(), metadata.ino())) {
+                    Some(name) => Some(name.clone()),
+                    None => same_artifact(&path, metadata.len())?,
+                };
+                let content = match linked {
+                    Some(name) => Content::Link(name),
                     None if metadata.len() <= TEXT_LIMIT => {
                         let bytes = fs::read(&path).operation(format!("read {relative}"))?;
                         match String::from_utf8(bytes) {
@@ -554,6 +594,14 @@ mod tests {
         .unwrap();
         fs::write(lib.join("A.olean.hash"), "0123456789abcdef").unwrap();
         fs::write(lib.join("A.trace"), r#"{"depHash": "1"}"#).unwrap();
+        // Rebuilt with the bytes of an artifact already cached: Lake leaves a
+        // copy, not a link. Too large to carry inline.
+        let large = vec![0xffu8; (TEXT_LIMIT + 1) as usize];
+        fs::write(artifacts.join("fedcba9876543210.c"), &large).unwrap();
+        let ir = one.join(".lake/packages/dep/.lake/build/ir");
+        fs::create_dir_all(&ir).unwrap();
+        fs::write(ir.join("A.c"), &large).unwrap();
+        fs::write(ir.join("A.c.hash"), "fedcba9876543210").unwrap();
         // An executable Lake linked, which seeds leave to the pool too.
         let bin = one.join(".lake/build/bin");
         fs::create_dir_all(&bin).unwrap();
@@ -585,9 +633,18 @@ mod tests {
         .unwrap()
         .unwrap();
         let prefix = ".lake/packages/dep/.lake/build/lib/lean";
+        let ir = ".lake/packages/dep/.lake/build/ir";
         assert_eq!(
             manifest.files,
             BTreeMap::from([
+                (
+                    format!("{ir}/A.c"),
+                    Content::Link("fedcba9876543210.c".into())
+                ),
+                (
+                    format!("{ir}/A.c.hash"),
+                    Content::Text("fedcba9876543210".into())
+                ),
                 (
                     format!("{prefix}/A.olean"),
                     Content::Link("0123456789abcdef.olean".into())
@@ -636,6 +693,21 @@ mod tests {
 
         fs::remove_file(artifacts.join("0123456789abcdef.olean")).unwrap();
         assert!(!manifest.present(&artifacts).unwrap());
+
+        // A copy whose bytes differ from the artifact its hash names is not it.
+        let mut other = large.clone();
+        other[0] = 0;
+        fs::remove_file(one.join(ir).join("A.c")).unwrap();
+        fs::write(one.join(ir).join("A.c"), &other).unwrap();
+        let record = Manifest::record(
+            &project(&one),
+            &packages,
+            &artifacts,
+            "l".into(),
+            "t".into(),
+            &[],
+        );
+        assert!(record.unwrap().is_none());
     }
 
     #[test]
