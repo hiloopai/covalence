@@ -70,19 +70,6 @@ pub(crate) struct Project {
     pub record: PathBuf,
     /// The Lake this command runs, which waits for its toolchain.
     pub lean: Lean,
-    /// Whether Lake may take outputs from the internal scope.
-    pub lookups: Lookups,
-}
-
-/// Where Lake looks for the outputs of an input its cache lacks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Lookups {
-    /// Nowhere: it builds them.
-    None,
-    /// The internal scope (see `internal`).
-    Internal,
-    /// The internal scope, listing what it takes for `put`'s adoption check.
-    Adopt,
 }
 
 /// `LAKE_CACHE_DIR`, else `$XDG_CACHE_HOME/lake`, else `~/.cache/lake`.
@@ -340,24 +327,10 @@ impl Project {
             .operation("locate Lake cache directory")
     }
 
-    /// Whether this runs in `main`'s CI for this repository: a push to
-    /// `main` or a run started on it.
-    pub fn main_ci(&self) -> bool {
-        env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
-            && env::var("GITHUB_REPOSITORY").as_deref() == Ok(&self.repository)
-            && env::var("GITHUB_REF").as_deref() == Ok("refs/heads/main")
-            && matches!(
-                env::var("GITHUB_EVENT_NAME").as_deref(),
-                Ok("push" | "workflow_dispatch")
-            )
-    }
-
     /// The commits to try for this repository's published builds: those
-    /// [`COMMITS`] names, else `HEAD` then its ancestors, newest first.
-    ///
-    /// `main`'s CI walks first parents, its own history. Anywhere else a
-    /// branch that merged `main` in holds `main`'s newest commits as second
-    /// parents, so every parent is walked.
+    /// [`COMMITS`] names, else `HEAD` then its ancestors, newest first. Every
+    /// parent is walked: a branch that merged `main` in holds `main`'s newest
+    /// commits as second parents.
     pub fn ancestors(&self) -> Result<Vec<String>> {
         if let Some(named) = env::var_os(COMMITS) {
             let named = named
@@ -365,13 +338,7 @@ impl Project {
                 .map_err(|_| invalid(format!("{COMMITS} is not UTF-8")))?;
             return named_commits(&named);
         }
-        let count = format!("--max-count={ANCESTORS}");
-        let mut args = vec!["rev-list", count.as_str()];
-        if self.main_ci() {
-            args.push("--first-parent");
-        }
-        args.push("HEAD");
-        let list = self.git(&args)?;
+        let list = self.git(&["rev-list", &format!("--max-count={ANCESTORS}"), "HEAD"])?;
         list.lines()
             .map(|commit| {
                 if !mapping::hex(commit, 40) {
@@ -475,7 +442,6 @@ impl Project {
     pub fn build(&self, kv: &Arc<dyn Kv>, targets: &[String]) -> Result<()> {
         let receipt = self.record.join("success.json");
         remove(&receipt)?;
-        remove(&crate::internal::adoption_list(self))?;
         remove(&self.build_manifest())?;
         remove(&self.published())?;
         let packages_dir = self.record.join("packages");
@@ -542,7 +508,7 @@ impl Project {
                 continue;
             }
             let mut command = self.lake()?;
-            crate::internal::lookups(&mut command, self, &identity.scope)?;
+            crate::outputs::lookups(&mut command, self, &identity.scope)?;
             command
                 .args(["build", "--wfail", "-o"])
                 .arg(&mapping)
@@ -793,7 +759,6 @@ mod tests {
             repository: "o/r".into(),
             record: root.join("record"),
             lean: crate::toolchain::Lean::default(),
-            lookups: Lookups::None,
         };
         let ancestors = project.ancestors().unwrap();
         let at = |commit: &String| ancestors.iter().position(|c| c == commit).unwrap();
@@ -883,7 +848,6 @@ mod tests {
             repository: "o/r".into(),
             record: root.path().join("record"),
             lean: Lean::default(),
-            lookups: crate::project::Lookups::None,
         };
         assert_eq!(project("").namespace(), "o/r");
         let nested = project("projects/smt-axioms");
@@ -937,7 +901,6 @@ mod tests {
             repository: "o/moria-lean".into(),
             record: root.path().join("record"),
             lean: Lean::default(),
-            lookups: crate::project::Lookups::None,
         };
         let names = project
             .packages()

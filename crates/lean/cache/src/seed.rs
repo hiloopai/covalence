@@ -535,6 +535,7 @@ fn unpack(
         }
         let mut file = File::create_new(&destination).operation("create seed file")?;
         io::copy(&mut entry, &mut file).operation("write seed file")?;
+        crate::outputs::installed(&file)?;
     }
     // Read the archive's padding too, so the writer never meets a closed pipe.
     io::copy(&mut archive.into_inner(), &mut io::sink()).operation("read seed chunk")?;
@@ -980,7 +981,6 @@ mod tests {
             repository: REPOSITORY.into(),
             record: dir.path().join("record"),
             lean: Default::default(),
-            lookups: crate::project::Lookups::None,
         };
         let receipt = Receipt {
             identity: Identity {

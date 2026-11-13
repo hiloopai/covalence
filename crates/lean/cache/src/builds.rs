@@ -574,7 +574,6 @@ mod tests {
             repository: "o/r".into(),
             record: root.join("record"),
             lean: crate::toolchain::Lean::default(),
-            lookups: crate::project::Lookups::None,
         }
     }
 

@@ -420,7 +420,6 @@ mod tests {
             repository: "o/r".into(),
             record: root.join("record"),
             lean: Default::default(),
-            lookups: crate::project::Lookups::None,
         };
         let kv = covalence_kv_memory::MemoryKv::default().into_dyn();
         let targets = ["Demo".to_owned()];

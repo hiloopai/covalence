@@ -118,7 +118,7 @@ impl Session {
                 "COVALENCE_LAKE_INDEX",
                 self.directory.path().join("index.json"),
             );
-        crate::internal::lookups(&mut command, project, &self.scope)?;
+        crate::outputs::lookups(&mut command, project, &self.scope)?;
         Ok(command)
     }
 
@@ -628,7 +628,7 @@ pub(crate) fn download(args: &[String]) -> Result<ExitCode> {
     if args.len() == file.len() + 3 && args[..file.len()] == file && args[file.len() + 1] == "-L" {
         let path = Path::new(&args[file.len()]);
         if let Some(rest) = url.strip_prefix(&format!("{BASE}/o/")) {
-            return crate::internal::serve_request(rest, path, &artifact_directory()?);
+            return crate::outputs::serve_request(rest, path);
         }
         return download_file(&scope, url, path);
     }

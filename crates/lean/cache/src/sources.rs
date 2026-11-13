@@ -504,7 +504,6 @@ mod tests {
                 repository: "o/r".into(),
                 record: root.join("record"),
                 lean: Default::default(),
-                lookups: crate::project::Lookups::None,
             };
             materialize_in(&project, &kv, cache).unwrap();
             (project, root.join(".lake/packages/dep-a"))

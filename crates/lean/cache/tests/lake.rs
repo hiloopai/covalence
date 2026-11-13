@@ -168,7 +168,7 @@ impl Fixture {
     }
     /// The publication report of the root package.
     fn publish(&self) -> Value {
-        checked(&mut self.cli("put"));
+        checked(self.cli("put").arg("--seed"));
         let report: Value =
             serde_json::from_slice(&fs::read(self.record("publication.json")).unwrap()).unwrap();
         report["packages"][0].clone()
@@ -578,8 +578,17 @@ fn unsuccessful_or_stale_receipts_cannot_publish() {
     fixture.commit();
     assert!(!fixture.cli("build").status().unwrap().success());
     assert!(!fixture.record("success.json").exists());
-    assert!(!fixture.cli("put").status().unwrap().success());
-    assert!(fixture.server.writes.lock().unwrap().is_empty());
+    // What did build is shared by input hash; nothing is keyed by the commit.
+    checked(fixture.cli("put").arg("--seed"));
+    assert!(
+        fixture
+            .server
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|key| !key.contains("/rev/"))
+    );
 }
 
 #[test]
@@ -701,7 +710,7 @@ fn dependencies_are_recorded_for_the_build_targets_closure_only() {
 
     // No import needs this package yet; an empty snapshot is not published.
     fixture.build();
-    checked(&mut fixture.cli("put"));
+    checked(fixture.cli("put").arg("--seed"));
     let pointers = || {
         fixture
             .server
@@ -722,7 +731,7 @@ fn dependencies_are_recorded_for_the_build_targets_closure_only() {
     .unwrap();
     fixture.commit();
     fixture.build();
-    checked(&mut fixture.cli("put"));
+    checked(fixture.cli("put").arg("--seed"));
     assert!(pointers().iter().any(|key| key.ends_with("/path-dep")));
     assert!(
         !dependency
@@ -739,8 +748,12 @@ fn dependencies_are_recorded_for_the_build_targets_closure_only() {
     .unwrap();
     fixture.commit();
     assert!(!fixture.cli("build").output().unwrap().status.success());
-    assert!(!fixture.cli("put").output().unwrap().status.success());
-    assert_eq!(fixture.server.writes.lock().unwrap().len(), writes);
+    checked(fixture.cli("put").arg("--seed"));
+    assert!(
+        fixture.server.writes.lock().unwrap()[writes..]
+            .iter()
+            .all(|key| !key.contains("/rev/"))
+    );
 }
 
 #[test]
@@ -763,23 +776,8 @@ fn transfer_failure_never_publishes_a_pointer() {
 }
 
 #[test]
-fn untrusted_writers_and_download_urls_are_rejected_before_network_io() {
+fn unsafe_download_urls_are_rejected_before_network_io() {
     let fixture = Fixture::new();
-    for (event, reference, repository) in [
-        ("pull_request", "refs/pull/1/merge", REPOSITORY),
-        ("push", "refs/heads/topic", REPOSITORY),
-        ("push", "refs/heads/main", "fork/proofs"),
-    ] {
-        let result = fixture
-            .cli("put")
-            .env("GITHUB_EVENT_NAME", event)
-            .env("GITHUB_REF", reference)
-            .env("GITHUB_REPOSITORY", repository)
-            .output()
-            .unwrap();
-        assert!(!result.status.success());
-        assert!(String::from_utf8_lossy(&result.stderr).contains("trusted main"));
-    }
     for url in [
         "https://covalence-lake.invalid/r/test/../other",
         "https://covalence-lake.invalid/r/test/%2e%2e/escape",
@@ -891,7 +889,7 @@ fn target_restore_fetches_only_the_target_closure_and_then_works_offline() {
 fn a_seeded_fresh_host_fetches_no_artifacts_and_unpacks_nothing() {
     let fixture = Fixture::new();
     fixture.build();
-    checked(&mut fixture.cli("put"));
+    checked(fixture.cli("put").arg("--seed"));
     let report: Value =
         serde_json::from_slice(&fs::read(fixture.record("publication.json")).unwrap()).unwrap();
     assert!(report["seed"]["files"].as_u64().unwrap() > 0, "{report}");
@@ -996,7 +994,7 @@ fn one_targeted_get_serves_every_package_of_the_workspace() {
     .unwrap();
     fixture.commit();
     fixture.build();
-    checked(&mut fixture.cli("put"));
+    checked(fixture.cli("put").arg("--seed"));
     let dep_entries = || {
         let report: Value =
             serde_json::from_slice(&fs::read(fixture.record("publication.json")).unwrap()).unwrap();
@@ -1016,7 +1014,7 @@ fn one_targeted_get_serves_every_package_of_the_workspace() {
     .unwrap();
     fixture.commit();
     fixture.build();
-    checked(&mut fixture.cli("put"));
+    checked(fixture.cli("put").arg("--seed"));
     assert!(
         fixture
             .server
@@ -1079,7 +1077,7 @@ fn native_objects_of_platform_independent_dependencies_are_published() {
     checked(fixture.cli("build").args(["--", "demo-exe"]));
     let recorded = fs::read_to_string(fixture.record("packages/dep.jsonl")).unwrap();
     assert!(recorded.contains(".o\"]"), "{recorded}");
-    checked(&mut fixture.cli("put"));
+    checked(fixture.cli("put").arg("--seed"));
     fixture.reset_local();
     let packaged = dependency.join(".lake/build");
     if packaged.exists() {
@@ -1097,7 +1095,7 @@ fn an_older_checkout_seeds_from_a_later_commit_and_takes_the_rest_from_the_pool(
     let fixture = Fixture::new();
     let old = fixture.revision();
     fixture.build();
-    checked(&mut fixture.cli("put"));
+    checked(fixture.cli("put").arg("--seed"));
     // Two later publishes take both seed slots.
     for proof in ["Nat.zero_add n", "by omega"] {
         fs::write(
@@ -1107,7 +1105,7 @@ fn an_older_checkout_seeds_from_a_later_commit_and_takes_the_rest_from_the_pool(
         .unwrap();
         fixture.commit();
         fixture.build();
-        checked(&mut fixture.cli("put"));
+        checked(fixture.cli("put").arg("--seed"));
     }
     let newest = fixture.revision();
     checked(
@@ -1146,7 +1144,7 @@ fn module_traces_name_the_recorded_inputs_and_targeted_restores_prefetch_them() 
     let index: Value =
         serde_json::from_slice(&fs::read(fixture.record("modules/demo.json")).unwrap()).unwrap();
     assert_eq!(index["modules"]["Demo.A"], input);
-    checked(&mut fixture.cli("put"));
+    checked(fixture.cli("put").arg("--seed"));
     assert!(
         fixture
             .server
@@ -1173,7 +1171,7 @@ fn module_traces_name_the_recorded_inputs_and_targeted_restores_prefetch_them() 
 fn recording_after_a_seeded_restore_reuses_the_pools_archives() {
     let fixture = Fixture::new();
     fixture.build();
-    checked(&mut fixture.cli("put"));
+    checked(fixture.cli("put").arg("--seed"));
     let published = fs::read_to_string(fixture.record("packages/demo.jsonl")).unwrap();
     fixture.reset_local();
     checked(fixture.cli("get").args(["--seed", "--", "Demo"]));
@@ -1206,7 +1204,7 @@ fn recording_after_a_seeded_restore_reuses_the_pools_archives() {
 fn a_published_tree_restores_and_records_again_without_lake() {
     let fixture = Fixture::new();
     fixture.build();
-    checked(&mut fixture.cli("put"));
+    checked(fixture.cli("put").arg("--seed"));
     let report: Value =
         serde_json::from_slice(&fs::read(fixture.record("publication.json")).unwrap()).unwrap();
     assert!(report["build_files"].as_u64().unwrap() > 0, "{report}");
@@ -1227,109 +1225,60 @@ fn a_published_tree_restores_and_records_again_without_lake() {
     let recorded = log(&checked(fixture.cli("build").args(["--", "Demo"])));
     assert!(recorded.contains("nothing to record"), "{recorded}");
     let writes = fixture.server.writes.lock().unwrap().len();
-    let put = log(&checked(&mut fixture.cli("put")));
+    let put = log(&checked(fixture.cli("put").arg("--seed")));
     assert!(put.contains("is published already"), "{put}");
     assert_eq!(fixture.server.writes.lock().unwrap().len(), writes);
 }
 
 #[test]
-fn internal_builds_share_outputs_and_main_adopts_them_after_a_kernel_replay() {
+fn any_host_shares_what_its_lake_built_by_input_hash() {
     let fixture = Fixture::new();
-    // A worker builds a change no main build published: no CI, so internal.
+    // A host builds, with plain Lake, a change no published build holds.
     let path = fixture.root.join("Demo/A.lean");
     fs::write(
         &path,
         format!(
-            "{}public theorem internal (n : Nat) : n = n := rfl\n",
+            "{}public theorem shared (n : Nat) : n = n := rfl\n",
             fs::read_to_string(&path).unwrap()
         ),
     )
     .unwrap();
     fixture.commit();
-    let internal = |action: &str| {
-        let mut command = fixture.cli(action);
-        command
-            .arg("--internal")
-            .env_remove("GITHUB_ACTIONS")
-            .env_remove("GITHUB_REF")
-            .env_remove("GITHUB_EVENT_NAME");
-        command
-    };
     checked(fixture.lake().args(["build", "--wfail", "Demo"]));
     let writes = fixture.server.writes.lock().unwrap().len();
-    let published = log(&checked(&mut internal("put")));
-    assert!(published.contains("to the internal scope"), "{published}");
+    let published = log(&checked(fixture.cli("put").arg("--seed")));
+    assert!(published.contains("published outputs only"), "{published}");
     let written = fixture.server.writes.lock().unwrap()[writes..].to_vec();
-    assert!(!written.is_empty());
     assert!(
-        written.iter().all(|key| key.contains("/lake-int/")),
+        written.iter().any(|key| key.contains("/out/")),
         "{written:?}"
     );
-    // Main's CI never reads the internal scope but by adoption.
+    // No `build` recorded this commit, so nothing is keyed by it.
     assert!(
-        !fixture
-            .cli("get")
-            .arg("--internal")
-            .status()
-            .unwrap()
-            .success()
+        written.iter().all(|key| !key.contains("/rev/")),
+        "{written:?}"
     );
+    // A later run publishes only what its own Lake builds.
+    checked(&mut fixture.cli("get"));
+    let again = log(&checked(&mut fixture.cli("put")));
     assert!(
-        !fixture
-            .cli("get")
-            .arg("--adopt")
-            .status()
-            .unwrap()
-            .success()
+        again.contains("nothing built since the last put"),
+        "{again}"
     );
-    // Another internal host takes those outputs through Lake's lookups.
+    // Another host takes those outputs through Lake's lookups.
     fixture.reset_local();
-    let restored = log(&checked(internal("get").args(["--", "Demo"])));
+    let restored = log(&checked(fixture.cli("get").args(["--", "Demo"])));
     assert!(!restored.contains("Built Demo"), "rebuilt: {restored}");
-    let fetched = |log: &str| {
-        log.lines()
-            .find_map(|line| {
-                line.strip_prefix("Lake cache: fetched ")?
-                    .strip_suffix(" outputs from the internal scope")?
-                    .parse::<usize>()
-                    .ok()
-            })
-            .unwrap_or_else(|| panic!("no internal fetch count: {log}"))
-    };
-    assert!(fetched(&restored) > 0, "{restored}");
-    // Main adopts them, and publishes only with a later kernel replay of
-    // every adopted module.
-    fixture.reset_local();
-    let recorded = log(&checked(
-        fixture.cli("build").arg("--adopt").args(["--", "Demo"]),
-    ));
-    assert!(!recorded.contains("Built Demo"), "rebuilt: {recorded}");
-    let adopted = fs::read_to_string(fixture.record("adopted.list")).unwrap();
-    assert_eq!(fetched(&recorded), adopted.lines().count(), "{recorded}");
-    let refused = fixture.cli("put").output().unwrap();
-    assert!(!refused.status.success());
-    assert!(log(&refused).contains("--replayed"), "{}", log(&refused));
-    // The replay covers the modules `adopted` lists.
-    let listed = String::from_utf8(checked(&mut fixture.cli("adopted")).stdout).unwrap();
-    assert!(listed.lines().any(|module| module == "Demo.A"), "{listed}");
-    let modules = listed
+    let fetched = restored
         .lines()
-        .map(|module| serde_json::json!({"status": "kernel_replayed", "module": module}))
-        .collect::<Vec<_>>();
-    let report = fixture.temporary.path().join("last-run.json");
-    fs::write(
-        &report,
-        serde_json::to_vec(&serde_json::json!({"status": "kernel_replayed", "results": modules}))
-            .unwrap(),
-    )
-    .unwrap();
-    checked(fixture.cli("put").arg("--replayed").arg(&report));
-    let publication: Value =
-        serde_json::from_slice(&fs::read(fixture.record("publication.json")).unwrap()).unwrap();
-    assert!(
-        publication["adopted"].as_u64().unwrap() > 0,
-        "{publication}"
-    );
+        .find_map(|line| {
+            line.strip_prefix("Lake cache: fetched ")?
+                .strip_suffix(" outputs by input hash")?
+                .parse::<usize>()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no fetch count: {restored}"));
+    assert!(fetched > 0, "{restored}");
 }
 
 #[test]
@@ -1371,7 +1320,7 @@ fn restores_into_a_workspace_lake_has_not_configured_install_without_lock_failur
     checked(fixture.lake().arg("update"));
     fixture.commit();
     fixture.build();
-    checked(&mut fixture.cli("put"));
+    checked(fixture.cli("put").arg("--seed"));
     for _ in 0..3 {
         fixture.reset_local();
         // Drop every package's configuration, as on a fresh checkout.
@@ -1439,7 +1388,7 @@ fn a_dependency_the_pool_already_maps_is_recorded_without_a_replay() {
     fixture.commit();
     let first = log(&checked(fixture.cli("build").args(["--", "Demo"])));
     assert!(!first.contains("without replaying"), "{first}");
-    checked(&mut fixture.cli("put"));
+    checked(fixture.cli("put").arg("--seed"));
     let replayed = fs::read_to_string(fixture.record("packages/git-dep.jsonl")).unwrap();
     // A root-only change: the pin's map in the pool holds everything.
     fs::write(
@@ -1462,7 +1411,7 @@ fn a_dependency_the_pool_already_maps_is_recorded_without_a_replay() {
         rows(&fs::read_to_string(fixture.record("packages/git-dep.jsonl")).unwrap()),
         rows(&replayed)
     );
-    checked(&mut fixture.cli("put"));
+    checked(fixture.cli("put").arg("--seed"));
 }
 
 /// `PATH` without any directory holding `lean` or `lake`.
@@ -1523,7 +1472,7 @@ fn a_missing_toolchain_installs_from_its_release_then_from_the_pool() {
         format!("{}\n", home.join("bin").display())
     );
     checked(cli("build").args(["--", "Demo"]));
-    let published = log(&checked(&mut cli("put")));
+    let published = log(&checked(cli("put").arg("--seed")));
     assert!(published.contains("published Lean"), "{published}");
     let key = format!(
         "lake/toolchains/{}-{}/{}",
@@ -1540,7 +1489,7 @@ fn a_missing_toolchain_installs_from_its_release_then_from_the_pool() {
         "{record}"
     );
     // Published once.
-    let again = log(&checked(&mut cli("put")));
+    let again = log(&checked(cli("put").arg("--seed")));
     assert!(!again.contains("published Lean"), "{again}");
 
     // A fresh host: no toolchain, no cache.
@@ -1581,6 +1530,6 @@ fn a_missing_toolchain_installs_from_its_release_then_from_the_pool() {
     assert!(home.join("bin/lake").is_file());
     // The receipt a build records names the scope the restore predicted.
     checked(cli("build").args(["--", "Demo"]));
-    let rebuilt = log(&checked(&mut cli("put")));
+    let rebuilt = log(&checked(cli("put").arg("--seed")));
     assert!(!rebuilt.contains("published Lean"), "{rebuilt}");
 }

@@ -17,8 +17,8 @@ cov-lake-cache get --seed --repository example/proofs -- MyLibrary
 # Or fetch only what one target needs:
 cov-lake-cache get --repository example/proofs -- MyLibrary.Module
 cov-lake-cache build --repository example/proofs -- MyLibrary
-# Run the repository's remaining correctness checks, then on trusted main CI:
-cov-lake-cache put --repository example/proofs
+# Share the build; where the next fresh hosts start (main), with its seed:
+cov-lake-cache put --seed --repository example/proofs
 ```
 
 ## Pool
@@ -85,8 +85,11 @@ runs.
   Mathlib and Aesop, so `build` adds each one the package's build folder
   traces, and executables that link them need not compile them again. A failed build removes the previous receipt. Recording
   requires a clean checkout; put generated output under an ignored directory.
-- `put` requires that receipt from the same revision, toolchain, platform and
-  CI run. It never builds. For each recorded package it builds the revision
+- `put` never builds. It publishes each output this host's Lake built itself
+  by input hash (below), with or without a receipt. With a receipt from the
+  same revision, toolchain, platform and CI run, it also publishes the
+  commit's records; a stale or changed receipt publishes nothing. For each
+  recorded package it builds the revision
   map locally, diffs it against the nearest published ancestor's map, uploads
   the artifacts the diff names that the pool lacks, then the map nodes the
   pool lacks, children first, and only then the revision pointer. A Git
@@ -100,10 +103,10 @@ runs.
   "targets": [...]}` naming the targets `build` checked; then the pointer
   `lake/src/rev/<owner>/<repo>/<commit>`, in that order. Blobs the nearest
   published first-parent ancestor's tree holds are not checked again.
-- `put` then publishes the commit's seed (below), unless one of the
+- `put --seed` then publishes the commit's seed (below), unless one of the
   repository's two seed slots already holds it.
 - `get` restores this repository's packages from `HEAD`, else from the
-  nearest of its 64 first-parent ancestors with a published build, and
+  newest of its 64 ancestors, over every parent, with a published build, and
   prints which commit it used. `COVALENCE_LAKE_COMMITS` (full revisions,
   comma- or newline-separated, nearest first) names the commits to search
   instead, for a checkout without the repository's history, such as a
@@ -165,8 +168,8 @@ the files, so this costs no space.
 ## Seeds
 
 A fresh host otherwise has Lake fetch and unpack each module on its own: about
-27,000 requests and archive decodes for one large repository. `put` also
-publishes the recorded build as a seed: for every input `build` checked, Lake's
+27,000 requests and archive decodes for one large repository. `put --seed`
+also publishes the recorded build as a seed: for every input `build` checked, Lake's
 local output file, without its archive, and the unpacked artifacts and native
 objects it names, as 16 Zstandard tar streams. Executables stay in the pool:
 a library restore needs none, and a build that does fetches each in one
@@ -199,53 +202,24 @@ still checks every trace against the sources. A seed that is missing, or fails
 its check because a publish overwrote it mid-read, is reported and the restore
 continues from the pool.
 
-## Internal scope
+## Outputs by input hash
 
-Prove workers, pull requests and people's machines are internal hosts. Each
-publishes the outputs its Lake built itself, committed or not, keyed by Lake's
-own input hash, and takes any other internal host's:
-
-```sh
-lake build Demo                          # any build, with LAKE_ARTIFACT_CACHE=true
-cov-lake-cache put --internal            # publish what this host built
-cov-lake-cache get --internal -- Demo    # elsewhere: Lake takes them instead of building
-```
-
-They live under `lake-int/<os>-<arch>/<toolchain scope>/`: `out/<package>/<input>.json`
-holds Lake's output record and each artifact's content ID, and `cas/` the
-artifacts `main`'s store lacks. A lifecycle rule deletes them 14 days after they
-are written; a missing entry or artifact only makes Lake build. `--internal`
-writes nothing else: no revision map, seed, build manifest, source tree, Git
-pack or toolchain, and it is refused in `main`'s CI.
-
-Lake asks for the outputs of each input its cache lacks through the bundled
-overlay, which reads `LAKE_OUTPUTS_ENDPOINT`; stock Lake never asks, and builds.
-
-### Adoption on `main`
-
-`main`'s CI reads the internal scope only by adopting outputs:
+Every host shares what its Lake built, keyed by Lake's own input hash:
+prove workers, pull requests, `main` and people's machines alike.
 
 ```sh
-cov-lake-cache get                       # the pool's mappings only: no targets, so no build
-cov-lake-cache build --adopt -- Demo     # Lake takes internal outputs; lists them
-cov-lake-cache adopted > modules.txt     # the modules those outputs belong to
-cov-kernel-checker lean-check replay-built --project . --modules modules.txt
-cov-lake-cache put --replayed .lake/declaration-replay/last-run.json
+lake build Demo                 # any build, with LAKE_ARTIFACT_CACHE=true
+cov-lake-cache put              # publish what this host's Lake built
+cov-lake-cache get -- Demo      # elsewhere: Lake takes them instead of building
 ```
 
-The restore names no targets: `get -- Demo` builds every module the pool
-lacks before `build --adopt` runs, which then finds nothing to adopt.
-
-`put` publishes a build that adopted outputs only when that replay ran after the
-build and passed for every module an adopted input belongs to. The replay proves
-each adopted `.olean`'s declarations sound in the Lean kernel. It does not prove:
-
-- that the `.olean` is what `main`'s source elaborates to: an internal host could
-  publish other statements, with valid proofs, for the same input;
-- anything about native code: an adopted input's `.c`, `.ir` and objects reach
-  `main`'s pool, and executables linked from them, as an internal host built them.
-
-Both are accepted under the internal hosts' trust.
+`put` writes `lake/<scope>/out/<package>/<input>.json`, Lake's output record
+and each artifact's content ID, for every output Lake built itself, committed
+or not, and the artifacts the pool lacks. Only a clean commit's recorded
+build gets commit-keyed records. Every Lake run of `get` and `build` asks for
+the outputs of each input its cache lacks through the bundled overlay, which
+reads `LAKE_OUTPUTS_ENDPOINT`; stock Lake never asks, and builds. Each prints
+how many outputs it fetched that way.
 
 ## Toolchain
 
@@ -346,10 +320,8 @@ only add its fee. `COVALENCE_S3_ACCELERATE` is `auto` (the default), `on` or
 instance metadata answers as EC2's does within 40 ms. A web identity token
 counts only when an EKS cluster issued it (`https://oidc.eks.<region>.amazonaws.com`),
 since CI and clusters elsewhere federate into AWS with their own issuers. An `AWS_ENDPOINT_URL` or
-profile `endpoint_url` overrides acceleration. GitHub publication
-requires a main push or manual main run in the named repository. Bucket
-permissions remain the actual write authorization boundary. Only trusted
-writers may publish maps and artifacts.
+profile `endpoint_url` overrides acceleration. Bucket permissions decide who
+writes.
 
 While Lake runs under this command, it stands in for `curl`. It serves pool
 artifacts named by the maps it installed and passes requests for other

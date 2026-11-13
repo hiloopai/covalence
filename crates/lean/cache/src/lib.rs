@@ -8,10 +8,10 @@ mod builds;
 mod dependencies;
 pub mod error;
 mod gc;
-mod internal;
 mod local;
 mod mapping;
 mod modules;
+mod outputs;
 mod overlay;
 pub mod pool;
 mod project;
@@ -41,9 +41,6 @@ enum Action {
     Gc,
     /// Print the targets a change from `--base` can affect.
     Scope,
-    /// Print the modules `build --adopt` took internal outputs for, one per
-    /// line, for the kernel replay `put --replayed` requires.
-    Adopted,
 }
 
 #[derive(Parser)]
@@ -61,7 +58,8 @@ struct Cli {
     #[arg(long)]
     record: Option<PathBuf>,
     /// With `get`, fill a host that never installed this repository's
-    /// mappings from the restored commit's seed first.
+    /// mappings from the restored commit's seed first. With `put`, publish
+    /// this build's seed for such hosts.
     #[arg(long)]
     seed: bool,
     /// With `scope`, the revision the change starts from.
@@ -71,19 +69,6 @@ struct Cli {
     /// never reads, such as `docs/**`.
     #[arg(long)]
     exclude: Vec<String>,
-    /// With `get`, `build` and `put` on a prove worker, a pull request or
-    /// another internal host: take and publish outputs any internal build
-    /// made, by Lake's input hash. `main` never reads them but by `--adopt`.
-    #[arg(long)]
-    internal: bool,
-    /// With `build` on `main`: let Lake take internal outputs, which `put`
-    /// publishes only with a kernel replay of every adopted module.
-    #[arg(long)]
-    adopt: bool,
-    /// With `put` after `build --adopt`: the `last-run.json` of a
-    /// `cov-kernel-checker lean-check replay-built` run after the build.
-    #[arg(long)]
-    replayed: Option<PathBuf>,
     #[arg(last = true, allow_hyphen_values = true)]
     targets: Vec<String>,
 }
@@ -106,63 +91,36 @@ fn execute(cli: Cli) -> Result<()> {
             .or_else(|| env::var("GITHUB_REPOSITORY").ok())
             .unwrap_or_default(),
         workspace,
-        lookups: if cli.internal {
-            project::Lookups::Internal
-        } else if cli.adopt {
-            project::Lookups::Adopt
-        } else {
-            project::Lookups::None
-        },
     };
-    let main_ci = project.main_ci();
-    // `main` reads the internal scope only through adoption's check.
-    if cli.internal && (main_ci || !matches!(cli.action, Action::Get | Action::Build | Action::Put))
-    {
-        return Err(invalid(
-            "--internal applies to get, build and put outside main's CI",
-        ));
-    }
-    if cli.adopt && !(main_ci && matches!(cli.action, Action::Build)) {
-        return Err(invalid("--adopt applies to build in a trusted main CI run"));
-    }
-    if cli.replayed.is_some() && (cli.internal || !matches!(cli.action, Action::Put)) {
-        return Err(invalid("--replayed applies to put of main's build"));
-    }
     if !matches!(cli.action, Action::Scope) && (cli.base.is_some() || !cli.exclude.is_empty()) {
         return Err(invalid("--base and --exclude apply to scope"));
     }
-    if matches!(cli.action, Action::Gc | Action::Adopted) && !cli.targets.is_empty() {
-        return Err(invalid("gc and adopted accept no targets"));
+    if matches!(cli.action, Action::Gc) && !cli.targets.is_empty() {
+        return Err(invalid("gc accepts no targets"));
     }
-    if cli.seed && !matches!(cli.action, Action::Get) {
-        return Err(invalid("--seed applies to get"));
+    if cli.seed && !matches!(cli.action, Action::Get | Action::Put) {
+        return Err(invalid("--seed applies to get and put"));
     }
     if matches!(cli.action, Action::Put) && !cli.targets.is_empty() {
         return Err(invalid(
             "put publishes a recorded build and accepts no targets",
         ));
     }
-    if matches!(cli.action, Action::Put) && !cli.internal && !main_ci {
-        return Err(invalid("publication requires a trusted main CI run"));
-    }
     if project.repository.is_empty()
         && !matches!(
             cli.action,
-            Action::Dependencies | Action::Gc | Action::Scope | Action::Adopted
+            Action::Dependencies | Action::Gc | Action::Scope
         )
     {
         return Err(invalid("--repository or GITHUB_REPOSITORY is required"));
     }
     let cache = project.cache_dir()?;
     // gc itself takes the lock exclusively.
-    let in_use = (!matches!(cli.action, Action::Gc | Action::Scope | Action::Adopted))
+    let in_use = (!matches!(cli.action, Action::Gc | Action::Scope))
         .then(|| gc::in_use(&cache))
         .transpose()?;
     let store = || {
-        let mut kv = storage::store()?;
-        if cli.internal {
-            kv = std::sync::Arc::new(internal::InternalKv::new(kv));
-        }
+        let kv = storage::store()?;
         // A restore checks the dependencies out while its seed downloads.
         if !matches!(cli.action, Action::Put | Action::Get) {
             sources::materialize(&project, &*kv)?;
@@ -185,37 +143,48 @@ fn execute(cli: Cli) -> Result<()> {
         match cli.action {
             Action::Dependencies => dependencies::fetch(&project, &store()?, &cli.targets),
             Action::Build => {
-                internal::count_fetches(&project)?;
+                outputs::start(&project)?;
                 project.build(&store()?, &cli.targets)?;
-                internal::report_fetches(&project)
-            }
-            Action::Put if cli.internal => {
-                let scope = project.identity()?.scope;
-                internal::publish(&project, store()?, &scope, &project.packages()?)
+                outputs::report_fetches();
+                Ok(())
             }
             Action::Put => {
-                let kv = store()?;
-                storage::publish(&project, &kv, cli.replayed.as_deref())?;
-                project.lean.publish(&kv)
+                // Commit-keyed records come only from a build `build`
+                // recorded at this clean commit, or found published already;
+                // a stale or changed record publishes nothing.
+                let receipt = project.record.join("success.json").is_file();
+                if receipt {
+                    project.receipt()?;
+                }
+                let recorded = receipt || project.published().is_file();
+                let built = outputs::built(&project)?;
+                if built.is_empty() && !recorded {
+                    println!("Lake cache: nothing built since the last put");
+                    Ok(())
+                } else {
+                    let kv = store()?;
+                    let scope = project.identity()?.scope;
+                    outputs::publish(&project, kv.clone(), &scope, &built)?;
+                    outputs::published(&project)?;
+                    if recorded {
+                        storage::publish(&project, &kv, cli.seed)?;
+                        project.lean.publish(&kv)
+                    } else {
+                        println!(
+                            "Lake cache: no recorded build of this commit; published outputs only"
+                        );
+                        Ok(())
+                    }
+                }
             }
             Action::Get => {
-                internal::count_fetches(&project)?;
+                outputs::start(&project)?;
                 restore::restore(&project, &store()?, &cli.targets, cli.seed, started)?;
-                internal::report_fetches(&project)?;
+                outputs::report_fetches();
                 drop(in_use);
                 gc::after_restore(&cache)
             }
             Action::Gc => gc::collect(&cache),
-            Action::Adopted => {
-                if let Some(adoption) =
-                    internal::Adoption::load(&internal::adoption_list(&project))?
-                {
-                    for module in adoption.modules(&project, &project.packages()?)? {
-                        println!("{module}");
-                    }
-                }
-                Ok(())
-            }
             Action::Scope => {
                 let base = cli.base.ok_or_else(|| invalid("scope requires --base"))?;
                 let targets = scope::scope(&project, &base, &cli.exclude, &cli.targets)?;

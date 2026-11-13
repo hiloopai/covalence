@@ -447,10 +447,10 @@ fn publish_modules(
     index.put(publisher.kv, &key)
 }
 
-/// Publish the recorded build. When `build --adopt` took internal outputs,
-/// only with `replayed`, a kernel replay of every adopted module after the
-/// build (see `internal::Adoption` for what that proves and what it does not).
-pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>, replayed: Option<&Path>) -> Result<()> {
+/// Publish the recorded build of this clean commit: its revision maps,
+/// module indexes, Git packs, build manifest and source tree, and with
+/// `seed`, a seed for hosts that never restored this repository.
+pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>, seed: bool) -> Result<()> {
     let started = Instant::now();
     if let Ok(published) = fs::read_to_string(project.published())
         && published == project.git(&["rev-parse", "HEAD"])?
@@ -459,26 +459,6 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>, replayed: Option<&Pat
         return Ok(());
     }
     let receipt = project.receipt()?;
-    let list = crate::internal::adoption_list(project);
-    let adopted = match crate::internal::Adoption::load(&list)? {
-        Some(adoption) => {
-            let report = replayed.ok_or_else(|| {
-                invalid(format!(
-                    "the build adopted {} internal outputs; publish them with --replayed and a kernel replay of their modules",
-                    adoption.inputs.len()
-                ))
-            })?;
-            let modules = adoption.modules(project, &project.packages()?)?;
-            adoption.check(&modules, report, &list)?;
-            println!(
-                "Lake cache: a kernel replay passed for the {} modules of {} adopted internal outputs",
-                modules.len(),
-                adoption.inputs.len()
-            );
-            adoption.inputs.len()
-        }
-        None => 0,
-    };
     let scope = &receipt.identity.scope;
     let remote = pool::store(kv.clone(), scope)?;
     let local = Local::open(project)?;
@@ -511,7 +491,9 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>, replayed: Option<&Pat
     }
     let git_packs = sources::publish_packs(project, &**kv)?;
     // A seed only shortcuts the maps just published.
-    let seed = seed::publish(project, &**kv, &receipt, local.directory())?;
+    let seed = seed
+        .then(|| seed::publish(project, &**kv, &receipt, local.directory()))
+        .transpose()?;
     let build = match crate::builds::Manifest::load(&project.build_manifest())? {
         Some(manifest) if crate::builds::tree(project)?.as_ref() == Some(&manifest.tree) => {
             let key = crate::builds::key(project, scope, &manifest.lake, &manifest.tree)?;
@@ -540,7 +522,6 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>, replayed: Option<&Pat
         "sources": sources,
         "seed": seed,
         "build_files": build,
-        "adopted": adopted,
         "git_packs": git_packs,
         "seconds": started.elapsed().as_secs_f64(),
     }))?;
