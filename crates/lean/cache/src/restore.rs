@@ -7,8 +7,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
-    fs::{self, File},
+    env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
@@ -531,23 +530,25 @@ fn index() -> Result<BTreeMap<String, Sha256>> {
 }
 
 /// Stream one artifact from the pool into a new file at `path`.
+/// Downloads `cid` to `path` whole or not at all. Lake skips a download whose
+/// path exists and reads the file at once, so a file written in place could
+/// be read half-written by another build on the host: `leantar` then calls
+/// the archive corrupted.
 fn fetch(store: &Blobs, cid: &Sha256, path: &Path) -> Result<Option<u64>> {
-    let mut file = File::create_new(path).operation("create Lake artifact")?;
-    let found = store.get_to(cid, &mut file).and_then(|found| {
-        file.flush().operation("flush Lake artifact")?;
-        Ok(found)
-    });
-    match found {
-        Ok(Some(bytes)) => Ok(Some(bytes)),
-        Ok(None) => {
-            fs::remove_file(path).operation("remove missing artifact")?;
-            eprintln!("{cid} is missing from the pool");
-            Ok(None)
-        }
-        Err(error) => {
-            fs::remove_file(path).operation("remove incomplete artifact")?;
-            Err(error)
-        }
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("artifact has no parent"))?;
+    let mut pending = tempfile::NamedTempFile::new_in(parent).operation("stage Lake artifact")?;
+    let Some(bytes) = store.get_to(cid, &mut pending)? else {
+        eprintln!("{cid} is missing from the pool");
+        return Ok(None);
+    };
+    pending.flush().operation("flush Lake artifact")?;
+    match pending.persist_noclobber(path) {
+        Ok(_) => Ok(Some(bytes)),
+        // Another download placed the same content first.
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(Some(bytes)),
+        Err(error) => Err(error.error).operation("place Lake artifact"),
     }
 }
 
@@ -708,6 +709,33 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_download_appears_whole_or_not_at_all() {
+        use covalence_kv_memory::MemoryKv;
+        let blobs = Blobs::new(MemoryKv::default().into_dyn(), "lake/test/cas");
+        let staging = tempfile::tempdir().unwrap();
+        let source = staging.path().join("source");
+        fs::write(&source, vec![7u8; 1 << 20]).unwrap();
+        let (cid, _) = crate::blobs::hash_file(&source).unwrap();
+        blobs.put_file(&cid, &source).unwrap();
+        let artifacts = tempfile::tempdir().unwrap();
+        let path = artifacts.path().join("0123456789abcdef.ltar");
+        assert_eq!(fetch(&blobs, &cid, &path).unwrap(), Some(1 << 20));
+        assert_eq!(fs::read(&path).unwrap(), fs::read(&source).unwrap());
+        // A second download of the same content finds it placed.
+        assert_eq!(fetch(&blobs, &cid, &path).unwrap(), Some(1 << 20));
+        // A miss leaves nothing behind, not even a staged file.
+        let missing = artifacts.path().join("fedcba9876543210.ltar");
+        let (other, _) = crate::blobs::hash_file(&staging.path().join("source")).unwrap();
+        let empty = Blobs::new(MemoryKv::default().into_dyn(), "lake/test/cas");
+        assert_eq!(fetch(&empty, &other, &missing).unwrap(), None);
+        let names: Vec<_> = fs::read_dir(artifacts.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["0123456789abcdef.ltar"]);
     }
 
     #[test]
