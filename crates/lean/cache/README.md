@@ -66,6 +66,35 @@ repositories coincide when their bytes do. Input hashes include no checkout
 path. A revision map, not the pool, says which output an input has: two
 builds of one input can differ, for example in logged messages.
 
+Shared `out/` entries use atomic create-if-absent publication. Output equality
+revision 1 compares actual SHA-256 constituent bytes, module mode and optional
+output presence. An archive and expanded outputs can agree even when their
+packing differs. Ordered olean parts and the ilean, IR signature, IR, C and
+bitcode roles remain distinct; malformed or unresolved outputs fail comparison.
+Generic descriptors follow the existing mapping format: null and Boolean
+metadata, numeric or string artifact references, and recursive containers.
+Unknown module shapes cannot fall back to generic equality.
+Module artifact descriptors must be strings; numeric references remain valid
+only in generic mappings. An archive's role descriptors must use the canonical
+role extensions and each role path must occur exactly once in its expected
+directory, so eager placement and directory-specific Lake extraction agree.
+Wrong-directory entries and duplicate role paths are rejected in either order.
+The archive entries must exactly match the declared role manifest; undeclared
+entries are rejected because Lake extracts them even when eager placement
+ignores them. The trace is handled separately and its diagnostics are excluded.
+Archive normalization supports an archive-only descriptor or a module record;
+nested archive or module descriptors fail explicitly.
+
+This equality deliberately excludes diagnostic logs, timing, extraction-supplied
+trace hashes, service routing and archive packaging. Logged messages may differ
+between builds with the same actual outputs; the first publisher's complete
+record and diagnostics stay unchanged. A different constituent or module mode
+is a conflict, and unsupported atomic creation fails without a replacement put.
+This comparison does not establish successful-compiler provenance or validate
+legacy stripped archive bindings. A contradictory retained archive input hash
+is rejected before that archive's outputs are installed; a matching or absent
+header is not proof of which input produced the bytes.
+
 Patched and stock `leantar` both write `LTR4` archives and report the same
 version, and stock `leantar` decodes the patched opcodes `0xa0` and `0xb0` as
 constructors instead of rejecting them. The executable is therefore part of

@@ -35,6 +35,8 @@ use crate::{
     project::Project,
 };
 
+mod normalized;
+
 pub(crate) fn key(scope: &str, package: &str, input: &str) -> Result<String> {
     for name in [scope, package] {
         mapping::segment_path(name)?;
@@ -111,12 +113,6 @@ pub(crate) fn publish(
     let blobs = crate::pool::blobs(kv.clone(), scope)?;
     let published = crate::storage::parallel(found, |_, (package, input, record)| {
         let key = key(scope, package, input)?;
-        if kv
-            .exists(key.as_bytes())
-            .map_err(store_error("check output"))?
-        {
-            return Ok(false);
-        }
         let mut artifacts = BTreeMap::new();
         for name in mapping::names(&record["data"])? {
             let path = cache.join("artifacts").join(&name);
@@ -135,9 +131,9 @@ pub(crate) fn publish(
             record: record.clone(),
             artifacts,
         };
-        kv.put(key.as_bytes(), Bytes::from(encode(&entry)?))
-            .map_err(store_error("publish output"))?;
-        Ok(true)
+        publish_entry(kv.as_ref(), &blobs, &key, input, &entry, |name| {
+            fs::read(cache.join("artifacts").join(name)).operation("read output constituent")
+        })
     })?;
     println!(
         "Lake cache: published {} of the {} outputs this host built in {:.1} s",
@@ -146,6 +142,51 @@ pub(crate) fn publish(
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// Atomically retain the first output. A losing publisher resolves actual
+/// constituents before accepting an idempotent retry; conflicts never replace
+/// the incumbent, including its diagnostics and routing record.
+fn publish_entry(
+    kv: &dyn Kv,
+    blobs: &crate::blobs::Blobs,
+    key: &str,
+    input: &str,
+    entry: &Entry,
+    load: impl FnMut(&str) -> Result<Vec<u8>>,
+) -> Result<bool> {
+    let candidate = normalized::entry(entry, input, load)?;
+    if kv
+        .put_new(key.as_bytes(), Bytes::from(encode(entry)?))
+        .map_err(store_error("create output"))?
+    {
+        return Ok(true);
+    }
+    let incumbent = kv
+        .get(key.as_bytes())
+        .map_err(store_error("read incumbent output"))?
+        .ok_or_else(|| {
+            invalid(format!(
+                "output {key} disappeared after conditional creation"
+            ))
+        })?;
+    let incumbent: Entry = json(&incumbent)?;
+    let existing = normalized::entry(&incumbent, input, |name| {
+        let cid: Sha256 = incumbent.artifacts[name]
+            .parse()
+            .map_err(|_| invalid("incumbent output names an invalid CID"))?;
+        let mut bytes = Vec::new();
+        blobs
+            .get_to(&cid, &mut bytes)?
+            .ok_or_else(|| invalid(format!("incumbent constituent {name} is missing")))?;
+        Ok(bytes)
+    })?;
+    if candidate != existing {
+        return Err(invalid(format!(
+            "conflicting outputs for {key}; incumbent retained"
+        )));
+    }
+    Ok(false)
 }
 
 fn store_error(
@@ -544,5 +585,172 @@ mod tests {
         );
         assert!(key("linux-x86_64/s", "demo", "HEAD").is_err());
         assert!(key("linux-x86_64/s", "../demo", "0123456789abcdef").is_err());
+    }
+}
+
+#[cfg(test)]
+mod atomic_tests {
+    use super::*;
+    use covalence_kv_memory::MemoryKv;
+    use covalence_kv_trait::{KvFuture, ready};
+    use std::sync::Barrier;
+
+    fn artifact_entry(byte: u8) -> (Entry, BTreeMap<String, Vec<u8>>) {
+        let name = format!("{byte:016x}.o");
+        let files = BTreeMap::from([(name.clone(), vec![byte; 32])]);
+        let mut hashing = crate::blobs::Hashing::new(Vec::new());
+        hashing.write_all(&files[&name]).unwrap();
+        let (_, digest, _) = hashing.finish();
+        let cid = crate::blobs::cid(&digest).unwrap();
+        (
+            Entry {
+                record: serde_json::json!({"data": name, "log": "first diagnostic"}),
+                artifacts: BTreeMap::from([(name, cid.to_string())]),
+            },
+            files,
+        )
+    }
+
+    fn upload(blobs: &crate::blobs::Blobs, entry: &Entry, files: &BTreeMap<String, Vec<u8>>) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in files {
+            let path = dir.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            blobs
+                .put_file(&entry.artifacts[name].parse().unwrap(), &path)
+                .unwrap();
+        }
+    }
+
+    fn attempt(
+        kv: &dyn Kv,
+        blobs: &crate::blobs::Blobs,
+        entry: &Entry,
+        files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<bool> {
+        publish_entry(
+            kv,
+            blobs,
+            "test/output",
+            "0123456789abcdef",
+            entry,
+            |name| {
+                files
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| invalid("missing candidate file"))
+            },
+        )
+    }
+
+    #[test]
+    fn concurrent_equal_outputs_are_idempotent_and_preserve_the_first_record() {
+        let kv = MemoryKv::default().into_dyn();
+        let blobs = crate::pool::blobs(kv.clone(), "test").unwrap();
+        let (entry, files) = artifact_entry(1);
+        upload(&blobs, &entry, &files);
+        let barrier = Barrier::new(2);
+        let mut other = Entry {
+            record: entry.record.clone(),
+            artifacts: entry.artifacts.clone(),
+        };
+        other.record["log"] = serde_json::json!("different diagnostic");
+        other.record["service"] = serde_json::json!("another route");
+        let results = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                attempt(kv.as_ref(), &blobs, &entry, &files)
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                attempt(kv.as_ref(), &blobs, &other, &files)
+            });
+            (
+                first.join().unwrap().unwrap(),
+                second.join().unwrap().unwrap(),
+            )
+        });
+        assert_ne!(results.0, results.1);
+        let expected = if results.0 { &entry } else { &other };
+        assert_eq!(
+            kv.get(b"test/output").unwrap().unwrap().as_ref(),
+            encode(expected).unwrap()
+        );
+        let before = kv.get(b"test/output").unwrap();
+        assert!(!attempt(kv.as_ref(), &blobs, &other, &files).unwrap());
+        assert_eq!(kv.get(b"test/output").unwrap(), before);
+    }
+
+    #[test]
+    fn concurrent_conflicts_keep_the_winner_and_never_replace_it() {
+        let kv = MemoryKv::default().into_dyn();
+        let blobs = crate::pool::blobs(kv.clone(), "test").unwrap();
+        let (entry, files) = artifact_entry(1);
+        let (other, other_files) = artifact_entry(2);
+        upload(&blobs, &entry, &files);
+        upload(&blobs, &other, &other_files);
+        let barrier = Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                attempt(kv.as_ref(), &blobs, &entry, &files)
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                attempt(kv.as_ref(), &blobs, &other, &other_files)
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_ne!(results.0.is_ok(), results.1.is_ok());
+        let (winner, loser, loser_files) = if results.0.is_ok() {
+            (&entry, &other, &other_files)
+        } else {
+            (&other, &entry, &files)
+        };
+        let before = kv.get(b"test/output").unwrap();
+        assert_eq!(before.as_ref().unwrap().as_ref(), encode(winner).unwrap());
+        assert!(
+            attempt(kv.as_ref(), &blobs, loser, loser_files)
+                .unwrap_err()
+                .to_string()
+                .contains("conflicting outputs")
+        );
+        assert_eq!(kv.get(b"test/output").unwrap(), before);
+    }
+
+    struct NoConditionalCreate;
+    impl Kv for NoConditionalCreate {
+        fn get(&self, _: &[u8]) -> std::result::Result<Option<Bytes>, covalence_kv_trait::Error> {
+            panic!("unsupported create must not fall back to reading")
+        }
+        fn put(&self, _: &[u8], _: Bytes) -> std::result::Result<(), covalence_kv_trait::Error> {
+            panic!("unsupported create must not fall back to replacement")
+        }
+        fn aget<'a>(&'a self, key: &'a [u8]) -> KvFuture<'a, Option<Bytes>> {
+            ready(self.get(key))
+        }
+        fn aput<'a>(&'a self, key: &'a [u8], value: Bytes) -> KvFuture<'a, ()> {
+            ready(self.put(key, value))
+        }
+    }
+
+    #[test]
+    fn unsupported_atomic_create_and_missing_incumbent_constituents_fail_closed() {
+        let kv = MemoryKv::default().into_dyn();
+        let blobs = crate::pool::blobs(kv.clone(), "test").unwrap();
+        let (entry, files) = artifact_entry(1);
+        assert!(attempt(&NoConditionalCreate, &blobs, &entry, &files).is_err());
+        // A legacy mapping whose CAS bytes vanished cannot establish equality,
+        // even when its JSON/CID claims happen to match the local candidate.
+        kv.put(b"test/output", Bytes::from(encode(&entry).unwrap()))
+            .unwrap();
+        let before = kv.get(b"test/output").unwrap();
+        assert!(
+            attempt(kv.as_ref(), &blobs, &entry, &files)
+                .unwrap_err()
+                .to_string()
+                .contains("missing")
+        );
+        assert_eq!(kv.get(b"test/output").unwrap(), before);
     }
 }

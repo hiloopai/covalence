@@ -402,21 +402,70 @@ fn incremental_publish_sends_only_the_difference_and_restore_reuses_proofs() {
     let named = |report: &Value| report["artifacts"].as_u64().unwrap();
     assert!(named(&first) > 2);
     let before = fixture.server.writes.lock().unwrap().len();
+    let conditional_before = fixture.server.conditional_writes.lock().unwrap().len();
+    let incumbents = fixture
+        .server
+        .writes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|key| key.contains("/out/"))
+        .map(|key| {
+            let path = fixture
+                .temporary
+                .path()
+                .join("s3")
+                .join(key.trim_start_matches('/'));
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert!(!incumbents.is_empty());
     let warm = fixture.publish();
     assert_eq!(warm["changed"], 0);
     assert_eq!(warm["uploaded"], 0);
     assert_eq!(warm["nodes"], 0);
-    // Builds: only the revision pointer. Sources: the tree, record and pointer.
+    // Warm publication attempts atomic creation of existing output mappings.
+    // Each must fail its precondition, leaving every incumbent byte unchanged.
+    let conditionals = fixture.server.conditional_writes.lock().unwrap();
+    let rejected = conditionals[conditional_before..]
+        .iter()
+        .filter(|(key, _)| key.contains("/out/"))
+        .collect::<Vec<_>>();
+    assert_eq!(rejected.len(), incumbents.len(), "{rejected:?}");
+    assert!(
+        rejected.iter().all(|(_, status)| *status == 412),
+        "{rejected:?}"
+    );
+    for (path, bytes) in &incumbents {
+        assert_eq!(&fs::read(path).unwrap(), bytes);
+    }
+    // Actual build writes: only the revision pointer. Sources: tree/record/pointer.
     let writes = fixture.server.writes.lock().unwrap();
     let pool = writes[before..]
         .iter()
         .filter(|key| !key.contains("/lake/src/"))
         .collect::<Vec<_>>();
-    assert_eq!(pool.len(), 1, "{pool:?}");
-    assert!(pool[0].contains("/rev/"));
+    let output_attempts = pool
+        .iter()
+        .filter(|key| key.contains("/out/"))
+        .collect::<Vec<_>>();
+    assert_eq!(output_attempts.len(), rejected.len(), "{output_attempts:?}");
+    assert!(output_attempts.iter().all(|key| {
+        rejected
+            .iter()
+            .any(|(rejected, _)| rejected.as_str() == key.as_str())
+    }));
+    let actual = pool
+        .iter()
+        .filter(|key| !key.contains("/out/"))
+        .collect::<Vec<_>>();
+    assert_eq!(actual.len(), 1, "{actual:?}");
+    assert!(actual[0].contains("/rev/"));
     let sources = writes.len() - before - pool.len();
     assert_eq!(sources, 3, "{:?}", &writes[before..]);
     drop(writes);
+    drop(conditionals);
     let path = fixture.root.join("Demo/A.lean");
     fs::write(
         &path,

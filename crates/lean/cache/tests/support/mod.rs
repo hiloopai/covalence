@@ -20,6 +20,7 @@ use tokio::sync::oneshot;
 pub struct Server {
     pub endpoint: String,
     pub writes: Arc<Mutex<Vec<String>>>,
+    pub conditional_writes: Arc<Mutex<Vec<(String, u16)>>>,
     pub reads: Arc<Mutex<Vec<String>>>,
     pub deny: Arc<AtomicBool>,
     stop: Option<oneshot::Sender<()>>,
@@ -37,13 +38,26 @@ impl Server {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let writes = Arc::new(Mutex::new(Vec::new()));
         let reads = Arc::new(Mutex::new(Vec::new()));
+        let conditional_writes = Arc::new(Mutex::new(Vec::new()));
+        let conditional_log = conditional_writes.clone();
         let deny = Arc::new(AtomicBool::new(false));
         let (log, read_log, fail) = (writes.clone(), reads.clone(), deny.clone());
         let handle = move |request: hyper::Request<hyper::body::Incoming>| {
-            let (service, log, read_log, fail) =
-                (service.clone(), log.clone(), read_log.clone(), fail.clone());
+            let (service, log, read_log, fail, conditional_log) = (
+                service.clone(),
+                log.clone(),
+                read_log.clone(),
+                fail.clone(),
+                conditional_log.clone(),
+            );
             async move {
                 let write = request.method() == "PUT";
+                let conditional = write
+                    && request
+                        .headers()
+                        .get("if-none-match")
+                        .is_some_and(|value| value == "*");
+                let path = request.uri().path().to_owned();
                 if write {
                     log.lock().unwrap().push(request.uri().path().to_owned());
                 } else if request.method() == "GET" {
@@ -58,7 +72,14 @@ impl Server {
                         .body("<Error><Code>AccessDenied</Code></Error>".to_owned().into())
                         .unwrap());
                 }
-                service.call(request.map(s3s::Body::from)).await
+                let response = service.call(request.map(s3s::Body::from)).await;
+                if conditional && let Ok(response) = &response {
+                    conditional_log
+                        .lock()
+                        .unwrap()
+                        .push((path, response.status().as_u16()));
+                }
+                response
             }
         };
         let (stop, stopped) = oneshot::channel();
@@ -84,6 +105,7 @@ impl Server {
         Self {
             endpoint,
             writes,
+            conditional_writes,
             reads,
             deny,
             stop: Some(stop),
