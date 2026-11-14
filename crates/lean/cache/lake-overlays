@@ -1,5 +1,5 @@
 # Lake overlays bundled in the release archive (src/overlay.rs), one per toolchain:
 # `lean --githash`, the overlay's release asset, its SHA-256. Each is built and checked by the
 # lake-overlay workflow of https://github.com/hiloopai/lean4-lake-parallel, branch lake-overlay/<nightly>.
-f0fc2fc18852fa60ff43f0daa33020d825c92e72 https://github.com/hiloopai/lean4-lake-parallel/releases/download/lake-overlay-nightly-2026-10-30-f6df35d34e5d/lake-overlay-nightly-2026-10-30-f6df35d34e5d.tar.zst 2cb46ddfa756afbc0948e0bd308ed779cbba7fc8d089d113de5c0b79ac9f7425
-67dafde474fbaf278d6d7f822068549bf6e532fa https://github.com/hiloopai/lean4-lake-parallel/releases/download/lake-overlay-nightly-2026-11-05-d914b13a0633/lake-overlay-nightly-2026-11-05-d914b13a0633.tar.zst 69fc9c77a76d6391a0b72b9976cfc06d194965db12c5d8b7436f45185a640a45
+f0fc2fc18852fa60ff43f0daa33020d825c92e72 https://github.com/hiloopai/lean4-lake-parallel/releases/download/lake-overlay-nightly-2026-10-30-eb13a72e7a67/lake-overlay-nightly-2026-10-30-eb13a72e7a67.tar.zst 203c52cf3c74259ba81dbe8f883a683b30d5e163c185efb0ad1549e696b71f44
+67dafde474fbaf278d6d7f822068549bf6e532fa https://github.com/hiloopai/lean4-lake-parallel/releases/download/lake-overlay-nightly-2026-11-05-5e786dbd5e6a/lake-overlay-nightly-2026-11-05-5e786dbd5e6a.tar.zst 0f390b0942e227a346b3b7e62a756af0e2f787c776bf0fbd178b09c9fcb01d05

@@ -251,8 +251,9 @@ fn embedded_nul_strings_survive_publication_and_native_restore() {
     fixture.publish();
     fixture.reset_local();
     let restored = log(&checked(&mut fixture.cli("get")));
-    assert!(restored.contains("placed 3 archives"), "{restored}");
-    // The restore decoded every archive, so Lake runs no archiver.
+    // Recorded unpacked: the restore places each output file, and Lake runs
+    // no archiver.
+    assert!(restored.contains("placed 0 archives and "), "{restored}");
     // `lake env lean` below reads `.lake/build`, which a cache hit fills only
     // when all artifacts are restored.
     let built = log(&checked(
@@ -396,7 +397,10 @@ fn incremental_publish_sends_only_the_difference_and_restore_reuses_proofs() {
     let fixture = Fixture::new();
     fixture.build();
     let first = fixture.publish();
-    assert!(first["uploaded"].as_u64().unwrap() > 2);
+    // Counts of the artifacts each revision names anew; `uploaded` leaves out
+    // those the publish by input hash just stored.
+    let named = |report: &Value| report["artifacts"].as_u64().unwrap();
+    assert!(named(&first) > 2);
     let before = fixture.server.writes.lock().unwrap().len();
     let warm = fixture.publish();
     assert_eq!(warm["changed"], 0);
@@ -426,9 +430,9 @@ fn incremental_publish_sends_only_the_difference_and_restore_reuses_proofs() {
     fixture.build();
     let changed = fixture.publish();
     assert!(changed["parent"].is_string());
-    assert!(changed["uploaded"].as_u64().unwrap() > 0);
+    assert!(named(&changed) > 0);
     assert!(changed["changed"].as_u64().unwrap() < changed["entries"].as_u64().unwrap());
-    assert!(changed["uploaded"].as_u64().unwrap() < first["uploaded"].as_u64().unwrap());
+    assert!(named(&changed) < named(&first));
     let expected = oleans(&fixture.root);
     let mapping = fs::read_to_string(fixture.record("packages/demo.jsonl")).unwrap();
     let row: Value = serde_json::from_str(mapping.lines().nth(1).unwrap()).unwrap();
@@ -436,7 +440,7 @@ fn incremental_publish_sends_only_the_difference_and_restore_reuses_proofs() {
         .temporary
         .path()
         .join("cache/artifacts")
-        .join(row[1].as_str().unwrap());
+        .join(row[1]["i"].as_str().unwrap_or_else(|| panic!("{row}")));
     let object = fixture.pool_object(&artifact);
     assert!(object.is_file());
     fixture.reset_local();
@@ -1155,32 +1159,20 @@ fn module_traces_name_the_recorded_inputs_and_targeted_restores_prefetch_them() 
 }
 
 #[test]
-fn recording_after_a_seeded_restore_reuses_the_pools_archives() {
+fn recording_after_a_seeded_restore_packs_no_archive() {
     let fixture = Fixture::new();
     fixture.build();
     checked(fixture.cli("put").arg("--seed"));
     let published = fs::read_to_string(fixture.record("packages/demo.jsonl")).unwrap();
+    assert!(!published.contains(".ltar"), "{published}");
     fixture.reset_local();
     checked(fixture.cli("get").args(["--seed", "--", "Demo"]));
     // A new tree, so the build records instead of placing the published one.
     fs::write(fixture.root.join("NOTES"), "outside every target\n").unwrap();
     fixture.commit();
-    // Revisions published before module indexes existed reuse archives too.
-    fs::remove_dir_all(
-        fixture
-            .temporary
-            .path()
-            .join("s3/bucket/lake")
-            .join(fixture.scope())
-            .join("modules"),
-    )
-    .unwrap();
-    // The seed holds unpacked files only; Lake would pack every archive.
-    let recorded = log(&checked(fixture.cli("build").args(["--", "Demo"])));
-    assert!(
-        recorded.contains("placed the pool's archives of 3 unchanged modules"),
-        "{recorded}"
-    );
+    // The seed holds unpacked files only, and the recording takes them as
+    // they are: Lake packs no archive.
+    checked(fixture.cli("build").args(["--", "Demo"]));
     assert_eq!(
         fs::read_to_string(fixture.record("packages/demo.jsonl")).unwrap(),
         published

@@ -350,8 +350,7 @@ impl Manifest {
                     );
                     return Ok(None);
                 };
-                // Lake's packed archives serve only a recording, which packs
-                // or reuses them again; seeds hold unpacked files instead.
+                // A restore needs no packed archive; seeds hold unpacked files.
                 if relative == PLACED
                     || relative.ends_with(".ltar")
                     || relative.ends_with(".ltar.hash")

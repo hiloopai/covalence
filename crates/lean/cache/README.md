@@ -86,7 +86,10 @@ runs.
 - `build` runs `lake build --wfail` once on the given targets (pass every
   target CI builds, such as executables, so they are published), records the root package's outputs,
   then replays the build once per other package, path and Git
-  dependencies alike, to record its outputs too. A Git dependency whose
+  dependencies alike, to record its outputs too. The bundled Lake overlay
+  records a module restored without its `.ltar` as its files, instead of
+  packing one (`LAKE_OUTPUTS_UNPACKED`), so a recording runs no archiver;
+  Lake without the overlay still packs. A Git dependency whose
   pin's map in the pool already holds the input of every trace in its build
   folder is recorded from that map instead of replayed, and `put` leaves it
   as it is. Lake's records leave out

@@ -505,20 +505,6 @@ impl Project {
             }
         }
         crate::builds::forget(self)?;
-        let nearest = crate::storage::nearest(
-            &**kv,
-            self,
-            &identity.scope,
-            &packages[0],
-            &self.ancestors()?,
-        )?;
-        crate::modules::reuse_archives(
-            self,
-            kv,
-            &identity.scope,
-            &packages,
-            nearest.as_ref().map(|(commit, _)| commit.as_str()),
-        )?;
         let mut recorded = BTreeMap::new();
         let mut pooled = BTreeSet::new();
         for (index, package) in packages.iter().enumerate() {
@@ -538,10 +524,13 @@ impl Project {
             }
             let mut command = self.lake()?;
             crate::outputs::lookups(&mut command, self, &identity.scope)?;
+            // The bundled overlay records a module without an archive as its
+            // outputs, instead of packing one: restores take either.
             command
                 .args(["build", "--wfail", "-o"])
                 .arg(&mapping)
-                .env("LAKE_ARTIFACT_CACHE", "true");
+                .env("LAKE_ARTIFACT_CACHE", "true")
+                .env("LAKE_OUTPUTS_UNPACKED", "1");
             // The first build checks everything; later ones only replay
             // traces to record another package's outputs.
             if index > 0 {
