@@ -64,10 +64,12 @@ pub(crate) fn install(
 ) -> Result<BTreeMap<String, String>> {
     let started = Instant::now();
     let mut jobs = BTreeSet::new();
-    for entry in entries.values() {
+    let mut inputs = BTreeMap::<_, Vec<_>>::new();
+    for (input, entry) in entries {
         match archive(entry) {
             Some((_, cid)) => {
                 jobs.insert(Job::Archive(cid));
+                inputs.entry(cid).or_default().push(input.as_str());
             }
             None => jobs.extend(
                 entry
@@ -82,7 +84,7 @@ pub(crate) fn install(
         fs::create_dir_all(artifacts).operation("create Lake artifact directory")?;
     }
     let done = storage::parallel_with(storage::ARCHIVE_WORKERS, &jobs, |_, job| match job {
-        Job::Archive(cid) => unpack_one(blobs, artifacts, cid).map(Some),
+        Job::Archive(cid) => unpack_one(blobs, artifacts, cid, &inputs[cid]).map(Some),
         Job::File(name, cid) => fetch(blobs, &artifacts.join(name), cid).map(|()| None),
     })?;
     let descriptors: BTreeMap<_, _> = jobs
@@ -125,12 +127,12 @@ fn fetch(blobs: &Blobs, path: &Path, cid: &Sha256) -> Result<()> {
 }
 
 /// Writes an archive's files and returns the outputs its trace names.
-fn unpack_one(blobs: &Blobs, artifacts: &Path, cid: &Sha256) -> Result<String> {
+fn unpack_one(blobs: &Blobs, artifacts: &Path, cid: &Sha256, inputs: &[&str]) -> Result<String> {
     let mut bytes = Vec::new();
     blobs
         .get_to(cid, &mut bytes)?
         .ok_or_else(|| invalid(format!("{cid} is missing from the pool")))?;
-    place(artifacts, &bytes, &cid.to_string())
+    place(artifacts, &bytes, &cid.to_string(), inputs)
 }
 
 /// Lake's output descriptor for each row of `rows`, such as an upstream
@@ -145,15 +147,17 @@ pub(crate) fn expand(
     rows: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>> {
     let started = Instant::now();
-    let archives: BTreeSet<&str> = rows
-        .values()
-        .filter_map(|output| local_archive(artifacts, output))
-        .collect();
-    let archives: Vec<_> = archives.into_iter().collect();
+    let mut inputs = BTreeMap::<_, Vec<_>>::new();
+    for (input, output) in rows {
+        if let Some(name) = local_archive(artifacts, output) {
+            inputs.entry(name).or_default().push(input.as_str());
+        }
+    }
+    let archives: Vec<_> = inputs.keys().copied().collect();
     let descriptors = storage::parallel_with(storage::ARCHIVE_WORKERS, &archives, |_, name| {
         let path = artifacts.join(name);
         let bytes = fs::read(&path).operation(format!("read {}", path.display()))?;
-        place(artifacts, &bytes, name)
+        place(artifacts, &bytes, name, &inputs[name])
     })?;
     let descriptors: BTreeMap<_, _> = archives.into_iter().zip(descriptors).collect();
     if !descriptors.is_empty() {
@@ -182,7 +186,11 @@ fn local_archive<'a>(artifacts: &Path, output: &'a str) -> Option<&'a str> {
 
 /// Writes an archive's files, which `name` names in errors, and returns the
 /// outputs its trace names.
-fn place(artifacts: &Path, bytes: &[u8], name: &str) -> Result<String> {
+fn place(artifacts: &Path, bytes: &[u8], name: &str, inputs: &[&str]) -> Result<String> {
+    // Check every mapping before sharing this archive's decoded files.
+    for input in inputs {
+        validate_input(bytes, name, input)?;
+    }
     // The input hash goes only into the trace's `depHash`, which Lake does
     // not read here, so one decode serves every input naming the archive.
     let archive = covalence_lean_ltar::unpack(bytes, 0).map_err(|source| Error::Archive {
@@ -234,6 +242,28 @@ fn place(artifacts: &Path, bytes: &[u8], name: &str) -> Result<String> {
         operation: "write Lake output descriptor".into(),
         source,
     })
+}
+
+/// Reject a retained archive-header input that contradicts the requested key,
+/// before decoding can replace the trace's hash or any output is installed.
+/// A stripped header remains unverified; a match is not producer provenance.
+pub(crate) fn validate_input(bytes: &[u8], name: &str, input: &str) -> Result<()> {
+    let retained =
+        covalence_lean_ltar::header_input_hash(bytes).map_err(|source| Error::Archive {
+            archive: name.to_owned(),
+            source,
+        })?;
+    if let Some(retained) = retained {
+        if !mapping::hex(input, 16) {
+            return Err(invalid("an archive input must be a 16-digit hash"));
+        }
+        if format!("{retained:016x}") != input {
+            return Err(invalid(format!(
+                "archive {name} retains input {retained:016x}, contradicting requested input {input}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Writes a content-addressed file once, read-only as Lake leaves the
@@ -290,6 +320,60 @@ mod tests {
             .collect();
         files.sort();
         files
+    }
+
+    fn retained_fixture(input: u64) -> Vec<u8> {
+        let stripped = fs::read(fixture()).unwrap();
+        assert_eq!(stripped[4], 0);
+        let mut bytes = b"LTR4\x01".to_vec();
+        bytes.extend_from_slice(&input.to_le_bytes());
+        bytes.extend_from_slice(&stripped[5..]);
+        bytes
+    }
+
+    #[test]
+    fn deduplicated_archive_checks_every_input_before_placing_files() {
+        let staging = tempfile::tempdir().unwrap();
+        let path = staging.path().join("archive");
+        fs::write(&path, retained_fixture(0x0123_4567_89ab_cdef)).unwrap();
+        let blobs = Blobs::new(MemoryKv::default().into_dyn(), "lake/test/cas");
+        let (cid, _) = blobs::hash_file(&path).unwrap();
+        blobs.put_file(&cid, &path).unwrap();
+        let entry = Entry {
+            output: "\"89abcdef01234567.ltar\"".to_owned(),
+            artifacts: BTreeMap::from([("89abcdef01234567.ltar".to_owned(), cid)]),
+        };
+        let mut entries = BTreeMap::from([("0123456789abcdef".to_owned(), entry.clone())]);
+        let artifacts = tempfile::tempdir().unwrap();
+        entries.insert("0123456789abcde0".to_owned(), entry);
+        let error = install(&blobs, artifacts.path(), &entries).unwrap_err();
+        assert!(error.to_string().contains("contradicting requested input"));
+        assert!(listing(artifacts.path()).is_empty());
+        entries.remove("0123456789abcde0");
+        assert!(install(&blobs, artifacts.path(), &entries).is_ok());
+        assert!(!listing(artifacts.path()).is_empty());
+    }
+
+    #[test]
+    fn local_archive_checks_all_inputs_even_with_warm_outputs() {
+        let artifacts = tempfile::tempdir().unwrap();
+        let name = "89abcdef01234567.ltar";
+        fs::write(
+            artifacts.path().join(name),
+            retained_fixture(0x0123_4567_89ab_cdef),
+        )
+        .unwrap();
+        let mut rows = BTreeMap::from([("0123456789abcdef".to_owned(), format!("\"{name}\""))]);
+        let before = listing(artifacts.path());
+        rows.insert("0123456789abcde0".to_owned(), format!("\"{name}\""));
+        assert!(expand(artifacts.path(), &rows).is_err());
+        assert_eq!(listing(artifacts.path()), before);
+        rows.remove("0123456789abcde0");
+        expand(artifacts.path(), &rows).unwrap();
+        let warm = listing(artifacts.path());
+        rows.insert("0123456789abcde0".to_owned(), format!("\"{name}\""));
+        assert!(expand(artifacts.path(), &rows).is_err());
+        assert_eq!(listing(artifacts.path()), warm);
     }
 
     #[test]

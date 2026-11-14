@@ -181,6 +181,29 @@ pub(crate) fn serve(
         )));
     }
     let blobs = crate::pool::blobs(kv, scope)?;
+    // Check archives before installing any of this entry's artifacts or its
+    // output record. Warm local archive hits need the same check as downloads.
+    let mut archives = BTreeMap::new();
+    for (name, cid) in &entry.artifacts {
+        if !name.ends_with(".ltar") {
+            continue;
+        }
+        let target = artifacts.join(name);
+        let bytes = if target.is_file() {
+            fs::read(&target).operation(format!("read {}", target.display()))?
+        } else {
+            let cid: Sha256 = cid
+                .parse()
+                .map_err(|_| invalid(format!("output {key} names an invalid CID")))?;
+            let mut bytes = Vec::new();
+            if blobs.get_to(&cid, &mut bytes)?.is_none() {
+                return Ok(false);
+            }
+            bytes
+        };
+        crate::archives::validate_input(&bytes, name, input)?;
+        archives.insert(name, bytes);
+    }
     for (name, cid) in &entry.artifacts {
         let target = artifacts.join(name);
         if target.is_file() {
@@ -190,7 +213,11 @@ pub(crate) fn serve(
             .parse()
             .map_err(|_| invalid(format!("output {key} names an invalid CID")))?;
         let mut pending = tempfile::NamedTempFile::new_in(artifacts).operation("stage artifact")?;
-        if blobs.get_to(&cid, &mut pending)?.is_none() {
+        if let Some(bytes) = archives.get(name) {
+            pending
+                .write_all(bytes)
+                .operation("stage checked archive")?;
+        } else if blobs.get_to(&cid, &mut pending)?.is_none() {
             // Expired before its entry: a miss, and Lake builds.
             return Ok(false);
         }
@@ -444,6 +471,70 @@ pub(crate) fn report_fetches() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use covalence_kv_memory::MemoryKv;
+
+    #[test]
+    fn lazy_lookup_rejects_wrong_header_before_any_install_including_local_hits() {
+        let kv = MemoryKv::default().into_dyn();
+        let blobs = crate::pool::blobs(kv.clone(), "test").unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let stripped = fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../ltar/tests/fixtures/module.ltar"),
+        )
+        .unwrap();
+        assert_eq!(stripped[4], 0);
+        let mut retained = b"LTR4\x01".to_vec();
+        retained.extend_from_slice(&0x0123_4567_89ab_cdef_u64.to_le_bytes());
+        retained.extend_from_slice(&stripped[5..]);
+        let mut entry = Entry {
+            record: serde_json::json!({"data": {
+                "a": "0000000000000000.art", "l": "1111111111111111.ltar"
+            }}),
+            artifacts: BTreeMap::new(),
+        };
+        for (name, bytes) in [
+            ("0000000000000000.art", b"other output".as_slice()),
+            ("1111111111111111.ltar", retained.as_slice()),
+        ] {
+            let path = staging.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            let (cid, _) = crate::blobs::hash_file(&path).unwrap();
+            blobs.put_file(&cid, &path).unwrap();
+            entry.artifacts.insert(name.to_owned(), cid.to_string());
+        }
+        let input = "0123456789abcde0";
+        kv.put(
+            key("test", "demo", input).unwrap().as_bytes(),
+            Bytes::from(encode(&entry).unwrap()),
+        )
+        .unwrap();
+        let artifacts = tempfile::tempdir().unwrap();
+        let output = staging.path().join("output.json");
+        let result = serve(kv.clone(), "test", "demo", input, &output, artifacts.path());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("contradicting requested input")
+        );
+        assert!(!output.exists());
+        assert_eq!(fs::read_dir(artifacts.path()).unwrap().count(), 0);
+        // A warm local archive must not bypass the guard, even if its remote
+        // payload expires or differs. Other output files still stay absent.
+        fs::write(artifacts.path().join("1111111111111111.ltar"), &retained).unwrap();
+        assert!(serve(kv.clone(), "test", "demo", input, &output, artifacts.path()).is_err());
+        assert!(!output.exists());
+        assert!(!artifacts.path().join("0000000000000000.art").exists());
+        let matching = "0123456789abcdef";
+        kv.put(
+            key("test", "demo", matching).unwrap().as_bytes(),
+            Bytes::from(encode(&entry).unwrap()),
+        )
+        .unwrap();
+        assert!(serve(kv, "test", "demo", matching, &output, artifacts.path()).unwrap());
+        assert!(output.is_file());
+        assert!(artifacts.path().join("0000000000000000.art").is_file());
+    }
 
     #[test]
     fn outputs_are_keyed_by_package_and_input_hash() {
