@@ -127,6 +127,38 @@ pub struct Archive {
     pub files: Vec<Entry>,
 }
 
+/// Reads the input hash retained in an `LTR4` archive's header.
+///
+/// Returns `None` for archives packed with `-s`. A hash supplied to
+/// [`unpack`] is independent of this value: rewriting a trace does not
+/// establish which input produced its files. The header is an archive's
+/// claim, not authenticated evidence of a successful compilation.
+///
+/// This reads only the header; it does not validate the archive's entries.
+///
+/// # Errors
+///
+/// Returns [`Error::Truncated`] for an incomplete header and
+/// [`Error::Unsupported`] for an unknown magic or hash flag.
+pub fn header_input_hash(archive: &[u8]) -> Result<Option<u64>> {
+    read_header(&mut Input::new(archive))
+}
+
+fn read_header(input: &mut Input<'_>) -> Result<Option<u64>> {
+    let magic = input.array::<4>()?;
+    if &magic != b"LTR4" {
+        return Err(unsupported(
+            "archive magic",
+            u32::from_be_bytes(magic).into(),
+        ));
+    }
+    match input.u8()? {
+        0 => Ok(None),
+        1 => input.u64().map(Some),
+        flag => Err(unsupported("depHash flag", flag.into())),
+    }
+}
+
 /// Unpacks an `LTR4` archive as `leantar -x` does, with `input_hash` as the
 /// trace's `depHash`.
 ///
@@ -143,20 +175,7 @@ pub struct Archive {
 ///   entries, and for paths that are absolute or leave their base directory.
 pub fn unpack(archive: &[u8], input_hash: u64) -> Result<Archive> {
     let mut input = Input::new(archive);
-    let magic = input.array::<4>()?;
-    if &magic != b"LTR4" {
-        return Err(unsupported(
-            "archive magic",
-            u32::from_be_bytes(magic).into(),
-        ));
-    }
-    match input.u8()? {
-        0 => {}
-        1 => {
-            input.u64()?;
-        }
-        flag => return Err(unsupported("depHash flag", flag.into())),
-    }
+    read_header(&mut input)?;
     let path = relative(input.cstr()?)?;
     let compression = input.u8()?;
     if matches!(compression, LGZ | LGZ_MODULE) {

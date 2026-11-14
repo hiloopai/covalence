@@ -11,7 +11,7 @@
 //! - `logged.ltar`: a trace with a log, so the trace is Zstandard JSON.
 //! - `patched.ltar`: written by hand; its olean uses opcodes `0xa0` and `0xb0`.
 
-use covalence_lean_ltar::{Archive, Dir, Error, unpack};
+use covalence_lean_ltar::{Archive, Dir, Error, header_input_hash, unpack};
 use sha2::{Digest, Sha256};
 
 const HASH: u64 = 0x0123_4567_89ab_cdef;
@@ -33,6 +33,38 @@ fn fixture(name: &str) -> Vec<u8> {
         env!("CARGO_MANIFEST_DIR")
     ))
     .unwrap()
+}
+
+#[test]
+fn retained_input_is_independent_of_the_requested_trace_stamp() {
+    let stripped = fixture("module.ltar");
+    assert_eq!(stripped[4], 0);
+    assert_eq!(header_input_hash(&stripped).unwrap(), None);
+    let original_input = 0xfedc_ba98_7654_3210_u64;
+    let mut retained = b"LTR4\x01".to_vec();
+    retained.extend_from_slice(&original_input.to_le_bytes());
+    retained.extend_from_slice(&stripped[5..]);
+    assert_eq!(header_input_hash(&retained).unwrap(), Some(original_input));
+    // The existing unpack API deliberately has leantar's caller-stamping
+    // semantics. Its resulting trace cannot serve as producer evidence.
+    assert_eq!(
+        unpack(&retained, HASH).unwrap(),
+        unpack(&stripped, HASH).unwrap()
+    );
+    assert_eq!(header_input_hash(&retained).unwrap(), Some(original_input));
+}
+
+#[test]
+fn invalid_or_truncated_input_headers_fail() {
+    for bytes in [&b""[..], &b"LTR4"[..], &b"LTR4\x01\x00"[..]] {
+        assert!(matches!(header_input_hash(bytes), Err(Error::Truncated)));
+    }
+    for bytes in [&b"LTR3\x00"[..], &b"LTR4\x02"[..]] {
+        assert!(matches!(
+            header_input_hash(bytes),
+            Err(Error::Unsupported { .. })
+        ));
+    }
 }
 
 #[test]
