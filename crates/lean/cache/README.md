@@ -123,6 +123,8 @@ runs.
 - `dependencies` restores the Mathlib/CSLib snapshot from upstream, then
   each Git dependency's build of its pin from the pool on top of it, so a
   partial pool map never hides upstream's artifacts.
+  Without `LAKE_CI_BUCKET` it needs no credentials: it installs the upstream
+  snapshots only, and the Git dependency pins build from source.
 - `gc` frees the host's cache of toolchain scopes it stopped using (below).
 - `scope --base <rev> -- <targets>` prints the part of `targets` that the
   change from `rev` to the working tree can affect, for CI that checks only

@@ -140,6 +140,11 @@ fn execute(cli: Cli) -> Result<()> {
             threads.spawn(|| project.lean.ready(&project.root));
         }
         match cli.action {
+            // Without a pool, the upstream snapshots still come from their
+            // public service.
+            Action::Dependencies if env::var_os("LAKE_CI_BUCKET").is_none() => {
+                dependencies::upstream_only(&project, &cli.targets)
+            }
             Action::Dependencies => dependencies::fetch(&project, &store()?, &cli.targets),
             Action::Build => {
                 outputs::start(&project)?;

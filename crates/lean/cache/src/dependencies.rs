@@ -53,6 +53,29 @@ pub(crate) fn fetch(project: &Project, kv: &Arc<dyn Kv>, targets: &[String]) -> 
     Ok(())
 }
 
+/// [`fetch`] without the pool, as on a host with no pool credentials: the
+/// upstream snapshots only, then a build of `targets`, in which the Git
+/// dependency pins build from source.
+pub(crate) fn upstream_only(project: &Project, targets: &[String]) -> Result<()> {
+    println!(
+        "Lake cache: LAKE_CI_BUCKET is unset: installing the upstream snapshots only; Git dependency pins build from source"
+    );
+    run("Lake", project.lake()?.args(["env", "true"]))?;
+    let lazy = !targets.is_empty();
+    upstream(project, &Local::open(project)?, lazy, &BTreeSet::new())?;
+    if lazy {
+        run(
+            "Lake dependency build",
+            project
+                .lake()?
+                .env("LAKE_CONFIG", config(project))
+                .args(["build", "--wfail"])
+                .args(targets),
+        )?;
+    }
+    Ok(())
+}
+
 /// Install the Mathlib/CSLib snapshot from upstream, except the snapshots in
 /// `seeded`, whose every mapping a seed holds. A pool map holds only the
 /// closures its publishers built, so upstream's snapshot comes first and the

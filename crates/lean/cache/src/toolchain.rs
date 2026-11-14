@@ -302,6 +302,10 @@ impl Lean {
                 else {
                     return Ok(Plan::Present);
                 };
+                // Without a pool, the release comes from its publisher.
+                if env::var_os("LAKE_CI_BUCKET").is_none() {
+                    return Ok(Plan::Release);
+                }
                 let kv = storage::store_with(PARTS)?;
                 let key = release.key()?;
                 let record = kv.get(key.as_bytes()).map_err(|source| Error::Store {
