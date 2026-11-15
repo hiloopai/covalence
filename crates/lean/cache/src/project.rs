@@ -465,6 +465,15 @@ impl Project {
             .join(format!("{package}.jsonl"))
     }
 
+    /// A restore replaces this checkout's build, so an earlier `build`'s
+    /// receipt no longer describes it. Left in place, it fails every later
+    /// `put` here once the tree changes, and with it the outputs that `put`
+    /// would publish by input hash.
+    pub fn forget_receipt(&self) -> Result<()> {
+        remove(&self.record.join("success.json"))?;
+        remove(&self.published())
+    }
+
     /// Run one strict build, then record each package's outputs: the
     /// repository's own packages always, and Git dependencies that `skip`
     /// does not exclude.

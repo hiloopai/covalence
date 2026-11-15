@@ -632,6 +632,20 @@ fn unsuccessful_or_stale_receipts_cannot_publish() {
 }
 
 #[test]
+fn a_restore_forgets_an_earlier_builds_receipt() {
+    let fixture = Fixture::new();
+    fixture.build();
+    checked(fixture.cli("put").arg("--seed"));
+    assert!(fixture.record("success.json").exists());
+    // A later session restores this checkout and changes its tree, as a
+    // prove worker's sessions do; its `put` still publishes what it built.
+    checked(fixture.cli("get").args(["--", "Demo"]));
+    assert!(!fixture.record("success.json").exists());
+    fs::write(fixture.root.join("SCRATCH"), "a session's file\n").unwrap();
+    checked(&mut fixture.cli("put"));
+}
+
+#[test]
 fn lean_reads_restored_dependency_oleans_from_their_build_folders() {
     let fixture = Fixture::new();
     let dependency = fixture.root.join("Dep");

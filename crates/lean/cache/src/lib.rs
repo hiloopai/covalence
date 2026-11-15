@@ -184,6 +184,7 @@ fn execute(cli: Cli) -> Result<()> {
                 }
             }
             Action::Get => {
+                project.forget_receipt()?;
                 outputs::start(&project)?;
                 restore::restore(&project, &store()?, &cli.targets, cli.seed, started)?;
                 outputs::report_fetches();
