@@ -149,11 +149,18 @@ fn contents(
         outputs: BTreeSet::new(),
         artifacts: BTreeSet::new(),
         archived: BTreeMap::new(),
+        replaced: 0,
     };
     for package in receipt.packages.keys() {
-        for input in mapping::rows(&project.mapping(package))?.keys() {
-            seed.add(format!("outputs/{package}/{input}.json"), false)?;
+        for (input, (recorded, _)) in mapping::rows(&project.mapping(package))? {
+            seed.add_recorded(format!("outputs/{package}/{input}.json"), &recorded)?;
         }
+    }
+    if seed.replaced > 0 {
+        println!(
+            "Lake cache: {} local output records named other outputs than this build recorded; the seed holds the recorded ones",
+            seed.replaced
+        );
     }
     let mut covered = Vec::new();
     for snapshot in snapshots {
@@ -182,6 +189,8 @@ struct Contents<'a> {
     artifacts: BTreeSet<String>,
     /// Outputs that are only an archive in the cache, by output file.
     archived: BTreeMap<String, Value>,
+    /// Local output files that named other outputs than the recording.
+    replaced: usize,
 }
 
 impl Contents<'_> {
@@ -193,17 +202,48 @@ impl Contents<'_> {
         if self.outputs.contains(&name) {
             return Ok(true);
         }
-        let bytes = match fs::read(self.cache.join(&name)) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(source) => {
-                return Err(Error::Io {
-                    operation: format!("read {name}"),
-                    source,
-                });
-            }
+        let Some(output) = self.local(&name)? else {
+            return Ok(false);
         };
-        let mut output: Value = json(&bytes)?;
+        self.add_output(name, output, mapping)
+    }
+
+    /// Add the outputs this build recorded for the input of output file
+    /// `name`, with Lake's local output file as their template. The local
+    /// file may name another build's outputs; a host the seed fills trusts
+    /// a record by its input hash alone, so the seed holds what `put`
+    /// publishes for that input, never that.
+    fn add_recorded(&mut self, name: String, recorded: &str) -> Result<bool> {
+        if self.outputs.contains(&name) {
+            return Ok(true);
+        }
+        let Some(mut output) = self.local(&name)? else {
+            return Ok(false);
+        };
+        let recorded: Value = json(recorded.as_bytes())?;
+        // An archive row is a recording that packed one, or a dependency
+        // recorded from the pool's map, whose local file this host's restore
+        // wrote from that archive; either names the same files.
+        if !recorded.is_string() && output["data"] != recorded {
+            self.replaced += 1;
+            output["data"] = recorded;
+        }
+        self.add_output(name, output, false)
+    }
+
+    /// Lake's local output file `name`, if there is one.
+    fn local(&self, name: &str) -> Result<Option<Value>> {
+        match fs::read(self.cache.join(name)) {
+            Ok(bytes) => json(&bytes).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(Error::Io {
+                operation: format!("read {name}"),
+                source,
+            }),
+        }
+    }
+
+    fn add_output(&mut self, name: String, mut output: Value, mapping: bool) -> Result<bool> {
         if let Some(data) = output["data"].as_object_mut() {
             data.remove("l");
         }
@@ -323,14 +363,23 @@ fn write_chunk(members: &[Member], cache: &Path) -> Result<(File, Chunk)> {
         header.set_mode(0o444);
         header.set_mtime(0);
         match &member.inline {
-            Some(bytes) => tar.append_data(&mut header, &member.name, bytes.as_slice()),
-            None => tar.append_data(
-                &mut header,
-                &member.name,
-                File::open(cache.join(&member.name)).operation(format!("open {}", member.name))?,
-            ),
+            Some(bytes) => tar
+                .append_data(&mut header, &member.name, bytes.as_slice())
+                .operation("write seed chunk")?,
+            None => {
+                let file = File::open(cache.join(&member.name))
+                    .operation(format!("open {}", member.name))?;
+                let mut checking = crate::lake_hash::Checking::new(file, member.bytes);
+                tar.append_data(&mut header, &member.name, &mut checking)
+                    .operation("write seed chunk")?;
+                // Every file a seed takes from the cache is an artifact,
+                // which no host may restore under a name its bytes are not.
+                let artifact = member.name.strip_prefix("artifacts/").ok_or_else(|| {
+                    invalid(format!("seed member {} is no artifact", member.name))
+                })?;
+                crate::lake_hash::expect(artifact, checking.finish())?;
+            }
         }
-        .operation("write seed chunk")?;
     }
     let hashing = tar
         .into_inner()
@@ -524,7 +573,8 @@ fn unpack(
         }
         files += 1;
         if let Some(artifact) = name.strip_prefix("artifacts/") {
-            if folder.add(artifact, &mut entry)? {
+            let len = entry.size();
+            if folder.add(artifact, &mut entry, len)? {
                 added.push(artifacts.join(artifact));
             }
             continue;
@@ -571,11 +621,14 @@ impl<'a> Folder<'a> {
 
     /// Add `name` with the bytes of `reader`, unless the folder holds it;
     /// whether it was added. A name always appears with its whole contents.
-    fn add(&self, name: &str, reader: &mut impl Read) -> Result<bool> {
+    /// Name `len` bytes from `reader` `name` here, checked against the name
+    /// before any build can see them.
+    fn add(&self, name: &str, reader: &mut impl Read, len: u64) -> Result<bool> {
         if self.path.join(name).exists() {
             io::copy(reader, &mut io::sink()).operation("skip seed artifact")?;
             return Ok(false);
         }
+        let mut checking = crate::lake_hash::Checking::new(reader, len);
         #[cfg(target_os = "linux")]
         {
             use rustix::fs::{AtFlags, CWD, Mode, OFlags, linkat, openat};
@@ -588,7 +641,8 @@ impl<'a> Folder<'a> {
             ) {
                 Ok(handle) => {
                     let mut file = File::from(handle);
-                    io::copy(reader, &mut file).operation("write seed artifact")?;
+                    io::copy(&mut checking, &mut file).operation("write seed artifact")?;
+                    crate::lake_hash::expect(name, checking.finish())?;
                     let unnamed = format!("/proc/self/fd/{}", file.as_raw_fd());
                     return match linkat(
                         CWD,
@@ -611,7 +665,8 @@ impl<'a> Folder<'a> {
         }
         let mut pending =
             tempfile::NamedTempFile::new_in(self.path).operation("stage seed artifact")?;
-        io::copy(reader, &mut pending).operation("write seed artifact")?;
+        io::copy(&mut checking, &mut pending).operation("write seed artifact")?;
+        crate::lake_hash::expect(name, checking.finish())?;
         let mut permissions = pending
             .as_file()
             .metadata()
@@ -948,17 +1003,17 @@ mod tests {
     fn publisher() -> (tempfile::TempDir, Project, Receipt) {
         let dir = tempfile::tempdir().unwrap();
         let files: [(&str, &[u8]); 9] = [
-            ("cache/artifacts/0000000000000001.olean", &[1; 300_000]),
-            ("cache/artifacts/0000000000000002.ilean", b"ilean"),
+            ("cache/artifacts/1c5115b155354754.olean", &[1; 300_000]),
+            ("cache/artifacts/a84401232eb136a6.ilean", b"ilean"),
             ("cache/artifacts/0000000000000003.ltar", &[3; 70_000]),
-            ("cache/artifacts/0000000000000004.o", b"object"),
+            ("cache/artifacts/e6f0e8e9581aa794.o", b"object"),
             (
                 "cache/outputs/p/00000000000000aa.json",
-                br#"{"service": null, "data": {"o": ["0000000000000001.olean"], "i": "0000000000000002.ilean", "l": "0000000000000003.ltar"}}"#,
+                br#"{"service": null, "data": {"o": ["1c5115b155354754.olean"], "i": "a84401232eb136a6.ilean", "l": "0000000000000003.ltar"}}"#,
             ),
             (
                 "cache/outputs/p/00000000000000bb.json",
-                br#"{"service": null, "data": "0000000000000004.o"}"#,
+                br#"{"service": null, "data": "e6f0e8e9581aa794.o"}"#,
             ),
             ("cache/artifacts/0000000000000005", b"executable"),
             (
@@ -967,7 +1022,7 @@ mod tests {
             ),
             (
                 "record/packages/p.jsonl",
-                b"\"2026-03-17\"\n[\"00000000000000aa\",\"0000000000000003.ltar\"]\n[\"00000000000000bb\",\"0000000000000004.o\"]\n[\"00000000000000cc\",\"0000000000000005\"]\n",
+                b"\"2026-03-17\"\n[\"00000000000000aa\",\"0000000000000003.ltar\"]\n[\"00000000000000bb\",\"e6f0e8e9581aa794.o\"]\n[\"00000000000000cc\",\"0000000000000005\"]\n",
             ),
         ];
         for (name, bytes) in files {
@@ -996,6 +1051,43 @@ mod tests {
     }
 
     #[test]
+    fn a_seed_holds_the_recorded_outputs_not_another_builds_local_record() {
+        let (dir, project, receipt) = publisher();
+        let cache = dir.path().join("cache");
+        let named = |bytes: &[u8]| format!("{:016x}.olean", crate::lake_hash::of(bytes));
+        let (recorded, other) = (named(b"this build's module"), named(b"an older module"));
+        fs::write(
+            cache.join("artifacts").join(&recorded),
+            b"this build's module",
+        )
+        .unwrap();
+        fs::write(cache.join("artifacts").join(&other), b"an older module").unwrap();
+        // Lake's local file for the input names another build's olean.
+        fs::write(
+            cache.join("outputs/p/00000000000000ee.json"),
+            format!(r#"{{"service": null, "data": {{"o": ["{other}"]}}}}"#),
+        )
+        .unwrap();
+        let mapping = project.mapping("p");
+        let mut rows = fs::read_to_string(&mapping).unwrap();
+        rows.push_str(&format!(
+            "[\"00000000000000ee\",{{\"o\":[\"{recorded}\"]}}]\n"
+        ));
+        fs::write(&mapping, rows).unwrap();
+        let (members, _) = contents(&project, &receipt, Vec::new(), &cache).unwrap();
+        let output = members
+            .iter()
+            .find(|member| member.name == "outputs/p/00000000000000ee.json")
+            .and_then(|member| member.inline.as_deref())
+            .map(|bytes| json::<Value>(bytes).unwrap())
+            .unwrap();
+        assert_eq!(output["data"]["o"][0], recorded.as_str());
+        let names: BTreeSet<_> = members.iter().map(|member| member.name.as_str()).collect();
+        assert!(names.contains(format!("artifacts/{recorded}").as_str()));
+        assert!(!names.contains(format!("artifacts/{other}").as_str()));
+    }
+
+    #[test]
     fn a_seed_holds_every_mapping_of_a_complete_upstream_snapshot() {
         let (dir, project, receipt) = publisher();
         let cache = dir.path().join("cache");
@@ -1006,18 +1098,18 @@ mod tests {
         };
         let files: [(&str, &[u8]); 6] = [
             // Lake fetched only one artifact of the snapshot.
-            ("artifacts/00000000000000f2.o", b"object"),
+            ("artifacts/d3c53e49d9978999.o", b"upstream object"),
             (
                 "outputs/mathlib/00000000000000e1.json",
                 br#"{"service": "upstream", "data": "00000000000000f1.ltar"}"#,
             ),
             (
                 "outputs/mathlib/00000000000000e2.json",
-                br#"{"service": "upstream", "data": "00000000000000f2.o"}"#,
+                br#"{"service": "upstream", "data": "d3c53e49d9978999.o"}"#,
             ),
             (
                 "revisions/mathlib/1111111111111111111111111111111111111111.jsonl",
-                b"\"2026-03-17\"\n[\"00000000000000e1\",\"00000000000000f1.ltar\"]\n[\"00000000000000e2\",\"00000000000000f2.o\"]\n",
+                b"\"2026-03-17\"\n[\"00000000000000e1\",\"00000000000000f1.ltar\"]\n[\"00000000000000e2\",\"d3c53e49d9978999.o\"]\n",
             ),
             // A snapshot one of whose mappings is not here is not a seed's.
             (
@@ -1049,7 +1141,7 @@ mod tests {
         for name in [
             "outputs/mathlib/00000000000000e1.json",
             "outputs/mathlib/00000000000000e2.json",
-            "artifacts/00000000000000f2.o",
+            "artifacts/d3c53e49d9978999.o",
         ] {
             assert!(names.contains(name), "{name}");
         }
@@ -1134,9 +1226,9 @@ mod tests {
         );
         let (publisher, ..) = publisher();
         for name in [
-            "artifacts/0000000000000001.olean",
-            "artifacts/0000000000000002.ilean",
-            "artifacts/0000000000000004.o",
+            "artifacts/1c5115b155354754.olean",
+            "artifacts/a84401232eb136a6.ilean",
+            "artifacts/e6f0e8e9581aa794.o",
         ] {
             assert_eq!(
                 fs::read(host.path().join(name)).unwrap(),
@@ -1151,7 +1243,7 @@ mod tests {
         let output: Value = json(&fs::read(host.path().join(OUTPUT)).unwrap()).unwrap();
         assert_eq!(
             output["data"],
-            serde_json::json!({"o": ["0000000000000001.olean"], "i": "0000000000000002.ilean"})
+            serde_json::json!({"o": ["1c5115b155354754.olean"], "i": "a84401232eb136a6.ilean"})
         );
     }
 
@@ -1159,9 +1251,12 @@ mod tests {
     fn a_seed_holds_the_files_of_an_output_that_is_only_an_archive() {
         let (dir, project, receipt) = publisher();
         let cache = dir.path().join("cache");
-        let archive = "89abcdef01234567.ltar";
+        // A module archive Lake packed, its files named by their bytes.
+        let archive = "cd9cef913c0321f4.ltar";
         fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../ltar/tests/fixtures/module.ltar"),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(archive),
             cache.join("artifacts").join(archive),
         )
         .unwrap();
@@ -1193,7 +1288,11 @@ mod tests {
         assert!(seeded["p"].contains("00000000000000dd"));
         let output: Value =
             json(&fs::read(host.path().join("outputs/p/00000000000000dd.json")).unwrap()).unwrap();
-        assert_eq!(output["data"]["c"], "7777777777777777.c");
+        assert!(
+            output["data"]["c"]
+                .as_str()
+                .is_some_and(|c| c.ends_with(".c"))
+        );
         for name in mapping::names(&output["data"]).unwrap() {
             assert!(
                 host.path().join("artifacts").join(&name).is_file(),
@@ -1309,18 +1408,24 @@ mod tests {
         let folder = Folder::open(&artifacts).unwrap();
         assert!(
             folder
-                .add("00000000000000aa.olean", &mut &b"first"[..])
+                .add("6de4304e616908fa.olean", &mut &b"first"[..], 5)
                 .unwrap()
         );
         // A folder that holds a name keeps its bytes.
         assert!(
             !folder
-                .add("00000000000000aa.olean", &mut &b"second"[..])
+                .add("6de4304e616908fa.olean", &mut &b"second"[..], 6)
                 .unwrap()
         );
-        let path = artifacts.join("00000000000000aa.olean");
+        let path = artifacts.join("6de4304e616908fa.olean");
         assert_eq!(fs::read(&path).unwrap(), b"first");
         assert!(fs::metadata(&path).unwrap().permissions().readonly());
+        assert_eq!(fs::read_dir(&artifacts).unwrap().count(), 1);
+        // Bytes another name's are never named this one.
+        let error = folder
+            .add("1c5115b155354754.olean", &mut &b"first"[..], 5)
+            .unwrap_err();
+        assert!(error.to_string().contains("holds other bytes"), "{error}");
         assert_eq!(fs::read_dir(&artifacts).unwrap().count(), 1);
     }
 

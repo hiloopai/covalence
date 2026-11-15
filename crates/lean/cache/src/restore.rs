@@ -550,6 +550,11 @@ fn fetch(store: &Blobs, cid: &Sha256, path: &Path) -> Result<Option<u64>> {
         return Ok(None);
     };
     pending.flush().operation("flush Lake artifact")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("artifact has no name"))?;
+    crate::lake_hash::check_file(name, pending.path())?;
     match pending.persist_noclobber(path) {
         Ok(_) => Ok(Some(bytes)),
         // Another download placed the same content first.
@@ -727,7 +732,8 @@ mod tests {
         let (cid, _) = crate::blobs::hash_file(&source).unwrap();
         blobs.put_file(&cid, &source).unwrap();
         let artifacts = tempfile::tempdir().unwrap();
-        let path = artifacts.path().join("0123456789abcdef.ltar");
+        let name = format!("{:016x}.ltar", crate::lake_hash::of(&vec![7u8; 1 << 20]));
+        let path = artifacts.path().join(&name);
         assert_eq!(fetch(&blobs, &cid, &path).unwrap(), Some(1 << 20));
         assert_eq!(fs::read(&path).unwrap(), fs::read(&source).unwrap());
         // A second download of the same content finds it placed.
@@ -741,7 +747,7 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert_eq!(names, ["0123456789abcdef.ltar"]);
+        assert_eq!(names, [name.as_str()]);
     }
 
     #[test]

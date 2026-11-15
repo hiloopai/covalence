@@ -71,7 +71,27 @@ pub(crate) fn cid(digest: &[u8]) -> Result<Sha256> {
     })
 }
 
+/// The SHA-256 CID of Lake artifact `name`'s bytes at `path`, and its
+/// length, in one read; fails unless the bytes are what the name says.
+pub(crate) fn hash_artifact(name: &str, path: &Path) -> Result<(Sha256, u64)> {
+    let file = File::open(path).operation(format!("open {}", path.display()))?;
+    let len = file
+        .metadata()
+        .operation(format!("read {}", path.display()))?
+        .len();
+    let mut checking = crate::lake_hash::Checking::new(file, len);
+    let mut hashing = Hashing {
+        inner: io::sink(),
+        hash: sha2::Sha256::new(),
+        bytes: 0,
+    };
+    io::copy(&mut checking, &mut hashing).operation("hash Lake artifact")?;
+    crate::lake_hash::expect(name, checking.finish())?;
+    Ok((cid(&hashing.hash.finalize())?, hashing.bytes))
+}
+
 /// The SHA-256 CID of a file's bytes, and its length.
+#[cfg(test)]
 pub(crate) fn hash_file(path: &Path) -> Result<(Sha256, u64)> {
     let mut file = File::open(path).operation(format!("open {}", path.display()))?;
     let mut hashing = Hashing {

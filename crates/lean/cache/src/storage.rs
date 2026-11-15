@@ -220,7 +220,9 @@ fn hash_files(files: &[(String, std::path::PathBuf)]) -> Result<BTreeMap<String,
     Ok(files
         .iter()
         .map(|(name, _)| name.clone())
-        .zip(parallel(files, |_, (_, path)| blobs::hash_file(path))?)
+        .zip(parallel(files, |_, (name, path)| {
+            blobs::hash_artifact(name, path)
+        })?)
         .collect())
 }
 

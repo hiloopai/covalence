@@ -8,6 +8,7 @@ mod builds;
 mod dependencies;
 pub mod error;
 mod gc;
+mod lake_hash;
 mod local;
 mod mapping;
 mod modules;

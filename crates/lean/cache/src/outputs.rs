@@ -146,7 +146,7 @@ pub(crate) fn publish(
                 // supplies this input.
                 return Ok(false);
             }
-            let (cid, _) = crate::blobs::hash_file(&path)?;
+            let (cid, _) = crate::blobs::hash_artifact(&name, &path)?;
             if !blobs.has(&cid)? {
                 blobs.put_file(&cid, &path)?;
             }
@@ -297,6 +297,7 @@ pub(crate) fn serve(
             .as_file()
             .set_permissions(permissions)
             .operation("mark artifact read-only")?;
+        crate::lake_hash::check_file(name, pending.path())?;
         if let Err(error) = pending.persist_noclobber(&target)
             && error.error.kind() != std::io::ErrorKind::AlreadyExists
         {
@@ -572,14 +573,16 @@ mod tests {
         let mut retained = b"LTR4\x01".to_vec();
         retained.extend_from_slice(&0x0123_4567_89ab_cdef_u64.to_le_bytes());
         retained.extend_from_slice(&stripped[5..]);
+        let other = b"other output".as_slice();
+        let art = format!("{:016x}.art", crate::lake_hash::of(other));
         let mut entry = Entry {
             record: serde_json::json!({"data": {
-                "a": "0000000000000000.art", "l": "1111111111111111.ltar"
+                "a": art, "l": "1111111111111111.ltar"
             }}),
             artifacts: BTreeMap::new(),
         };
         for (name, bytes) in [
-            ("0000000000000000.art", b"other output".as_slice()),
+            (art.as_str(), other),
             ("1111111111111111.ltar", retained.as_slice()),
         ] {
             let path = staging.path().join(name);
@@ -610,7 +613,7 @@ mod tests {
         fs::write(artifacts.path().join("1111111111111111.ltar"), &retained).unwrap();
         assert!(serve(kv.clone(), "test", "demo", input, &output, artifacts.path()).is_err());
         assert!(!output.exists());
-        assert!(!artifacts.path().join("0000000000000000.art").exists());
+        assert!(!artifacts.path().join(&art).exists());
         let matching = "0123456789abcdef";
         kv.put(
             key("test", "demo", matching).unwrap().as_bytes(),
@@ -619,7 +622,7 @@ mod tests {
         .unwrap();
         assert!(serve(kv, "test", "demo", matching, &output, artifacts.path()).unwrap());
         assert!(output.is_file());
-        assert!(artifacts.path().join("0000000000000000.art").is_file());
+        assert!(artifacts.path().join(&art).is_file());
     }
 
     #[test]

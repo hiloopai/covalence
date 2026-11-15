@@ -267,11 +267,17 @@ pub(crate) fn validate_input(bytes: &[u8], name: &str, input: &str) -> Result<()
 }
 
 /// Writes a content-addressed file once, read-only as Lake leaves the
-/// artifacts it downloads; an existing file has the same bytes.
+/// artifacts it downloads; an existing file has the same bytes. The bytes
+/// must be what the file's name says.
 fn save(path: &Path, bytes: &[u8]) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("artifact has no name"))?;
+    crate::lake_hash::check(name, bytes)?;
     let parent = path
         .parent()
         .ok_or_else(|| invalid("artifact has no parent"))?;
@@ -304,8 +310,24 @@ mod tests {
     use super::*;
     use crate::blobs;
 
+    /// A module archive Lake packed, its files named by their bytes.
     fn fixture() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../ltar/tests/fixtures/module.ltar")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cd9cef913c0321f4.ltar")
+    }
+
+    /// The outputs the fixture's trace names, without its archive.
+    fn fixture_outputs() -> Value {
+        let archive = covalence_lean_ltar::unpack(&fs::read(fixture()).unwrap(), 0).unwrap();
+        let mut outputs: Value =
+            serde_json::from_slice::<Value>(&archive.trace.bytes).unwrap()["outputs"].clone();
+        outputs.as_object_mut().unwrap().remove("l");
+        outputs
+    }
+
+    /// An object file and its name, as Lake names it.
+    fn object_code() -> (String, &'static [u8]) {
+        let bytes = b"object code".as_slice();
+        (format!("{:016x}.o", crate::lake_hash::of(bytes)), bytes)
     }
 
     /// Each file in `directory` with its modification time.
@@ -383,11 +405,11 @@ mod tests {
         blobs.put_file(&archive, &fixture()).unwrap();
         let staging = tempfile::tempdir().unwrap();
         let object = staging.path().join("object");
-        fs::write(&object, b"object code").unwrap();
+        let (o, code_bytes) = object_code();
+        fs::write(&object, code_bytes).unwrap();
         let (code, _) = blobs::hash_file(&object).unwrap();
         blobs.put_file(&code, &object).unwrap();
         let ltar = "89abcdef01234567.ltar".to_owned();
-        let o = "0d9deac573f269f3.o".to_owned();
         // Two inputs per output, as a union of publishers' maps has them.
         let entry = |name: &String, cid| Entry {
             output: format!("\"{name}\""),
@@ -405,33 +427,13 @@ mod tests {
         assert_eq!(rows["1123456789abcde0"], format!("\"{o}\""));
         assert_eq!(rows["0123456789abcdef"], rows["0123456789abcde0"]);
         let outputs: Value = serde_json::from_str(&rows["0123456789abcdef"]).unwrap();
-        assert_eq!(
-            outputs,
-            serde_json::json!({
-                "m": true,
-                "o": ["1111111111111111.olean", "2222222222222222.olean.server",
-                      "3333333333333333.olean.private"],
-                "i": "4444444444444444.ilean",
-                "rs": "5555555555555555.ir.sig",
-                "r": "6666666666666666.ir",
-                "c": "7777777777777777.c",
-            })
-        );
+        assert_eq!(outputs, fixture_outputs());
         let first = listing(artifacts.path());
-        let names: Vec<_> = first.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "0d9deac573f269f3.o",
-                "1111111111111111.olean",
-                "2222222222222222.olean.server",
-                "3333333333333333.olean.private",
-                "4444444444444444.ilean",
-                "5555555555555555.ir.sig",
-                "6666666666666666.ir",
-                "7777777777777777.c",
-            ]
-        );
+        let names: Vec<_> = first.iter().map(|(name, _)| name.clone()).collect();
+        let mut expected = mapping::names(&outputs).unwrap();
+        expected.push(o.clone());
+        expected.sort();
+        assert_eq!(names, expected);
         for (name, _) in &first {
             let path = artifacts.path().join(name);
             assert!(
@@ -439,7 +441,7 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(fs::read(artifacts.path().join(&o)).unwrap(), b"object code");
+        assert_eq!(fs::read(artifacts.path().join(&o)).unwrap(), code_bytes);
         // A warm cache: the same restore again succeeds and writes nothing.
         assert_eq!(install(&blobs, artifacts.path(), &entries).unwrap(), rows);
         assert_eq!(listing(artifacts.path()), first);
@@ -470,8 +472,10 @@ mod tests {
             ["0123456789abcde0", "0123456789abcdef"]
         );
         let outputs: Value = serde_json::from_str(&expanded["0123456789abcdef"]).unwrap();
-        assert_eq!(outputs["c"], "7777777777777777.c");
-        assert!(artifacts.path().join("1111111111111111.olean").is_file());
+        assert_eq!(outputs, fixture_outputs());
+        for name in mapping::names(&outputs).unwrap() {
+            assert!(artifacts.path().join(&name).is_file(), "{name}");
+        }
         let first = listing(artifacts.path());
         assert_eq!(expand(artifacts.path(), &rows).unwrap(), expanded);
         assert_eq!(listing(artifacts.path()), first);
