@@ -604,6 +604,48 @@ impl Project {
         self.record.join("build.json")
     }
 
+    /// Whether this checkout holds a recorded build `put` may publish under
+    /// its commit: one found published already at `HEAD`, or a receipt of
+    /// this clean tree, revision, platform and toolchain. A receipt of
+    /// another tree or revision describes an earlier build in a reused
+    /// checkout, not this one; `put` then publishes outputs only. A receipt
+    /// of another platform or toolchain, or of this tree with a mapping
+    /// changed since, still fails ([`receipt`]).
+    pub fn recorded(&self) -> Result<bool> {
+        if fs::read_to_string(self.published()).is_ok_and(|published| {
+            self.commit()
+                .is_ok_and(|commit| published.trim() == commit.trim())
+        }) {
+            return Ok(true);
+        }
+        let path = self.record.join("success.json");
+        if !path.is_file() {
+            return Ok(false);
+        }
+        let receipt: Receipt = json(&fs::read(&path).operation("read successful build receipt")?)?;
+        let identity = self.identity()?;
+        // This host's outputs belong to the scope it built them in; another
+        // platform or toolchain since the build must not publish them.
+        if receipt.identity.scope != identity.scope {
+            return Err(invalid(
+                "cache receipt does not match this platform and toolchain",
+            ));
+        }
+        if !self.git(&["status", "--porcelain"])?.is_empty() {
+            println!(
+                "Lake cache: the tree changed since the recorded build; publishing outputs only"
+            );
+            return Ok(false);
+        }
+        if receipt.identity.revision != identity.revision {
+            println!(
+                "Lake cache: the recorded build is of another revision; publishing outputs only"
+            );
+            return Ok(false);
+        }
+        self.receipt().map(|_| true)
+    }
+
     pub fn receipt(&self) -> Result<Receipt> {
         self.clean()?;
         let receipt: Receipt = json(

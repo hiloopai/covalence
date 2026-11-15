@@ -157,12 +157,9 @@ fn execute(cli: Cli) -> Result<()> {
             Action::Put => {
                 // Commit-keyed records come only from a build `build`
                 // recorded at this clean commit, or found published already;
-                // a stale or changed record publishes nothing.
-                let receipt = project.record.join("success.json").is_file();
-                if receipt {
-                    project.receipt()?;
-                }
-                let recorded = receipt || project.published().is_file();
+                // a receipt of another tree publishes outputs only, and a
+                // changed one fails.
+                let recorded = project.recorded()?;
                 let built = outputs::built(&project)?;
                 if built.is_empty() && !recorded {
                     println!("Lake cache: nothing built since the last put");

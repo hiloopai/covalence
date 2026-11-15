@@ -632,6 +632,38 @@ fn unsuccessful_or_stale_receipts_cannot_publish() {
 }
 
 #[test]
+fn a_receipt_of_another_tree_leaves_put_its_outputs() {
+    let fixture = Fixture::new();
+    fixture.build();
+    checked(fixture.cli("put").arg("--seed"));
+    let pointers = |fixture: &Fixture| {
+        fixture
+            .server
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|key| key.contains("/rev/"))
+            .count()
+    };
+    let before = pointers(&fixture);
+    // A reused checkout's next session builds with Lake alone, no restore,
+    // and its tree no longer matches the recorded build.
+    fs::write(fixture.root.join("SCRATCH"), "a session's file\n").unwrap();
+    checked(fixture.lake().args(["build", "Demo"]));
+    let published = log(&checked(&mut fixture.cli("put")));
+    assert!(published.contains("publishing outputs only"), "{published}");
+    assert_eq!(pointers(&fixture), before);
+    // So does a later revision.
+    fs::remove_file(fixture.root.join("SCRATCH")).unwrap();
+    fs::write(fixture.root.join("NOTES"), "a later commit\n").unwrap();
+    fixture.commit();
+    let published = log(&checked(&mut fixture.cli("put")));
+    assert!(published.contains("of another revision"), "{published}");
+    assert_eq!(pointers(&fixture), before);
+}
+
+#[test]
 fn a_restore_forgets_an_earlier_builds_receipt() {
     let fixture = Fixture::new();
     fixture.build();
