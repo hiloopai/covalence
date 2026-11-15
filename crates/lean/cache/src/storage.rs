@@ -216,6 +216,18 @@ pub(crate) fn nearest(
 }
 
 /// The CID of each file, hashed in parallel.
+/// Each artifact name the entries give, with its CID.
+fn cids<'a>(entries: impl Iterator<Item = &'a Entry>) -> BTreeMap<String, Sha256> {
+    entries
+        .flat_map(|entry| {
+            entry
+                .artifacts
+                .iter()
+                .map(|(name, cid)| (name.clone(), *cid))
+        })
+        .collect()
+}
+
 fn hash_files(files: &[(String, std::path::PathBuf)]) -> Result<BTreeMap<String, (Sha256, u64)>> {
     Ok(files
         .iter()
@@ -228,19 +240,25 @@ fn hash_files(files: &[(String, std::path::PathBuf)]) -> Result<BTreeMap<String,
 
 /// The entries of a Lake mapping, with each artifact's CID, from files in
 /// `directory`. With `complete`, entries naming a missing artifact fail;
-/// without, they are left out.
+/// without, they are left out. A file `known` names keeps that CID unread: a
+/// Lake artifact's name is the hash of its content.
 fn mapped_entries(
     mapping_path: &Path,
     directory: &Path,
     complete: bool,
+    known: &BTreeMap<String, Sha256>,
 ) -> Result<BTreeMap<String, Entry>> {
     let rows = mapping::rows(mapping_path)?;
+    let mut present = BTreeSet::new();
     let mut files = BTreeMap::new();
     for (_, names) in rows.values() {
         for name in names {
             let path = directory.join(name);
             if path.is_file() {
-                files.insert(name.clone(), path);
+                present.insert(name.clone());
+                if !known.contains_key(name) {
+                    files.insert(name.clone(), path);
+                }
             } else if complete {
                 return Err(invalid(format!("artifact {} is missing", path.display())));
             }
@@ -253,7 +271,13 @@ fn mapped_entries(
         .filter_map(|(input, (output, names))| {
             let artifacts = names
                 .iter()
-                .map(|name| hashes.get(name).map(|(cid, _)| (name.clone(), *cid)))
+                .map(|name| {
+                    let cid = known
+                        .get(name)
+                        .filter(|_| present.contains(name))
+                        .or_else(|| hashes.get(name).map(|(cid, _)| cid))?;
+                    Some((name.clone(), *cid))
+                })
                 .collect::<Option<BTreeMap<_, _>>>()?;
             Some((input, Entry { output, artifacts }))
         })
@@ -320,6 +344,7 @@ fn publish_package(publisher: &Publisher, package: &Package) -> Result<Option<Pu
                 pool::copy_nodes(remote, &*local.nodes(), root)?;
                 upstream = pool::entries(&Map::open(local.nodes(), root))?;
             }
+            let known = cids(upstream.values());
             // Fold in the upstream snapshots Lake fetched for this package, so
             // the pool covers at least what upstream does. Upstream services
             // name snapshots by a pinned commit, not always the package's own.
@@ -330,16 +355,30 @@ fn publish_package(publisher: &Publisher, package: &Package) -> Result<Option<Pu
                     .join(&package.name)
                     .join(format!("{pin}.jsonl"));
                 if path.is_file() {
-                    upstream.extend(mapped_entries(&path, artifacts, false)?);
+                    upstream.extend(mapped_entries(&path, artifacts, false, &known)?);
                 }
             }
             (existing.map(|root| (commit.clone(), root)), upstream)
         }
     };
+    let parent_map = match &parent {
+        Some((_, root)) => {
+            pool::copy_nodes(remote, &*local.nodes(), *root)?;
+            Some(Map::open(local.nodes(), *root))
+        }
+        None => None,
+    };
+    // Hashing every artifact took 177 s of erebor's 187 s publish, which
+    // changed 4 of its 6,970 entries.
+    let known = match &parent_map {
+        Some(map) => cids(pool::entries(map)?.values()),
+        None => BTreeMap::new(),
+    };
     entries.extend(mapped_entries(
         &project.mapping(&package.name),
         artifacts,
         true,
+        &known,
     )?);
     if entries.is_empty() {
         return Ok(None);
@@ -351,13 +390,6 @@ fn publish_package(publisher: &Publisher, package: &Package) -> Result<Option<Pu
     {
         return Ok(None);
     }
-    let parent_map = match &parent {
-        Some((_, root)) => {
-            pool::copy_nodes(remote, &*local.nodes(), *root)?;
-            Some(Map::open(local.nodes(), *root))
-        }
-        None => None,
-    };
     let transfer = pool::transfer(parent_map.as_ref(), &map)?;
     let wanted = transfer
         .artifacts
@@ -532,6 +564,36 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>, seed: bool) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_known_artifact_keeps_its_cid_unread_and_a_missing_one_still_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = dir.path().join("artifacts");
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(artifacts.join("00000000000000a1.olean"), "a").unwrap();
+        fs::write(artifacts.join("00000000000000b1.olean"), "b").unwrap();
+        let mapping = dir.path().join("demo.jsonl");
+        fs::write(
+            &mapping,
+            "\"2026-03-17\"\n[\"000000000000000a\",\"00000000000000a1.olean\"]\n[\"000000000000000b\",\"00000000000000b1.olean\"]\n",
+        )
+        .unwrap();
+        // A CID the file's bytes do not have: kept, so the file is not read.
+        let (other, _) = blobs::hash_file(&mapping).unwrap();
+        let known = BTreeMap::from([("00000000000000a1.olean".to_owned(), other)]);
+        let entries = mapped_entries(&mapping, &artifacts, true, &known).unwrap();
+        assert_eq!(
+            entries["000000000000000a"].artifacts["00000000000000a1.olean"],
+            other
+        );
+        let (b, _) = blobs::hash_file(&artifacts.join("00000000000000b1.olean")).unwrap();
+        assert_eq!(
+            entries["000000000000000b"].artifacts["00000000000000b1.olean"],
+            b
+        );
+        fs::remove_file(artifacts.join("00000000000000a1.olean")).unwrap();
+        assert!(mapped_entries(&mapping, &artifacts, true, &known).is_err());
+    }
 
     #[test]
     fn parallel_results_keep_input_order() {
