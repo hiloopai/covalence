@@ -322,10 +322,8 @@ pub(crate) fn restore(
         }
         let nearest = storage::nearest(&**kv, project, scope, &packages[0], &commits)?;
         let looked_up = started.elapsed();
-        let fresh = seed
-            && local
-                .installed(Installed::Mappings, scope, &packages[0].name)?
-                .is_none();
+        let installed = local.installed(Installed::Mappings, scope, &packages[0].name)?;
+        let fresh = seed && installed.is_none();
         let remote = match nearest.as_ref().filter(|_| fresh) {
             Some((commit, _)) => seed::find(&**kv, scope, &project.namespace(), commit, &commits)?,
             None => None,
@@ -358,8 +356,13 @@ pub(crate) fn restore(
             session.configure(project)?;
         }
         // The import closure needs only the checked-out sources and the
-        // pool, so it is read while the seed downloads.
-        let prefetching = lazy.then(|| {
+        // pool, so it is read while the seed downloads. A host that installed
+        // this base already holds what a prefetch would place: reading the
+        // closure cost 1.3 s of a warm 2.6 s restore of silmaril-lean.
+        let current = nearest
+            .as_ref()
+            .is_some_and(|(_, root)| installed == Some(*root));
+        let prefetching = (lazy && !current).then(|| {
             let commit = nearest.as_ref().map(|(commit, _)| commit.clone());
             let (packages, scope) = (&packages, scope.to_owned());
             threads.spawn(move || {

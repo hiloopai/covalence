@@ -1205,6 +1205,10 @@ fn module_traces_name_the_recorded_inputs_and_targeted_restores_prefetch_them() 
         !restored.contains("Unpacked Demo.A"),
         "unpacked: {restored}"
     );
+    // This host installed that base: another restore has nothing to place.
+    let again = log(&checked(fixture.cli("get").args(["--", "Demo.A"])));
+    assert!(!again.contains("prefetching"), "{again}");
+    assert!(!again.contains("Built Demo.A"), "rebuilt: {again}");
 }
 
 #[test]
