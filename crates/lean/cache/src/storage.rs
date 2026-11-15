@@ -571,11 +571,11 @@ mod tests {
         let artifacts = dir.path().join("artifacts");
         fs::create_dir_all(&artifacts).unwrap();
         fs::write(artifacts.join("00000000000000a1.olean"), "a").unwrap();
-        fs::write(artifacts.join("00000000000000b1.olean"), "b").unwrap();
+        fs::write(artifacts.join("8ef1a9e2e9f4162f.olean"), "b").unwrap();
         let mapping = dir.path().join("demo.jsonl");
         fs::write(
             &mapping,
-            "\"2026-03-17\"\n[\"000000000000000a\",\"00000000000000a1.olean\"]\n[\"000000000000000b\",\"00000000000000b1.olean\"]\n",
+            "\"2026-03-17\"\n[\"000000000000000a\",\"00000000000000a1.olean\"]\n[\"000000000000000b\",\"8ef1a9e2e9f4162f.olean\"]\n",
         )
         .unwrap();
         // A CID the file's bytes do not have: kept, so the file is not read.
@@ -586,9 +586,9 @@ mod tests {
             entries["000000000000000a"].artifacts["00000000000000a1.olean"],
             other
         );
-        let (b, _) = blobs::hash_file(&artifacts.join("00000000000000b1.olean")).unwrap();
+        let (b, _) = blobs::hash_file(&artifacts.join("8ef1a9e2e9f4162f.olean")).unwrap();
         assert_eq!(
-            entries["000000000000000b"].artifacts["00000000000000b1.olean"],
+            entries["000000000000000b"].artifacts["8ef1a9e2e9f4162f.olean"],
             b
         );
         fs::remove_file(artifacts.join("00000000000000a1.olean")).unwrap();
