@@ -549,7 +549,9 @@ impl Project {
                 command.args(["--package", &package.name]);
             }
             run("Lake build", command.args(targets))?;
-            add_traced_outputs(&mapping, &build, &self.cache_dir()?.join("artifacts"))?;
+            let artifacts = self.cache_dir()?.join("artifacts");
+            add_traced_outputs(&mapping, &build, &artifacts)?;
+            check_archive_rows(&mapping, &build, &artifacts)?;
             Index::record(&build, &mapping)?.save(&self.modules(&package.name))?;
             recorded.insert(package.name.clone(), digest(&mapping)?);
         }
@@ -663,6 +665,68 @@ fn add_traced_outputs(mapping: &Path, build: &Path, artifacts: &Path) -> Result<
     Ok(added)
 }
 
+/// Hold every archive Lake recorded to the outputs its module's trace names.
+/// Lake records the archive it finds in a module's build folder, even after
+/// restoring that module's files for a new input, so a recording can pair
+/// an input with an archive of another build. A host that later restores the
+/// input unpacks that archive under it and builds against its files. A row
+/// whose archive holds other outputs than the trace for its input takes the
+/// trace's outputs instead, or is left out when they are not all in Lake's
+/// cache; a row without such a trace stays.
+fn check_archive_rows(mapping: &Path, build: &Path, artifacts: &Path) -> Result<()> {
+    let mut traced = BTreeMap::new();
+    for trace in files(build, "trace")? {
+        let bytes = fs::read(&trace).operation(format!("read {}", trace.display()))?;
+        let Ok(trace) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let (Some(input), serde_json::Value::Object(mut outputs)) =
+            (trace["depHash"].as_str(), trace["outputs"].clone())
+        else {
+            continue;
+        };
+        outputs.remove("l");
+        traced.insert(input.to_owned(), outputs);
+    }
+    let mut rows = BTreeMap::new();
+    let (mut replaced, mut dropped) = (0, 0);
+    for (input, (output, _)) in mapping::rows(mapping)? {
+        let archive = serde_json::from_str::<serde_json::Value>(&output)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .filter(|name| name.ends_with(".ltar"));
+        let (Some(archive), Some(expected)) = (archive, traced.get(&input)) else {
+            rows.insert(input, output);
+            continue;
+        };
+        let held = fs::read(artifacts.join(&archive))
+            .ok()
+            .and_then(|bytes| crate::archives::outputs(&bytes, &archive).ok());
+        if held.as_ref() == Some(expected) {
+            rows.insert(input, output);
+            continue;
+        }
+        let expected = serde_json::Value::Object(expected.clone());
+        if mapping::names(&expected)?
+            .iter()
+            .all(|name| artifacts.join(name).is_file())
+        {
+            rows.insert(input, expected.to_string());
+            replaced += 1;
+        } else {
+            dropped += 1;
+        }
+    }
+    if replaced + dropped > 0 {
+        println!(
+            "Lake cache: {} recorded archives held other outputs than their module's trace: {replaced} take the trace's outputs, {dropped} are left out",
+            replaced + dropped
+        );
+        mapping::write(mapping, &rows)?;
+    }
+    Ok(())
+}
+
 /// The files with `extension` under `directory`, if it exists.
 pub(crate) fn files(directory: &Path, extension: &str) -> Result<Vec<PathBuf>> {
     let mut found = Vec::new();
@@ -734,6 +798,52 @@ fn named_commits(text: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recorded_archive_of_another_build_takes_its_traces_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (build, artifacts) = (dir.path().join("build"), dir.path().join("artifacts"));
+        fs::create_dir_all(build.join("lib/lean")).unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        // A module archive Lake packed, its files named by their bytes.
+        let archive = "cd9cef913c0321f4.ltar";
+        let bytes = fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(archive),
+        )
+        .unwrap();
+        fs::write(artifacts.join(archive), &bytes).unwrap();
+        let held = serde_json::Value::Object(crate::archives::outputs(&bytes, archive).unwrap());
+        // This build's olean for input `aa`, which the archive does not hold.
+        let olean = format!("{:016x}.olean", crate::lake_hash::of(b"this build"));
+        fs::write(artifacts.join(&olean), b"this build").unwrap();
+        let traced = serde_json::json!({"o": [olean]});
+        let trace = |name: &str, input: &str, outputs: &serde_json::Value| {
+            fs::write(
+                build.join("lib/lean").join(name),
+                serde_json::json!({"depHash": input, "outputs": outputs}).to_string(),
+            )
+            .unwrap();
+        };
+        trace("A.trace", "00000000000000aa", &traced);
+        trace("B.trace", "00000000000000bb", &held);
+        let mapping = dir.path().join("p.jsonl");
+        fs::write(
+            &mapping,
+            format!(
+                "\"2026-03-17\"\n[\"00000000000000aa\",\"{archive}\"]\n[\"00000000000000bb\",\"{archive}\"]\n"
+            ),
+        )
+        .unwrap();
+        check_archive_rows(&mapping, &build, &artifacts).unwrap();
+        let rows = mapping::rows(&mapping).unwrap();
+        let output =
+            |input: &str| -> serde_json::Value { serde_json::from_str(&rows[input].0).unwrap() };
+        assert_eq!(output("00000000000000aa"), traced);
+        // An archive that holds what its trace names stays.
+        assert_eq!(output("00000000000000bb"), serde_json::json!(archive));
+    }
 
     #[test]
     fn named_commits_are_full_revisions_nearest_first() {

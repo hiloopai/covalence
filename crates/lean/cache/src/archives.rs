@@ -186,11 +186,16 @@ fn local_archive<'a>(artifacts: &Path, output: &'a str) -> Option<&'a str> {
 
 /// Writes an archive's files, which `name` names in errors, and returns the
 /// outputs its trace names.
-fn place(artifacts: &Path, bytes: &[u8], name: &str, inputs: &[&str]) -> Result<String> {
-    // Check every mapping before sharing this archive's decoded files.
-    for input in inputs {
-        validate_input(bytes, name, input)?;
-    }
+/// An archive's files, its module's path stem, and the outputs its trace
+/// names without the archive itself.
+fn decode(
+    bytes: &[u8],
+    name: &str,
+) -> Result<(
+    covalence_lean_ltar::Archive,
+    String,
+    serde_json::Map<String, Value>,
+)> {
     // The input hash goes only into the trace's `depHash`, which Lake does
     // not read here, so one decode serves every input naming the archive.
     let archive = covalence_lean_ltar::unpack(bytes, 0).map_err(|source| Error::Archive {
@@ -201,13 +206,28 @@ fn place(artifacts: &Path, bytes: &[u8], name: &str, inputs: &[&str]) -> Result<
         .trace
         .path
         .strip_suffix(".trace")
-        .ok_or_else(|| invalid(format!("archive {name} has no module trace")))?;
+        .ok_or_else(|| invalid(format!("archive {name} has no module trace")))?
+        .to_owned();
     let trace: Value = json(&archive.trace.bytes)?;
     let Some(Value::Object(mut outputs)) = trace.get("outputs").cloned() else {
         return Err(invalid(format!("archive {name} names no module outputs")));
     };
     // Lake would resolve the archive too; the files are all it needs.
     outputs.remove("l");
+    Ok((archive, stem, outputs))
+}
+
+/// The outputs archive `name` holds, without the archive itself.
+pub(crate) fn outputs(bytes: &[u8], name: &str) -> Result<serde_json::Map<String, Value>> {
+    decode(bytes, name).map(|(_, _, outputs)| outputs)
+}
+
+fn place(artifacts: &Path, bytes: &[u8], name: &str, inputs: &[&str]) -> Result<String> {
+    // Check every mapping before sharing this archive's decoded files.
+    for input in inputs {
+        validate_input(bytes, name, input)?;
+    }
+    let (archive, stem, outputs) = decode(bytes, name)?;
     let mut names = Vec::new();
     for value in outputs.values() {
         match value {
