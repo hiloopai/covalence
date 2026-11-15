@@ -796,7 +796,14 @@ mod tests {
         assert!(sweep(&cache.path, cutoff()).unwrap().is_none());
         assert!(cache.has("artifacts/000000000000000a.olean"));
         drop(running);
-        assert!(sweep(&cache.path, cutoff()).unwrap().is_some());
+        // A process another test forks holds a copy of each descriptor open
+        // at that moment, a lock's too, until it executes: a sweep can still
+        // find the lock held for that long after the command ends.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sweep(&cache.path, cutoff()).unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the lock stayed held");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert!(!cache.has("artifacts/000000000000000a.olean"));
     }
 }
