@@ -17,6 +17,13 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Changed
 
+- `cov-kernel-checker receipt-cache push` uploads a pack of only the modules
+  whose ledger rows changed since the index the checkout pulled; the index
+  (`mor/receipt-pack/v2`) names the earlier packs that hold the rest, and past
+  16 packs a push merges them into one. A push no longer restores the parent's
+  receipts locally first. `pull` reads these indexes and the single-pack
+  `mor/receipt-pack/v1` indexes earlier checkers wrote; earlier checkers cannot
+  read the new ones.
 - `cov-lake-cache build`, and `get` or `dependencies` with targets, fail when a
   module belongs to more than one Lake library of its package, naming the
   module and the libraries. Such a module's trace depended on which library a

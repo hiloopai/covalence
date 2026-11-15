@@ -32,3 +32,6 @@ tempfile = "3"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+covalence-kv-memory.workspace = true

@@ -988,6 +988,7 @@ dependencies = [
  "covalence-cas-prolly",
  "covalence-cas-sqlite",
  "covalence-cas-trait",
+ "covalence-kv-memory",
  "covalence-kv-s3",
  "covalence-kv-trait",
  "covalence-lib-cid",

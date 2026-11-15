@@ -23,7 +23,12 @@ use std::{
     time::Instant,
 };
 
-const FORMAT: &str = "mor/receipt-pack/v1";
+const FORMAT: &str = "mor/receipt-pack/v2";
+/// What earlier checkers wrote: an index naming one pack of every module.
+const FORMAT_V1: &str = "mor/receipt-pack/v1";
+/// A push adds a pack of only the modules whose rows changed; an index naming
+/// more than this many packs is written as one merged pack instead.
+const MAX_PACKS: usize = 16;
 const REPLAY: &str = "mor/kernel-replay/v1";
 const MAX_PACK: u64 = 512 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 2 * 1024 * 1024 * 1024;
@@ -63,16 +68,43 @@ enum Command {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(crate = "covalence_lib_serde::serde")]
+#[serde(deny_unknown_fields)]
+struct Pack {
+    pack: String,
+    bytes: u64,
+}
+
+/// A revision's receipts: its ledger and the packs that hold them, oldest
+/// first. A module in a later pack replaces the same module in an earlier one.
 #[derive(Serialize, Deserialize)]
 #[serde(crate = "covalence_lib_serde::serde")]
 #[serde(deny_unknown_fields)]
 struct Index {
     format: String,
     scope: String,
-    pack: String,
-    bytes: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    packs: Vec<Pack>,
+    /// `FORMAT_V1`'s single pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pack: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bytes: Option<u64>,
     ledger: String,
     ledger_hash: String,
+}
+
+impl Index {
+    fn packs(&self) -> Vec<Pack> {
+        match (&self.pack, self.bytes) {
+            (Some(pack), Some(bytes)) => vec![Pack {
+                pack: pack.clone(),
+                bytes,
+            }],
+            _ => self.packs.clone(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -81,7 +113,9 @@ struct Index {
 struct Header {
     format: String,
     scope: String,
-    ledger: String,
+    /// `FORMAT_V1` packs carried their ledger; an index carries it now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ledger: Option<String>,
 }
 
 // Field order matches the checker's manifest encoding, hence its CAS identity.
@@ -243,65 +277,30 @@ fn index_key(scope: &str, revision: &str) -> Result<String> {
     Ok(format!("indexes/{scope}/{revision}.json"))
 }
 
-fn publish(kv: &dyn Kv, args: &Args, revision: &str) -> Result<Value> {
-    let key = index_key(&args.scope, revision)?;
-    let ledger = fs::read_to_string(&args.ledger).into_diagnostic()?;
-    // A reader imports only changed modules. Carry unchanged proof maps forward
-    // before publishing the next snapshot, preserving all new local pointers.
-    let parent = args
-        .state
-        .join("shared")
-        .join(format!("{}.json", args.scope));
-    let mut missing = false;
-    for row in ledger.lines().skip(1) {
-        let name = row
-            .split('\t')
-            .next()
-            .ok_or_else(|| miette!("invalid module ledger"))?;
-        if !args
-            .state
-            .join("modules")
-            .join(relative(name)?)
-            .with_extension("json")
-            .is_file()
-        {
-            missing = true;
-        }
-    }
-    if missing && parent.is_file() {
-        let index: Index =
-            serde_json::from_slice(&fs::read(parent).into_diagnostic()?).into_diagnostic()?;
-        validate_index(&index, &args.scope)?;
-        let scratch = tempfile::tempdir().into_diagnostic()?;
-        let previous = Args {
-            remote: args.remote.clone(),
-            scope: args.scope.clone(),
-            state: args.state.clone(),
-            ledger: scratch.path().join("ledger"),
-            current_inputs: None,
-            command: Command::Pull { revision: vec![] },
-        };
-        restore_pack(kv, &previous, &index)?;
-    }
+fn module_name(row: &str) -> Result<&str> {
+    row.split('\t')
+        .next()
+        .ok_or_else(|| miette!("invalid module ledger"))
+}
 
-    let header = Header {
-        format: FORMAT.into(),
-        scope: args.scope.clone(),
-        ledger,
-    };
+/// Write `lines`, each a module's record, as one pack, and upload it.
+fn write_pack<'a>(
+    kv: &dyn Kv,
+    scope: &str,
+    lines: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<Pack> {
     let mut pack = tempfile::tempfile().into_diagnostic()?;
     let mut gzip = GzEncoder::new(&mut pack, Compression::fast());
-    line(&mut gzip, &header)?;
-    let mut count = 0;
-    for row in header.ledger.lines().skip(1) {
-        let name = row
-            .split('\t')
-            .next()
-            .ok_or_else(|| miette!("invalid module ledger"))?;
-        if let Some(module) = export_module(&args.state, name)? {
-            line(&mut gzip, &module)?;
-            count += 1;
-        }
+    line(
+        &mut gzip,
+        &Header {
+            format: FORMAT.into(),
+            scope: scope.into(),
+            ledger: None,
+        },
+    )?;
+    for record in lines {
+        gzip.write_all(record).into_diagnostic()?;
     }
     gzip.finish().into_diagnostic()?;
     let bytes = pack.metadata().into_diagnostic()?.len();
@@ -309,17 +308,98 @@ fn publish(kv: &dyn Kv, args: &Args, revision: &str) -> Result<Value> {
         return Err(miette!("receipt pack exceeds {MAX_PACK} bytes"));
     }
     let hash = digest(&mut pack)?;
-    let blob = format!("packs/{hash}");
     // No index can point at an incomplete pack, even after an interrupted upload.
-    kv.put_new_from(blob.as_bytes(), &mut pack, bytes)
+    kv.put_new_from(format!("packs/{hash}").as_bytes(), &mut pack, bytes)
         .into_diagnostic()?;
+    Ok(Pack { pack: hash, bytes })
+}
+
+/// Publish this ledger's receipts under `revision`. Against the index this
+/// checkout pulled, only the modules whose ledger rows changed go into a new
+/// pack; the index names it after the parent's packs, which still hold every
+/// other module. Past [`MAX_PACKS`] the packs are merged into one.
+fn publish(kv: &dyn Kv, args: &Args, revision: &str) -> Result<Value> {
+    let key = index_key(&args.scope, revision)?;
+    let mut phases = serde_json::Map::new();
+    let mut phase = Instant::now();
+    let mut mark = |name: &str, phase: &mut Instant| {
+        phases.insert(name.into(), json!(phase.elapsed().as_secs_f64()));
+        *phase = Instant::now();
+    };
+    let ledger = fs::read_to_string(&args.ledger).into_diagnostic()?;
+    let shared = args
+        .state
+        .join("shared")
+        .join(format!("{}.json", args.scope));
+    let parent = if shared.is_file() {
+        let index: Index =
+            serde_json::from_slice(&fs::read(&shared).into_diagnostic()?).into_diagnostic()?;
+        validate_index(&index, &args.scope)?;
+        // A changed policy line makes every row new.
+        (index.ledger.lines().next() == ledger.lines().next()).then_some(index)
+    } else {
+        None
+    };
+    let before = parent
+        .as_ref()
+        .map(|index| {
+            index
+                .ledger
+                .lines()
+                .skip(1)
+                .map(|row| Ok((module_name(row)?, row)))
+                .collect::<Result<BTreeMap<_, _>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut current = BTreeSet::new();
+    let mut fresh = BTreeMap::new();
+    for row in ledger.lines().skip(1) {
+        let name = module_name(row)?;
+        current.insert(name.to_owned());
+        if before.get(name) == Some(&row) {
+            continue;
+        }
+        if let Some(module) = export_module(&args.state, name)? {
+            let mut record = serde_json::to_vec(&module).into_diagnostic()?;
+            record.push(b'\n');
+            fresh.insert(name.to_owned(), record);
+        }
+    }
+    let changed = fresh.len();
+    mark("export", &mut phase);
+    let mut packs = parent.as_ref().map(Index::packs).unwrap_or_default();
+    let mut uploaded = Vec::new();
+    if packs.len() >= MAX_PACKS {
+        // Newest first: a module's latest receipt wins.
+        let mut merged = fresh;
+        for pack in packs.iter().rev() {
+            let mut file = fetch_pack(kv, pack)?;
+            each_module(&mut file, &args.scope, |record, module| {
+                if current.contains(&module.name) && !merged.contains_key(&module.name) {
+                    merged.insert(module.name, record.to_vec());
+                }
+                Ok(())
+            })?;
+        }
+        mark("merge", &mut phase);
+        let pack = write_pack(kv, &args.scope, merged.values().map(Vec::as_slice))?;
+        uploaded.push(pack.clone());
+        packs = vec![pack];
+    } else if !fresh.is_empty() || packs.is_empty() {
+        let pack = write_pack(kv, &args.scope, fresh.values().map(Vec::as_slice))?;
+        uploaded.push(pack.clone());
+        packs.push(pack);
+    }
+    mark("upload", &mut phase);
     let index = Index {
         format: FORMAT.into(),
         scope: args.scope.clone(),
-        pack: hash,
-        bytes,
-        ledger_hash: blake3::hash(header.ledger.as_bytes()).to_hex().to_string(),
-        ledger: header.ledger,
+        packs,
+        pack: None,
+        bytes: None,
+        ledger_hash: blake3::hash(ledger.as_bytes()).to_hex().to_string(),
+        ledger,
     };
     let created = kv
         .put_new(
@@ -327,9 +407,16 @@ fn publish(kv: &dyn Kv, args: &Args, revision: &str) -> Result<Value> {
             serde_json::to_vec(&index).into_diagnostic()?.into(),
         )
         .into_diagnostic()?;
-    Ok(
-        json!({"status":"published", "new_index":created, "modules":count, "bytes":bytes, "pack":index.pack}),
-    )
+    mark("index", &mut phase);
+    Ok(json!({
+        "status": "published",
+        "new_index": created,
+        "modules": changed,
+        "packs": index.packs.len(),
+        "bytes": uploaded.iter().map(|pack| pack.bytes).sum::<u64>(),
+        "uploaded": uploaded.iter().map(|pack| pack.pack.clone()).collect::<Vec<_>>(),
+        "phases": phases,
+    }))
 }
 
 fn read_line(input: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
@@ -362,10 +449,7 @@ fn needed(args: &Args, ledger: &str) -> Result<Option<BTreeSet<String>>> {
         .skip(1)
         .filter(|row| !same_policy || !saved.contains(row))
         .map(|row| {
-            let name = row
-                .split('\t')
-                .next()
-                .ok_or_else(|| miette!("invalid input row"))?;
+            let name = module_name(row)?;
             relative(name)?;
             Ok(name.to_owned())
         })
@@ -373,27 +457,22 @@ fn needed(args: &Args, ledger: &str) -> Result<Option<BTreeSet<String>>> {
         .map(Some)
 }
 
-fn unpack(file: &mut fs::File, args: &Args) -> Result<usize> {
-    let mut input = BufReader::new(GzDecoder::new(file).take(MAX_EXPANDED + 1));
+/// Each module of a hash-checked pack, with its record line, after checking
+/// the pack's header against `scope`.
+fn each_module(
+    file: &mut fs::File,
+    scope: &str,
+    mut visit: impl FnMut(&[u8], Module) -> Result<()>,
+) -> Result<()> {
+    file.rewind().into_diagnostic()?;
+    let mut input = BufReader::new(GzDecoder::new(&mut *file).take(MAX_EXPANDED + 1));
     let bytes = read_line(&mut input)?.ok_or_else(|| miette!("empty receipt pack"))?;
     let header: Header = serde_json::from_slice(&bytes).into_diagnostic()?;
-    if header.format != FORMAT || header.scope != args.scope {
+    if !matches!(header.format.as_str(), FORMAT | FORMAT_V1) || header.scope != scope {
         return Err(miette!("receipt pack scope/format mismatch"));
     }
-    let needed = needed(args, &header.ledger)?;
-    // The complete pack was hash-checked before parsing. Only misses need local
-    // proof maps: unchanged modules already have a trusted module-level receipt.
-    let parent = args
-        .state
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent).into_diagnostic()?;
-    // Sticky disks may be on a different filesystem from the runner's /tmp.
-    let staged = tempfile::tempdir_in(parent).into_diagnostic()?;
     let mut size = bytes.len() as u64;
     let mut names = BTreeSet::new();
-    let mut imported = BTreeSet::new();
     while let Some(bytes) = read_line(&mut input)? {
         size += bytes.len() as u64;
         if size > MAX_EXPANDED {
@@ -404,19 +483,47 @@ fn unpack(file: &mut fs::File, args: &Args) -> Result<usize> {
             return Err(miette!("duplicate receipt module"));
         }
         relative(&module.name)?;
-        if needed
-            .as_ref()
-            .is_none_or(|selected| selected.contains(&module.name))
-            && !args
-                .state
-                .join("modules")
-                .join(relative(&module.name)?)
-                .with_extension("json")
-                .exists()
-        {
-            import_module(staged.path(), &module)?;
-            imported.insert(module.name);
-        }
+        visit(&bytes, module)?;
+    }
+    Ok(())
+}
+
+/// Import from `packs`, newest first, the receipts this checkout lacks, then
+/// write `ledger`. The packs were hash-checked before parsing. Only misses
+/// need local proof maps: unchanged modules already have a trusted
+/// module-level receipt.
+fn unpack(packs: &mut [fs::File], args: &Args, ledger: &str) -> Result<usize> {
+    let needed = needed(args, ledger)?;
+    let parent = args
+        .state
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).into_diagnostic()?;
+    // Sticky disks may be on a different filesystem from the runner's /tmp.
+    let staged = tempfile::tempdir_in(parent).into_diagnostic()?;
+    let mut seen = BTreeSet::new();
+    let mut imported = BTreeSet::new();
+    for file in packs.iter_mut() {
+        each_module(file, &args.scope, |_, module| {
+            if !seen.insert(module.name.clone()) {
+                return Ok(());
+            }
+            if needed
+                .as_ref()
+                .is_none_or(|selected| selected.contains(&module.name))
+                && !args
+                    .state
+                    .join("modules")
+                    .join(relative(&module.name)?)
+                    .with_extension("json")
+                    .exists()
+            {
+                import_module(staged.path(), &module)?;
+                imported.insert(module.name);
+            }
+            Ok(())
+        })?;
     }
     for name in &imported {
         let relative = relative(name)?;
@@ -455,30 +562,51 @@ fn unpack(file: &mut fs::File, args: &Args) -> Result<usize> {
             )?;
         }
     }
-    atomic(&args.ledger, header.ledger.as_bytes())?;
+    atomic(&args.ledger, ledger.as_bytes())?;
     Ok(imported.len())
 }
 
 fn validate_index(index: &Index, scope: &str) -> Result<()> {
-    if index.format != FORMAT
+    let shape = match index.format.as_str() {
+        FORMAT => index.pack.is_none() && index.bytes.is_none() && !index.packs.is_empty(),
+        FORMAT_V1 => index.pack.is_some() && index.bytes.is_some() && index.packs.is_empty(),
+        _ => false,
+    };
+    if !shape
         || index.scope != scope
-        || index.bytes > MAX_PACK
+        || index.packs().len() > MAX_PACKS
         || blake3::hash(index.ledger.as_bytes()).to_hex().as_str() != index.ledger_hash
     {
         return Err(miette!("invalid receipt index"));
     }
-    hex(&index.pack, &[64])
+    for pack in index.packs() {
+        if pack.bytes > MAX_PACK {
+            return Err(miette!("invalid receipt index"));
+        }
+        hex(&pack.pack, &[64])?;
+    }
+    Ok(())
 }
 
-fn restore_pack(kv: &dyn Kv, args: &Args, index: &Index) -> Result<usize> {
-    let mut pack = tempfile::tempfile().into_diagnostic()?;
+fn fetch_pack(kv: &dyn Kv, pack: &Pack) -> Result<fs::File> {
+    let mut file = tempfile::tempfile().into_diagnostic()?;
     let size = kv
-        .get_to(format!("packs/{}", index.pack).as_bytes(), &mut pack)
+        .get_to(format!("packs/{}", pack.pack).as_bytes(), &mut file)
         .into_diagnostic()?;
-    if size != Some(index.bytes) || digest(&mut pack)? != index.pack {
+    if size != Some(pack.bytes) || digest(&mut file)? != pack.pack {
         return Err(miette!("missing or corrupt receipt pack"));
     }
-    unpack(&mut pack, args)
+    Ok(file)
+}
+
+fn restore(kv: &dyn Kv, args: &Args, index: &Index) -> Result<usize> {
+    let mut packs = index
+        .packs()
+        .iter()
+        .rev()
+        .map(|pack| fetch_pack(kv, pack))
+        .collect::<Result<Vec<_>>>()?;
+    unpack(&mut packs, args, &index.ledger)
 }
 
 fn pull(kv: &dyn Kv, args: &Args, revisions: &[String]) -> Result<Value> {
@@ -498,12 +626,18 @@ fn pull(kv: &dyn Kv, args: &Args, revisions: &[String]) -> Result<Value> {
             atomic(&args.ledger, index.ledger.as_bytes())?;
             0
         } else {
-            restore_pack(kv, args, &index)?
+            restore(kv, args, &index)?
         };
         atomic(&parent, &bytes)?;
-        return Ok(
-            json!({"status":"restored", "revision":revision, "bytes":bytes.len() as u64 + if ledger_only {0} else {index.bytes}, "modules":modules, "ledger_only":ledger_only}),
-        );
+        let packs = index.packs();
+        return Ok(json!({
+            "status": "restored",
+            "revision": revision,
+            "packs": packs.len(),
+            "bytes": bytes.len() as u64 + if ledger_only { 0 } else { packs.iter().map(|pack| pack.bytes).sum() },
+            "modules": modules,
+            "ledger_only": ledger_only,
+        }));
     }
     Ok(json!({"status":"miss"}))
 }
@@ -528,6 +662,8 @@ pub fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LEDGER: &str = "successful ledger\n";
 
     fn fixture() -> Module {
         let cas: Arc<dyn Cas> = Arc::new(SqliteCas::open_in_memory().unwrap());
@@ -575,7 +711,7 @@ mod tests {
             &Header {
                 format: FORMAT.into(),
                 scope: args.scope.clone(),
-                ledger: "successful ledger\n".into(),
+                ledger: None,
             },
         )
         .unwrap();
@@ -587,14 +723,201 @@ mod tests {
         file
     }
 
+    /// A small receipt for module `name`, its entries tagged by `version`.
+    fn small(name: &str, version: &str) -> Module {
+        let cas: Arc<dyn Cas> = Arc::new(SqliteCas::open_in_memory().unwrap());
+        let entries: BTreeMap<String, String> = (0..3)
+            .map(|n| (format!("proof{n}"), format!("{version}{n}")))
+            .collect();
+        let map =
+            Map::empty(cas)
+                .unwrap()
+                .apply(entries.iter().map(|(k, v)| {
+                    Edit::Insert(k.as_bytes().to_vec().into(), Dasl::String(v.clone()))
+                }))
+                .unwrap();
+        let manifest = Manifest {
+            kind: REPLAY.into(),
+            context: "context".into(),
+            root: map.root().to_string(),
+        };
+        let receipt =
+            covalence_lib_cid::Blake3::of(&serde_json::to_vec(&manifest).unwrap()).to_string();
+        Module {
+            name: name.into(),
+            receipt,
+            manifest,
+            entries,
+        }
+    }
+
+    /// Replace this checkout's receipt of `module`, as a replay does.
+    fn replay(args: &Args, module: &Module) {
+        let relative = relative(&module.name).unwrap();
+        let _ = fs::remove_file(
+            args.state
+                .join("modules")
+                .join(&relative)
+                .with_extension("json"),
+        );
+        let _ = fs::remove_dir_all(args.state.join("cas").join(&relative));
+        import_module(&args.state, module).unwrap();
+    }
+
+    fn ledger(rows: &[(&str, &str)]) -> String {
+        let mut ledger = String::from("policy\n");
+        for (name, input) in rows {
+            ledger.push_str(&format!("{name}\t{input}\tout\n"));
+        }
+        ledger
+    }
+
+    #[test]
+    fn a_push_sends_only_changed_receipts_and_a_pull_takes_the_newest() {
+        let kv = covalence_kv_memory::MemoryKv::default();
+        let root = tempfile::tempdir().unwrap();
+        let first = Args {
+            state: root.path().join("first"),
+            ..args(root.path())
+        };
+        replay(&first, &small("A", "a"));
+        replay(&first, &small("B", "b"));
+        fs::write(&first.ledger, ledger(&[("A", "1"), ("B", "1")])).unwrap();
+        let one = "1".repeat(40);
+        let published = publish(&kv, &first, &one).unwrap();
+        assert_eq!(
+            (published["modules"].as_u64(), published["packs"].as_u64()),
+            (Some(2), Some(1))
+        );
+        // The next checkout pulls only what changed, replays B and pushes.
+        let second = Args {
+            state: root.path().join("second"),
+            ledger: root.path().join("pulled"),
+            current_inputs: Some(root.path().join("current")),
+            ..args(root.path())
+        };
+        let changed = ledger(&[("A", "1"), ("B", "2")]);
+        fs::write(root.path().join("current"), &changed).unwrap();
+        pull(&kv, &second, std::slice::from_ref(&one)).unwrap();
+        replay(&second, &small("B", "b2"));
+        fs::write(root.path().join("ledger2"), &changed).unwrap();
+        let pushing = Args {
+            ledger: root.path().join("ledger2"),
+            current_inputs: None,
+            ..second
+        };
+        let two = "2".repeat(40);
+        let published = publish(&kv, &pushing, &two).unwrap();
+        assert_eq!(
+            (published["modules"].as_u64(), published["packs"].as_u64()),
+            (Some(1), Some(2))
+        );
+        assert!(published["bytes"].as_u64().unwrap() < 2_000);
+        // A fresh checkout gets A from the first pack and B from the second.
+        let third = Args {
+            state: root.path().join("third"),
+            ..args(root.path())
+        };
+        let restored = pull(&kv, &third, std::slice::from_ref(&two)).unwrap();
+        assert_eq!(restored["modules"].as_u64(), Some(2));
+        let b = export_module(&third.state, "B").unwrap().unwrap();
+        assert_eq!(b.entries["proof0"], "b20");
+        assert!(export_module(&third.state, "A").unwrap().is_some());
+    }
+
+    #[test]
+    fn past_the_pack_limit_a_push_merges_every_pack() {
+        let kv = covalence_kv_memory::MemoryKv::default();
+        let root = tempfile::tempdir().unwrap();
+        let args = args(root.path());
+        replay(&args, &small("A", "a"));
+        let mut parent = None;
+        for n in 0..=MAX_PACKS {
+            replay(&args, &small("B", &format!("b{n}")));
+            fs::write(&args.ledger, ledger(&[("A", "1"), ("B", &n.to_string())])).unwrap();
+            let revision = format!("{n:040}");
+            let published = publish(&kv, &args, &revision).unwrap();
+            let expected = if n + 1 > MAX_PACKS { 1 } else { n + 1 };
+            assert_eq!(
+                published["packs"].as_u64(),
+                Some(expected as u64),
+                "push {n}"
+            );
+            // Each push follows the previous one's index, as a pull leaves it.
+            let key = index_key(&args.scope, &revision).unwrap();
+            let index = kv.get(key.as_bytes()).unwrap().unwrap();
+            atomic(
+                &args
+                    .state
+                    .join("shared")
+                    .join(format!("{}.json", args.scope)),
+                &index,
+            )
+            .unwrap();
+            parent = Some(revision);
+        }
+        let fresh = Args {
+            state: root.path().join("fresh"),
+            ..args
+        };
+        let restored = pull(&kv, &fresh, &[parent.unwrap()]).unwrap();
+        assert_eq!(
+            (restored["modules"].as_u64(), restored["packs"].as_u64()),
+            (Some(2), Some(1))
+        );
+        let b = export_module(&fresh.state, "B").unwrap().unwrap();
+        assert_eq!(b.entries["proof0"], format!("b{MAX_PACKS}0"));
+    }
+
+    #[test]
+    fn an_index_of_one_pack_from_an_earlier_checker_still_restores() {
+        let kv = covalence_kv_memory::MemoryKv::default();
+        let root = tempfile::tempdir().unwrap();
+        let args = args(root.path());
+        let mut file = tempfile::tempfile().unwrap();
+        let mut gzip = GzEncoder::new(&mut file, Compression::fast());
+        line(
+            &mut gzip,
+            &Header {
+                format: FORMAT_V1.into(),
+                scope: args.scope.clone(),
+                ledger: Some(LEDGER.into()),
+            },
+        )
+        .unwrap();
+        line(&mut gzip, &small("A", "a")).unwrap();
+        gzip.finish().unwrap();
+        let bytes = file.metadata().unwrap().len();
+        let hash = digest(&mut file).unwrap();
+        kv.put_new_from(format!("packs/{hash}").as_bytes(), &mut file, bytes)
+            .unwrap();
+        let index = Index {
+            format: FORMAT_V1.into(),
+            scope: args.scope.clone(),
+            packs: Vec::new(),
+            pack: Some(hash),
+            bytes: Some(bytes),
+            ledger: LEDGER.into(),
+            ledger_hash: blake3::hash(LEDGER.as_bytes()).to_hex().to_string(),
+        };
+        let revision = "3".repeat(40);
+        kv.put_new(
+            index_key(&args.scope, &revision).unwrap().as_bytes(),
+            serde_json::to_vec(&index).unwrap().into(),
+        )
+        .unwrap();
+        let restored = pull(&kv, &args, &[revision]).unwrap();
+        assert_eq!(restored["modules"].as_u64(), Some(1));
+    }
+
     #[test]
     fn thirty_thousand_entries_rebuild_identical_cas_and_keep_local_pointer() {
         let root = tempfile::tempdir().unwrap();
         let args = args(root.path());
         let module = fixture();
         let expected = module.receipt.clone();
-        let mut file = pack(&args, &[module]);
-        assert_eq!(unpack(&mut file, &args).unwrap(), 1);
+        let file = pack(&args, &[module]);
+        assert_eq!(unpack(&mut [file], &args, LEDGER).unwrap(), 1);
         let exported = export_module(&args.state, "Fixture.Proofs")
             .unwrap()
             .unwrap();
@@ -602,8 +925,7 @@ mod tests {
         assert_eq!(exported.entries.len(), 30_000);
         let pointer = args.state.join("modules/Fixture/Proofs.json");
         fs::write(&pointer, "existing local pointer").unwrap();
-        file.rewind().unwrap();
-        unpack(&mut file, &args).unwrap();
+        unpack(&mut [pack(&args, &[fixture()])], &args, LEDGER).unwrap();
         assert_eq!(
             fs::read_to_string(pointer).unwrap(),
             "existing local pointer"
@@ -617,8 +939,8 @@ mod tests {
         let mut parent = fixture();
         parent.name = "Fixture".into();
         let child = fixture();
-        let mut file = pack(&args, &[parent, child]);
-        assert_eq!(unpack(&mut file, &args).unwrap(), 2);
+        let file = pack(&args, &[parent, child]);
+        assert_eq!(unpack(&mut [file], &args, LEDGER).unwrap(), 2);
         for name in ["Fixture", "Fixture.Proofs"] {
             let module = export_module(&args.state, name).unwrap().unwrap();
             assert_eq!(module.entries.len(), 30_000);
@@ -633,7 +955,7 @@ mod tests {
         let mut bad = fixture();
         bad.name = "Fixture.Corrupt".into();
         bad.entries.insert("proof0".into(), "forged".into());
-        assert!(unpack(&mut pack(&args, &[good, bad]), &args).is_err());
+        assert!(unpack(&mut [pack(&args, &[good, bad])], &args, LEDGER).is_err());
         assert!(!args.ledger.exists());
         assert!(!args.state.exists());
     }
@@ -648,9 +970,9 @@ mod tests {
         assert!(index_key(&"a".repeat(64), "main").is_err());
         let root = tempfile::tempdir().unwrap();
         let mut args = args(root.path());
-        let mut file = pack(&args, &[]);
+        let file = pack(&args, &[]);
         args.scope = "b".repeat(64);
-        assert!(unpack(&mut file, &args).is_err());
+        assert!(unpack(&mut [file], &args, LEDGER).is_err());
         assert!(!args.ledger.exists());
         assert!(read_line(&mut BufReader::new(b"truncated".as_slice())).is_err());
     }
@@ -679,8 +1001,12 @@ mod tests {
         let mut index = Index {
             format: FORMAT.into(),
             scope: args.scope.clone(),
-            pack: "a".repeat(64),
-            bytes: 1,
+            packs: vec![Pack {
+                pack: "a".repeat(64),
+                bytes: 1,
+            }],
+            pack: None,
+            bytes: None,
             ledger: ledger.into(),
             ledger_hash: blake3::hash(ledger.as_bytes()).to_hex().to_string(),
         };
