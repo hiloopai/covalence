@@ -421,7 +421,7 @@ impl Manifest {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        fs::write(path, encode(self)?).operation("save build manifest")
+        crate::atomic::write(path, encode(self)?, "save build manifest")
     }
 
     pub fn load(path: &Path) -> Result<Option<Self>> {
@@ -538,13 +538,15 @@ impl Manifest {
                 Content::Link(name) => fs::hard_link(artifacts.join(name), &target)
                     .or_else(|_| fs::copy(artifacts.join(name), &target).map(|_| ()))
                     .operation(format!("place {path}")),
-                Content::Text(text) => fs::write(&target, text).operation(format!("write {path}")),
+                Content::Text(text) => {
+                    crate::atomic::write(&target, text, &format!("write {path}"))
+                }
             }
         })?;
         if let Some(parent) = marker.parent() {
             fs::create_dir_all(parent).operation("create build folder")?;
         }
-        fs::write(&marker, self.mark()).operation("mark the placed build")?;
+        crate::atomic::write(&marker, self.mark(), "mark the placed build")?;
         println!(
             "Lake cache: placed the build of tree {} ({} files) in {:.1} s; Lake has nothing to rebuild",
             self.tree,

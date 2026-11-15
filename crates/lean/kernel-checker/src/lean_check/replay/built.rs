@@ -19,13 +19,15 @@ pub struct Built {
     jobs: usize,
 }
 
+/// A file's identity and content stamp. Not its ctime: Lake hard-links
+/// outputs from its cache, so another checkout linking or unlinking the same
+/// file changes the shared inode's ctime while its content stays the same.
 #[derive(Clone, PartialEq, Eq)]
 struct Stamp {
     dev: u64,
     ino: u64,
     len: u64,
     modified: (i64, i64),
-    changed: (i64, i64),
 }
 
 fn stamp(path: &Path) -> Result<Stamp> {
@@ -38,7 +40,6 @@ fn stamp(path: &Path) -> Result<Stamp> {
         ino: meta.ino(),
         len: meta.len(),
         modified: (meta.mtime(), meta.mtime_nsec()),
-        changed: (meta.ctime(), meta.ctime_nsec()),
     })
 }
 
@@ -412,6 +413,20 @@ mod tests {
         fs::write(&file, "after").unwrap();
         assert!(inputs.verify_all().is_err());
     }
+    #[test]
+    fn another_checkouts_hard_link_is_no_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("input");
+        fs::write(&file, "before").unwrap();
+        let inputs = Inputs::new(&[dir.path().to_owned()]).unwrap();
+        // Linking and unlinking a second name changes the inode's ctime only.
+        let other = tempfile::tempdir().unwrap();
+        fs::hard_link(&file, other.path().join("input")).unwrap();
+        fs::remove_file(other.path().join("input")).unwrap();
+        inputs.digest(&file).unwrap();
+        inputs.verify_all().unwrap();
+    }
+
     #[test]
     fn module_paths_cannot_escape_checkout() {
         assert_eq!(

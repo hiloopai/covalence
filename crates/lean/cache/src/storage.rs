@@ -520,7 +520,11 @@ pub(crate) fn publish(project: &Project, kv: &Arc<dyn Kv>, seed: bool) -> Result
         "Lake cache publication: {}",
         String::from_utf8_lossy(&report)
     );
-    fs::write(project.record.join("publication.json"), report).operation("write publication report")
+    crate::atomic::write(
+        &project.record.join("publication.json"),
+        report,
+        "write publication report",
+    )
 }
 
 #[cfg(test)]

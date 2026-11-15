@@ -30,7 +30,7 @@ use covalence_lib_data::Bytes;
 use covalence_lib_serde::{Deserialize, Serialize};
 
 use crate::{
-    error::{IoResult, Result, encode, invalid, json},
+    error::{Error, IoResult, Result, encode, invalid, json},
     mapping,
     project::Project,
 };
@@ -66,12 +66,17 @@ pub(crate) struct Entry {
 pub(crate) type Built = Vec<(String, String, serde_json::Value)>;
 
 pub(crate) fn built(project: &Project) -> Result<Built> {
-    let outputs = project.cache_dir()?.join("outputs");
     let since = fs::metadata(started_marker(project))
         .and_then(|marker| marker.modified())
         .ok();
+    records(&project.cache_dir()?.join("outputs"), since)
+}
+
+/// The output records under `outputs` written since `since`, Lake's own.
+fn records(outputs: &Path, since: Option<std::time::SystemTime>) -> Result<Built> {
     let mut found = Vec::new();
-    for path in crate::project::files(&outputs, "json")? {
+    let mut unfinished = 0;
+    for path in crate::project::files(outputs, "json")? {
         let written = fs::metadata(&path)
             .and_then(|record| record.modified())
             .operation(format!("read {}", path.display()))?;
@@ -80,7 +85,7 @@ pub(crate) fn built(project: &Project) -> Result<Built> {
         }
         let (Some(package), Some(input)) = (
             path.parent()
-                .and_then(|folder| folder.strip_prefix(&outputs).ok())
+                .and_then(|folder| folder.strip_prefix(outputs).ok())
                 .and_then(Path::to_str),
             path.file_stem().and_then(|stem| stem.to_str()),
         ) else {
@@ -89,13 +94,33 @@ pub(crate) fn built(project: &Project) -> Result<Built> {
         if !mapping::hex(input, 16) {
             continue;
         }
-        let record: serde_json::Value =
-            json(&fs::read(&path).operation(format!("read {}", path.display()))?)?;
+        let bytes = fs::read(&path).operation(format!("read {}", path.display()))?;
+        let record: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(record) => record,
+            // Lake writes a record in place, and every checkout on a host
+            // shares its cache: one that ends early is another build's, still
+            // being written, which that build's `put` publishes.
+            Err(error) if error.is_eof() => {
+                unfinished += 1;
+                continue;
+            }
+            Err(source) => {
+                return Err(Error::Json {
+                    operation: format!("read {}", path.display()),
+                    source,
+                });
+            }
+        };
         // Lake writes `"service": null` for what it built itself.
         if record["service"].is_string() {
             continue;
         }
         found.push((package.to_owned(), input.to_owned(), record));
+    }
+    if unfinished > 0 {
+        println!(
+            "Lake cache: left {unfinished} output records another build is still writing to it"
+        );
     }
     Ok(found)
 }
@@ -513,6 +538,26 @@ pub(crate) fn report_fetches() {
 mod tests {
     use super::*;
     use covalence_kv_memory::MemoryKv;
+
+    #[test]
+    fn a_record_another_build_is_still_writing_is_left_to_it() {
+        let outputs = tempfile::tempdir().unwrap();
+        let package = outputs.path().join("demo");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("0123456789abcdef.json"),
+            r#"{"service": null, "data": {"o": ["1111111111111111.olean"]}}"#,
+        )
+        .unwrap();
+        fs::write(package.join("0123456789abcde0.json"), "").unwrap();
+        fs::write(package.join("0123456789abcde1.json"), r#"{"service": nu"#).unwrap();
+        let found = records(outputs.path(), None).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, "0123456789abcdef");
+        // A malformed record is no write in progress.
+        fs::write(package.join("0123456789abcde2.json"), "{]").unwrap();
+        assert!(records(outputs.path(), None).is_err());
+    }
 
     #[test]
     fn lazy_lookup_rejects_wrong_header_before_any_install_including_local_hits() {

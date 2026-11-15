@@ -109,7 +109,7 @@ impl Index {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).operation("create module index directory")?;
         }
-        fs::write(path, encode(self)?).operation("save module index")
+        crate::atomic::write(path, encode(self)?, "save module index")
     }
 
     /// The published index at `key`, if any.

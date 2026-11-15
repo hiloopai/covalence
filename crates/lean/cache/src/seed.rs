@@ -854,7 +854,7 @@ impl Staged {
             if !path.exists() {
                 fs::create_dir_all(cache.join("revisions").join(package))
                     .operation("create upstream mapping directory")?;
-                fs::write(&path, text).operation("write upstream mapping list")?;
+                crate::atomic::write(&path, text, "write upstream mapping list")?;
             }
         }
         let mut seeded = Seeded::new();

@@ -500,8 +500,11 @@ impl Project {
                     "Lake cache: {} is published with this build already; nothing to record",
                     identity.revision
                 );
-                return fs::write(self.published(), &identity.revision)
-                    .operation("record the published commit");
+                return crate::atomic::write(
+                    &self.published(),
+                    &identity.revision,
+                    "record the published commit",
+                );
             }
         }
         crate::builds::forget(self)?;
@@ -576,7 +579,7 @@ impl Project {
             targets: targets.to_vec(),
             pooled,
         };
-        fs::write(receipt, encode(&record)?).operation("save successful build receipt")
+        crate::atomic::write(&receipt, encode(&record)?, "save successful build receipt")
     }
 
     /// Where `build` names the commit it found published already, which

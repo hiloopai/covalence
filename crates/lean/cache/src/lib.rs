@@ -2,6 +2,7 @@
 #![deny(missing_docs)]
 
 mod archives;
+mod atomic;
 mod blobs;
 mod builds;
 mod dependencies;

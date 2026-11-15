@@ -65,8 +65,11 @@ impl Session {
                 + "\n";
         }
         settings.push_str(&format!("[[cache.service]]\nname = \"{SERVICE}\"\nkind = \"s3\"\nartifactEndpoint = \"{BASE}/a\"\nrevisionEndpoint = \"{BASE}/r\"\n"));
-        fs::write(directory.path().join("config.toml"), settings)
-            .operation("write Lake cache configuration")?;
+        crate::atomic::write(
+            &directory.path().join("config.toml"),
+            settings,
+            "write Lake cache configuration",
+        )?;
         let session = Self {
             directory,
             scope: scope.to_owned(),
@@ -91,11 +94,11 @@ impl Session {
     }
 
     fn save_index(&self) -> Result<()> {
-        fs::write(
-            self.directory.path().join("index.json"),
+        crate::atomic::write(
+            &self.directory.path().join("index.json"),
             encode(&self.index)?,
+            "save artifact index",
         )
-        .operation("save artifact index")
     }
 
     /// Lake, configured to fetch through this session.

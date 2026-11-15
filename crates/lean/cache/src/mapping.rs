@@ -127,7 +127,7 @@ pub(crate) fn write<'a>(
     for (input, output) in rows {
         text.push_str(&format!("[\"{input}\",{output}]\n"));
     }
-    std::fs::write(path, text).operation("write Lake mapping")
+    crate::atomic::write(path, text, "write Lake mapping")
 }
 
 /// The artifact files a Lake mapping names, which must exist in `directory`.

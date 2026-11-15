@@ -82,7 +82,11 @@ pub(crate) fn record_use(directory: &Path, scope: &str, toolchain: Option<&str>)
         .parent()
         .ok_or_else(|| invalid("scope record has no parent"))?;
     fs::create_dir_all(parent).operation("create scope record directory")?;
-    fs::write(&path, toolchain.unwrap_or_default()).operation("record the scope's use")
+    crate::atomic::write(
+        &path,
+        toolchain.unwrap_or_default(),
+        "record the scope's use",
+    )
 }
 
 fn setting(name: &str, default: u64) -> Result<u64> {

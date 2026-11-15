@@ -116,7 +116,7 @@ impl Local {
             .parent()
             .ok_or_else(|| invalid("upstream marker has no parent"))?;
         fs::create_dir_all(parent).operation("create upstream marker directory")?;
-        fs::write(&path, request.join("\n") + "\n").operation("write upstream marker")
+        crate::atomic::write(&path, request.join("\n") + "\n", "write upstream marker")
     }
 
     /// Whether what a record of `level` claims for `package` is still in

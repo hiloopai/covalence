@@ -303,11 +303,11 @@ fn check_out(
         .canonicalize()
         .operation("locate mirror objects")?;
     let git_dir = destination.join(".git");
-    fs::write(
-        git_dir.join("objects/info/alternates"),
+    crate::atomic::write(
+        &git_dir.join("objects/info/alternates"),
         format!("{}\n", objects.display()),
-    )
-    .operation("link mirror objects")?;
+        "link mirror objects",
+    )?;
     // Lake and Git must see the mirror's shallow boundary as their own.
     fs::copy(mirror.join("shallow"), git_dir.join("shallow")).operation("copy shallow boundary")?;
     run(
@@ -431,7 +431,7 @@ fn fetch(kv: &dyn Kv, mirror: &Path, url: &str, commit: &str) -> Result<Source> 
         let mut boundary = fs::read_to_string(&shallow).unwrap_or_default();
         if !boundary.lines().any(|line| line == commit) {
             boundary.push_str(&format!("{commit}\n"));
-            fs::write(&shallow, boundary).operation("record shallow boundary")?;
+            crate::atomic::write(&shallow, boundary, "record shallow boundary")?;
         }
         Source::Pool
     } else {
