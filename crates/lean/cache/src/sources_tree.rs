@@ -186,6 +186,20 @@ fn read_objects(
 }
 
 /// The CIDs of a published tree's files.
+/// The paths of a published tree.
+fn tree_paths(cas: &KvCas, tree: &Cid) -> Result<Vec<String>> {
+    let Some(bytes) = cas.get(tree).map_err(cas_error("read published tree"))? else {
+        return Err(invalid("a source record names a missing tree"));
+    };
+    let Value::Map(mut fields) = Value::decode(&bytes).map_err(dasl_error("decode tree"))? else {
+        return Err(invalid("a published tree is not a map"));
+    };
+    let Some(Value::Map(files)) = fields.remove("files") else {
+        return Err(invalid("a published tree has no files"));
+    };
+    Ok(files.into_keys().collect())
+}
+
 fn tree_cids(cas: &KvCas, tree: &Cid) -> Result<BTreeSet<Cid>> {
     let Some(bytes) = cas.get(tree).map_err(cas_error("read published tree"))? else {
         return Ok(BTreeSet::new());
@@ -225,7 +239,16 @@ fn nearest_tree(
     let Some(text) = records.into_iter().flatten().next() else {
         return Ok(None);
     };
-    let record: Cid = str::from_utf8(&text)
+    let (tree, _) = record(cas, &text)?;
+    tree.cast().map(Some).map_err(|source| Error::Cid {
+        operation: "read a source record".into(),
+        source,
+    })
+}
+
+/// The tree and targets of the record a pointer's text names.
+fn record(cas: &KvCas, pointer: &[u8]) -> Result<(Cid<Bdasl>, Vec<String>)> {
+    let record: Cid = str::from_utf8(pointer)
         .ok()
         .and_then(|text| text.trim().parse().ok())
         .ok_or_else(|| invalid("invalid source record pointer"))?;
@@ -235,13 +258,21 @@ fn nearest_tree(
     let Value::Map(mut fields) = Value::decode(&bytes).map_err(dasl_error("decode record"))? else {
         return Err(invalid("a source record is not a map"));
     };
-    match fields.remove("tree") {
-        Some(Value::Link(tree)) => Ok(Some(tree.cast().map_err(|source| Error::Cid {
-            operation: "read a source record".into(),
-            source,
-        })?)),
-        _ => Err(invalid("a source record has no tree")),
-    }
+    let Some(Value::Link(tree)) = fields.remove("tree") else {
+        return Err(invalid("a source record has no tree"));
+    };
+    let targets = match fields.remove("targets") {
+        None => Vec::new(),
+        Some(Value::List(items)) => items
+            .into_iter()
+            .map(|item| match item {
+                Value::String(target) => Ok(target),
+                _ => Err(invalid("a source record names a target that is no string")),
+            })
+            .collect::<Result<_>>()?,
+        Some(_) => return Err(invalid("a source record's targets are no list")),
+    };
+    Ok((tree, targets))
 }
 
 /// A tree's DRISL bytes and CID.
@@ -315,8 +346,50 @@ pub(crate) fn publish(
     pointer(repository, commit)?;
     let cas = KvCas::with_prefix(kv.clone(), "lake/src/cas")
         .map_err(|_| invalid("invalid source CAS prefix"))?;
-    // `HEAD` holds the commit's tree, whether or not the checkout has the
-    // commit (see `Project::commit`).
+    // `hiloop prove publish` records a commit's tree from Git before a worker
+    // builds it, in a checkout that can hold files the commit lacks: the
+    // record keeps that tree, and a build adds only the targets it checked.
+    let existing = kv
+        .get(pointer(repository, commit)?.as_bytes())
+        .map_err(|source| Error::Store {
+            operation: "read source record pointer".into(),
+            source,
+        })?;
+    if let Some(existing) = existing {
+        let (tree, before) = record(&cas, &existing)?;
+        let targets = before
+            .into_iter()
+            .chain(targets.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let (record_bytes, record_cid) = encode_record(tree, &targets)?;
+        // A record that names these targets already is left as it is.
+        if str::from_utf8(&existing).map(str::trim) != Ok(record_cid.to_string().as_str()) {
+            Put::<Cid>::put(&cas, record_bytes.into()).map_err(cas_error("upload record"))?;
+            kv.put(
+                pointer(repository, commit)?.as_bytes(),
+                Bytes::copy_from_slice(record_cid.to_string().as_bytes()),
+            )
+            .map_err(|source| Error::Store {
+                operation: "publish source record pointer".into(),
+                source,
+            })?;
+        }
+        let tree: Cid = tree.cast().map_err(|source| Error::Cid {
+            operation: "read a source record".into(),
+            source,
+        })?;
+        return Ok(Published {
+            commit: commit.to_owned(),
+            record: record_cid.to_string(),
+            tree: tree.to_string(),
+            files: tree_paths(&cas, &tree)?.len(),
+            uploaded: 0,
+        });
+    }
+    // Without one, `HEAD` holds the commit's tree, whether or not the
+    // checkout has the commit (see `Project::commit`).
     let (entries, by_object) = snapshot(&project.root, "HEAD")?;
     let ancestors = project.git(&["rev-list", "--first-parent", "--max-count=65", "HEAD"])?;
     let ancestors = ancestors
@@ -454,6 +527,49 @@ mod tests {
         let second = git(&root, &["rev-parse", "HEAD"]);
         let child = publish(&project, &kv, &second, &targets).unwrap();
         assert_eq!((child.files, child.uploaded), (2, 1));
+    }
+
+    #[test]
+    fn a_build_keeps_the_published_tree_and_adds_its_targets() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().to_owned();
+        let commit = |message: &str| {
+            git(&root, &["add", "-A"]);
+            git(
+                &root,
+                &["-c", "commit.gpgsign=false", "commit", "-qm", message],
+            );
+            git(&root, &["rev-parse", "HEAD"])
+        };
+        git(&root, &["init", "-q"]);
+        std::fs::write(root.join("A.lean"), "theorem a : True := trivial\n").unwrap();
+        let published = commit("the commit");
+        let project = Project {
+            root: root.clone(),
+            workspace: String::new(),
+            repository: "o/r".into(),
+            record: root.join("record"),
+            lean: Default::default(),
+        };
+        let kv = covalence_kv_memory::MemoryKv::default().into_dyn();
+        // The client publishes the commit's tree before any build.
+        let client = publish(&project, &kv, &published, &[]).unwrap();
+        // A worker's checkout of it holds a file an earlier job left, which
+        // its synthetic `HEAD` commits.
+        std::fs::write(root.join("stray.html"), "an earlier job's output\n").unwrap();
+        commit("the worker's synthetic commit");
+        let built = publish(&project, &kv, &published, &["Demo".to_owned()]).unwrap();
+        assert_eq!(built.tree, client.tree);
+        assert_eq!((built.files, built.uploaded), (1, 0));
+        let cas = KvCas::with_prefix(kv.clone(), "lake/src/cas").unwrap();
+        let pointer = kv
+            .get(format!("lake/src/rev/o/r/{published}").as_bytes())
+            .unwrap()
+            .unwrap();
+        let (tree, targets) = record(&cas, &pointer).unwrap();
+        assert_eq!(targets, ["Demo"]);
+        let tree: Cid = tree.cast().unwrap();
+        assert_eq!(tree_paths(&cas, &tree).unwrap(), ["A.lean"]);
     }
 
     #[test]

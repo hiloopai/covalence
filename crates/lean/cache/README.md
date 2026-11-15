@@ -37,7 +37,7 @@ layout's version (`cov-lake/v1`), `lean --version` and the toolchain's
 | `<scope>/modules/<repo>/<commit>/<package>` | commit | each module's input in that build, for a targeted `get` to prefetch | the same |
 | `<scope>/builds/<repo>/<lake>/<tree>` | Git tree and Lake | a build manifest: the files to place without running Lake | the same |
 | `<scope>/seed/<repo>/{a,b}/` | two slots, oldest overwritten | a recorded build, unpacked, as 16 tar streams | `put --seed` |
-| `src/rev/<repo>/<commit>`, `src/cas/` | commit; BLAKE3 of each blob | the commit's source tree and the targets it built | `put` of a recorded build, root workspace only |
+| `src/rev/<repo>/<commit>`, `src/cas/` | commit; BLAKE3 of each blob | the commit's source tree and the targets it built | `hiloop prove publish` (the tree), `put` of a recorded build (its targets; the tree only when no record exists), root workspace only |
 | `git/<owner>/<dependency>/<commit>.{pack,idx}` | pinned commit | a Git dependency's pin | `put` |
 | `toolchains/<os>-<arch>/<toolchain>`, `toolchains/cas/` | Lean release | the release archive | `put`, when the pool lacks it |
 
@@ -138,12 +138,15 @@ runs.
   this publisher's winning, plus the upstream snapshot Lake fetched for a
   pinned commit, for the artifacts on disk. A pin's map can still lack
   modules no publisher built.
-- `put` then publishes the commit's source tree under `lake/src/`: each
-  tracked Git blob, uncompressed, in a key-value CAS under its raw BLAKE3 CID;
-  the DRISL tree `{"files": {<path>: <link>}}`; the record `{"tree": <link>,
-  "targets": [...]}` naming the targets `build` checked; then the pointer
-  `lake/src/rev/<owner>/<repo>/<commit>`, in that order. Blobs the nearest
-  published first-parent ancestor's tree holds are not checked again.
+- `put` then records the targets `build` checked under `lake/src/`, in the
+  record `{"tree": <link>, "targets": [...]}` behind the pointer
+  `lake/src/rev/<owner>/<repo>/<commit>`. A commit `hiloop prove publish`
+  already recorded keeps that tree, which comes from Git, not from the
+  checkout, which can hold files the commit lacks. Otherwise `put` publishes
+  `HEAD`'s tree: each tracked Git blob, uncompressed, in a key-value CAS under
+  its raw BLAKE3 CID; the DRISL tree `{"files": {<path>: <link>}}`; then the
+  record and the pointer, in that order. Blobs the nearest published
+  first-parent ancestor's tree holds are not checked again.
 - `put --seed` then publishes the commit's seed (below), unless one of the
   repository's two seed slots already holds it.
 - `get` restores this repository's packages from `HEAD`, else from the

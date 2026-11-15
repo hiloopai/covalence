@@ -440,7 +440,7 @@ fn incremental_publish_sends_only_the_difference_and_restore_reuses_proofs() {
     for (path, bytes) in &incumbents {
         assert_eq!(&fs::read(path).unwrap(), bytes);
     }
-    // Actual build writes: only the revision pointer. Sources: tree/record/pointer.
+    // Actual build writes: only the revision pointer.
     let writes = fixture.server.writes.lock().unwrap();
     let pool = writes[before..]
         .iter()
@@ -462,8 +462,9 @@ fn incremental_publish_sends_only_the_difference_and_restore_reuses_proofs() {
         .collect::<Vec<_>>();
     assert_eq!(actual.len(), 1, "{actual:?}");
     assert!(actual[0].contains("/rev/"));
+    // Sources: nothing, as the commit's record names its tree and targets.
     let sources = writes.len() - before - pool.len();
-    assert_eq!(sources, 3, "{:?}", &writes[before..]);
+    assert_eq!(sources, 0, "{:?}", &writes[before..]);
     drop(writes);
     drop(conditionals);
     let path = fixture.root.join("Demo/A.lean");
