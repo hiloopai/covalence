@@ -163,7 +163,7 @@ fn execute(cli: Cli) -> Result<()> {
                 let built = outputs::built(&project)?;
                 if built.is_empty() && !recorded {
                     println!("Lake cache: nothing built since the last put");
-                    Ok(())
+                    outputs::published(&project)
                 } else {
                     let kv = store()?;
                     let scope = project.identity()?.scope;

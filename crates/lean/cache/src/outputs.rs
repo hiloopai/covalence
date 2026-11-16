@@ -57,41 +57,85 @@ pub(crate) struct Entry {
     pub artifacts: BTreeMap<String, String>,
 }
 
-/// What this host's Lake built itself since the first `get` or `build`
-/// after this checkout's last `put` (all of it before any): each output
-/// record in Lake's cache written since, by package and input. Records a
-/// restore installed name the service they came from, and ones a seed or a
-/// lookup installed are dated before any run ([`installed`]); ones Lake
-/// wrote after building name no service.
+/// What Lake built itself in this checkout since the first `get` or `build`
+/// after its last `put` that found something (all of it before any): the output record of each
+/// input a trace under one of its packages' build folders names, by package
+/// and input, when the record was written since. Lake's cache is the host's,
+/// shared by every checkout on it, so only this checkout's traces say which
+/// of its records this checkout's runs used. Records a restore installed
+/// name the service they came from, and ones a seed or a lookup installed are
+/// dated before any run ([`installed`]); ones Lake wrote after building name
+/// no service.
 pub(crate) type Built = Vec<(String, String, serde_json::Value)>;
 
 pub(crate) fn built(project: &Project) -> Result<Built> {
     let since = fs::metadata(started_marker(project))
         .and_then(|marker| marker.modified())
         .ok();
-    records(&project.cache_dir()?.join("outputs"), since)
+    let builds = project
+        .packages()?
+        .into_iter()
+        .map(|package| {
+            let build = project.root.join(&package.dir).join(".lake/build");
+            (package.name, build)
+        })
+        .collect::<Vec<_>>();
+    records(&project.cache_dir()?.join("outputs"), &builds, since)
 }
 
-/// The output records under `outputs` written since `since`, Lake's own.
-fn records(outputs: &Path, since: Option<std::time::SystemTime>) -> Result<Built> {
+/// The inputs the traces under each package's build folder name, of the
+/// traces written since `since`.
+fn traced(
+    builds: &[(String, PathBuf)],
+    since: Option<std::time::SystemTime>,
+) -> Result<BTreeSet<(String, String)>> {
+    let mut inputs = BTreeSet::new();
+    for (package, build) in builds {
+        for trace in crate::project::files(build, "trace")? {
+            let written = fs::metadata(&trace)
+                .and_then(|trace| trace.modified())
+                .operation(format!("read {}", trace.display()))?;
+            if since.is_some_and(|since| written < since) {
+                continue;
+            }
+            let bytes = fs::read(&trace).operation(format!("read {}", trace.display()))?;
+            // Old trace stubs name no input.
+            let Some(input) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|trace| trace["depHash"].as_str().map(str::to_owned))
+                .filter(|input| mapping::hex(input, 16))
+            else {
+                continue;
+            };
+            inputs.insert((package.clone(), input));
+        }
+    }
+    Ok(inputs)
+}
+
+/// The output records under `outputs` of the inputs `builds` traced, written
+/// since `since`, that Lake built itself.
+fn records(
+    outputs: &Path,
+    builds: &[(String, PathBuf)],
+    since: Option<std::time::SystemTime>,
+) -> Result<Built> {
     let mut found = Vec::new();
     let mut unfinished = 0;
-    for path in crate::project::files(outputs, "json")? {
-        let written = fs::metadata(&path)
-            .and_then(|record| record.modified())
-            .operation(format!("read {}", path.display()))?;
-        if since.is_some_and(|since| written < since) {
-            continue;
-        }
-        let (Some(package), Some(input)) = (
-            path.parent()
-                .and_then(|folder| folder.strip_prefix(outputs).ok())
-                .and_then(Path::to_str),
-            path.file_stem().and_then(|stem| stem.to_str()),
-        ) else {
-            continue;
+    for (package, input) in traced(builds, since)? {
+        let path = outputs.join(&package).join(format!("{input}.json"));
+        let written = match fs::metadata(&path).and_then(|record| record.modified()) {
+            Ok(written) => written,
+            // A trace of a target Lake keeps no output record of.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(Error::Io {
+                    operation: format!("read {}", path.display()),
+                    source,
+                });
+            }
         };
-        if !mapping::hex(input, 16) {
+        if since.is_some_and(|since| written < since) {
             continue;
         }
         let bytes = fs::read(&path).operation(format!("read {}", path.display()))?;
@@ -115,7 +159,7 @@ fn records(outputs: &Path, since: Option<std::time::SystemTime>) -> Result<Built
         if record["service"].is_string() {
             continue;
         }
-        found.push((package.to_owned(), input.to_owned(), record));
+        found.push((package, input, record));
     }
     if unfinished > 0 {
         println!(
@@ -540,6 +584,55 @@ mod tests {
     use super::*;
     use covalence_kv_memory::MemoryKv;
 
+    /// A checkout whose `demo` package traced `inputs` under its build
+    /// folder.
+    fn checkout(inputs: &[&str]) -> (tempfile::TempDir, Vec<(String, PathBuf)>) {
+        let root = tempfile::tempdir().unwrap();
+        let build = root.path().join(".lake/build");
+        for (index, input) in inputs.iter().enumerate() {
+            let lib = build.join("lib/lean/Demo");
+            fs::create_dir_all(&lib).unwrap();
+            fs::write(
+                lib.join(format!("M{index}.trace")),
+                format!(r#"{{"depHash": "{input}", "outputs": "1111111111111111.olean"}}"#),
+            )
+            .unwrap();
+        }
+        (root, vec![("demo".to_owned(), build)])
+    }
+
+    #[test]
+    fn a_checkout_finds_only_the_records_its_own_traces_name() {
+        let outputs = tempfile::tempdir().unwrap();
+        let package = outputs.path().join("demo");
+        fs::create_dir_all(&package).unwrap();
+        let built = r#"{"service": null, "data": {"o": ["1111111111111111.olean"]}}"#;
+        for input in ["00000000000000aa", "00000000000000bb", "00000000000000cc"] {
+            fs::write(package.join(format!("{input}.json")), built).unwrap();
+        }
+        let (_one, one) = checkout(&["00000000000000aa"]);
+        let (_two, two) = checkout(&["00000000000000bb", "00000000000000dd"]);
+        let inputs = |builds| {
+            records(outputs.path(), builds, None)
+                .unwrap()
+                .into_iter()
+                .map(|(_, input, _)| input)
+                .collect::<Vec<_>>()
+        };
+        // The host's cache holds both checkouts' builds and a third's; each
+        // checkout's put takes only its own, and a trace without a record
+        // takes nothing.
+        assert_eq!(inputs(&one), ["00000000000000aa"]);
+        assert_eq!(inputs(&two), ["00000000000000bb"]);
+        // Nor does a trace older than the run, nor a record from before it.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        assert!(
+            records(outputs.path(), &one, Some(later))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn a_record_another_build_is_still_writing_is_left_to_it() {
         let outputs = tempfile::tempdir().unwrap();
@@ -552,12 +645,18 @@ mod tests {
         .unwrap();
         fs::write(package.join("0123456789abcde0.json"), "").unwrap();
         fs::write(package.join("0123456789abcde1.json"), r#"{"service": nu"#).unwrap();
-        let found = records(outputs.path(), None).unwrap();
+        let (_root, builds) = checkout(&[
+            "0123456789abcdef",
+            "0123456789abcde0",
+            "0123456789abcde1",
+            "0123456789abcde2",
+        ]);
+        let found = records(outputs.path(), &builds, None).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].1, "0123456789abcdef");
         // A malformed record is no write in progress.
         fs::write(package.join("0123456789abcde2.json"), "{]").unwrap();
-        assert!(records(outputs.path(), None).is_err());
+        assert!(records(outputs.path(), &builds, None).is_err());
     }
 
     #[test]

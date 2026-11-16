@@ -56,11 +56,23 @@ struct Fixture {
     temporary: tempfile::TempDir,
     root: PathBuf,
     server: Server,
+    /// Lake's cache, the host's: every checkout on a host shares it.
+    cache: PathBuf,
 }
 
 impl Fixture {
     fn new() -> Self {
         let temporary = tempfile::tempdir().unwrap();
+        let cache = temporary.path().join("cache");
+        Self::on(temporary, cache)
+    }
+
+    /// Another checkout on `host`'s host, publishing to its own pool.
+    fn beside(host: &Self) -> Self {
+        Self::on(tempfile::tempdir().unwrap(), host.cache.clone())
+    }
+
+    fn on(temporary: tempfile::TempDir, cache: PathBuf) -> Self {
         let root = temporary.path().join("project");
         fs::create_dir_all(root.join("Demo")).unwrap();
         fs::write(root.join("lean-toolchain"), format!("{}\n", toolchain())).unwrap();
@@ -92,6 +104,7 @@ impl Fixture {
             temporary,
             root,
             server,
+            cache,
         };
         checked(fixture.lake().args(["env", "true"]));
         fixture.commit();
@@ -107,7 +120,7 @@ impl Fixture {
             .env("LAKE", path_toolchain().join("bin/lake"))
             .env("ELAN_HOME", self.temporary.path().join("elan"))
             .env("GITHUB_PATH", self.temporary.path().join("github-path"))
-            .env("LAKE_CACHE_DIR", self.temporary.path().join("cache"))
+            .env("LAKE_CACHE_DIR", &self.cache)
             .env("LAKE_ARTIFACT_CACHE", "true")
             .env("AWS_REGION", "us-east-1")
             .env("AWS_ENDPOINT_URL", &self.server.endpoint)
@@ -197,10 +210,7 @@ impl Fixture {
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
     fn reset_local(&self) {
-        for directory in [
-            self.root.join(".lake/build"),
-            self.temporary.path().join("cache"),
-        ] {
+        for directory in [self.root.join(".lake/build"), self.cache.clone()] {
             if directory.exists() {
                 fs::remove_dir_all(directory).unwrap();
             }
@@ -662,6 +672,50 @@ fn a_receipt_of_another_tree_leaves_put_its_outputs() {
     let published = log(&checked(&mut fixture.cli("put")));
     assert!(published.contains("of another revision"), "{published}");
     assert_eq!(pointers(&fixture), before);
+}
+
+#[test]
+fn a_put_publishes_none_of_what_another_checkout_on_the_host_built() {
+    let one = Fixture::new();
+    one.build();
+    checked(one.cli("put").arg("--seed"));
+    let other = Fixture::beside(&one);
+    fs::write(
+        other.root.join("Demo/A.lean"),
+        "module\npublic theorem a' (n : Nat) : n * 1 = n := by simp\n",
+    )
+    .unwrap();
+    other.commit();
+    // This checkout's next session restores while the other one builds.
+    checked(&mut one.cli("get"));
+    other.build();
+    let writes = one.server.writes.lock().unwrap().len();
+    let again = log(&checked(&mut one.cli("put")));
+    assert!(
+        again.contains("nothing built since the last put"),
+        "{again}"
+    );
+    let written = one.server.writes.lock().unwrap()[writes..].to_vec();
+    assert!(written.is_empty(), "{written:?}");
+}
+
+#[test]
+fn a_put_after_a_failed_one_and_a_restore_still_publishes_the_build() {
+    let fixture = Fixture::new();
+    fixture.build();
+    fixture.server.deny.store(true, Ordering::SeqCst);
+    let failed = fixture.cli("put").output().unwrap();
+    fixture.server.deny.store(false, Ordering::SeqCst);
+    assert!(!failed.status.success(), "{}", log(&failed));
+    checked(&mut fixture.cli("get"));
+    let writes = fixture.server.writes.lock().unwrap().len();
+    let published = log(&checked(&mut fixture.cli("put")));
+    assert!(published.contains("published outputs only"), "{published}");
+    let written = fixture.server.writes.lock().unwrap()[writes..].to_vec();
+    assert!(
+        written.iter().any(|key| key.contains("/out/")),
+        "{written:?}"
+    );
 }
 
 #[test]
