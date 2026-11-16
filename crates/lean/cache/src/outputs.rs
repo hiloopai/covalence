@@ -57,8 +57,9 @@ pub(crate) struct Entry {
     pub artifacts: BTreeMap<String, String>,
 }
 
-/// What Lake built itself in this checkout since the first `get` or `build`
-/// after its last `put` that found something (all of it before any): the output record of each
+/// What Lake built itself in this checkout since its last `put` read Lake's
+/// outputs, or before any, since its first `get` or `build` (all of it
+/// before either): the output record of each
 /// input a trace under one of its packages' build folders names, by package
 /// and input, when the record was written since. Lake's cache is the host's,
 /// shared by every checkout on it, so only this checkout's traces say which
@@ -538,8 +539,10 @@ fn lookup(kv: Arc<dyn Kv>, rest: &str, path: &Path, artifacts: &Path) -> Result<
     serve(kv, &scope, package, input, path, artifacts)
 }
 
-/// Marks when the first `get` or `build` since this checkout's last `put`
-/// started Lake.
+/// Dated when this checkout's last `put` read Lake's outputs, or before
+/// any, when its first `get` or `build` started Lake. A plain `lake build`
+/// marks nothing, so a put that removed the marker would leave the next put
+/// every output this checkout's traces name.
 fn started_marker(project: &Project) -> PathBuf {
     project.record.join("unpublished-since")
 }
@@ -560,14 +563,13 @@ pub(crate) fn start(project: &Project) -> Result<()> {
     }
 }
 
-/// Everything Lake built here so far is published.
-pub(crate) fn published(project: &Project) -> Result<()> {
-    match fs::remove_file(started_marker(project)) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            Err(error).operation("clear the run's start")
-        }
-        _ => Ok(()),
-    }
+/// Everything Lake built here before `read`, when `put` read its outputs, is
+/// published.
+pub(crate) fn published(project: &Project, read: std::time::SystemTime) -> Result<()> {
+    fs::create_dir_all(&project.record).operation("create build record folder")?;
+    fs::File::create(started_marker(project))
+        .and_then(|marker| marker.set_modified(read))
+        .operation("mark what put published")
 }
 
 /// Say how many outputs this run's Lake fetched by input hash.

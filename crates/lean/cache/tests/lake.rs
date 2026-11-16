@@ -431,6 +431,9 @@ fn incremental_publish_sends_only_the_difference_and_restore_reuses_proofs() {
         })
         .collect::<std::collections::BTreeMap<_, _>>();
     assert!(!incumbents.is_empty());
+    // A put takes only outputs written since the last one read Lake's, so a
+    // warm put retries them only where the checkout lost that mark.
+    fs::remove_file(fixture.record("unpublished-since")).unwrap();
     let warm = fixture.publish();
     assert_eq!(warm["changed"], 0);
     assert_eq!(warm["uploaded"], 0);
@@ -672,6 +675,34 @@ fn a_receipt_of_another_tree_leaves_put_its_outputs() {
     let published = log(&checked(&mut fixture.cli("put")));
     assert!(published.contains("of another revision"), "{published}");
     assert_eq!(pointers(&fixture), before);
+}
+
+#[test]
+fn a_put_after_a_plain_lake_build_publishes_only_what_it_built() {
+    let fixture = Fixture::new();
+    fixture.build();
+    checked(fixture.cli("put").arg("--seed"));
+    // A session's later builds run Lake alone, which marks nothing.
+    checked(fixture.lake().args(["build", "Demo"]));
+    let writes = fixture.server.writes.lock().unwrap().len();
+    let again = log(&checked(&mut fixture.cli("put")));
+    assert!(again.contains("published 0 of the 0 outputs"), "{again}");
+    let written = fixture.server.writes.lock().unwrap()[writes..].to_vec();
+    assert!(
+        written.iter().all(|key| !key.contains("/out/")),
+        "{written:?}"
+    );
+    fs::write(
+        fixture.root.join("Demo/B.lean"),
+        "module\npublic theorem b (n : Nat) : 0 + n = n := by omega\n",
+    )
+    .unwrap();
+    checked(fixture.lake().args(["build", "Demo"]));
+    let published = log(&checked(&mut fixture.cli("put")));
+    assert!(
+        published.contains("published 2 of the 2 outputs"),
+        "{published}"
+    );
 }
 
 #[test]

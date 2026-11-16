@@ -160,15 +160,16 @@ fn execute(cli: Cli) -> Result<()> {
                 // a receipt of another tree publishes outputs only, and a
                 // changed one fails.
                 let recorded = project.recorded()?;
+                let read = std::time::SystemTime::now();
                 let built = outputs::built(&project)?;
                 if built.is_empty() && !recorded {
                     println!("Lake cache: nothing built since the last put");
-                    outputs::published(&project)
+                    outputs::published(&project, read)
                 } else {
                     let kv = store()?;
                     let scope = project.identity()?.scope;
                     outputs::publish(&project, kv.clone(), &scope, &built)?;
-                    outputs::published(&project)?;
+                    outputs::published(&project, read)?;
                     if recorded {
                         storage::publish(&project, &kv, cli.seed)?;
                         project.lean.publish(&kv)
