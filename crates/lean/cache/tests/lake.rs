@@ -1446,6 +1446,65 @@ fn any_host_shares_what_its_lake_built_by_input_hash() {
 }
 
 #[test]
+fn a_put_publishes_nothing_the_pool_served_even_after_lake_rewrote_it() {
+    let fixture = Fixture::new();
+    // Outputs no published build holds, shared only by input hash.
+    let path = fixture.root.join("Demo/A.lean");
+    fs::write(
+        &path,
+        format!(
+            "{}public theorem served (n : Nat) : n = n := rfl\n",
+            fs::read_to_string(&path).unwrap()
+        ),
+    )
+    .unwrap();
+    fixture.commit();
+    checked(fixture.lake().args(["build", "--wfail", "Demo"]));
+    checked(&mut fixture.cli("put"));
+    // A fresh host takes them through Lake's lookups.
+    fixture.reset_local();
+    let restored = log(&checked(fixture.cli("get").args(["--", "Demo"])));
+    assert!(!restored.contains("Built Demo"), "rebuilt: {restored}");
+    assert!(
+        !restored.contains("fetched 0 outputs by input hash"),
+        "{restored}"
+    );
+    // Lake rewrites a record it took when it unpacks or packs the module's
+    // archive, which dates it like one it built.
+    let outputs = fixture.cache.join("outputs");
+    let mut rewritten = 0;
+    for package in fs::read_dir(&outputs).unwrap() {
+        for record in fs::read_dir(package.unwrap().path()).unwrap() {
+            let record = record.unwrap().path();
+            let bytes = fs::read(&record).unwrap();
+            fs::write(&record, bytes).unwrap();
+            rewritten += 1;
+        }
+    }
+    assert!(rewritten > 0);
+    let (writes, reads) = (
+        fixture.server.writes.lock().unwrap().len(),
+        fixture.server.reads.lock().unwrap().len(),
+    );
+    let again = log(&checked(&mut fixture.cli("put")));
+    assert!(
+        again.contains("nothing built since the last put"),
+        "{again}"
+    );
+    let written = fixture.server.writes.lock().unwrap()[writes..].to_vec();
+    assert!(
+        written.iter().all(|key| !key.contains("/out/")),
+        "{written:?}"
+    );
+    let read = fixture.server.reads.lock().unwrap()[reads..].to_vec();
+    assert!(
+        read.iter()
+            .all(|key| !key.contains("/out/") && !key.contains("/cas/")),
+        "{read:?}"
+    );
+}
+
+#[test]
 fn restores_into_a_workspace_lake_has_not_configured_install_without_lock_failures() {
     // Several packages' mappings install at once; on a fresh checkout each
     // Lake run would otherwise reconfigure the workspace concurrently.

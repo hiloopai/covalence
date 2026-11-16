@@ -73,6 +73,7 @@ pub(crate) fn built(project: &Project) -> Result<Built> {
     let since = fs::metadata(started_marker(project))
         .and_then(|marker| marker.modified())
         .ok();
+    let served = served(project)?;
     let builds = project
         .packages()?
         .into_iter()
@@ -81,7 +82,40 @@ pub(crate) fn built(project: &Project) -> Result<Built> {
             (package.name, build)
         })
         .collect::<Vec<_>>();
-    records(&project.cache_dir()?.join("outputs"), &builds, since)
+    records(
+        &project.cache_dir()?.join("outputs"),
+        &builds,
+        since,
+        &served,
+    )
+}
+
+/// Lists the outputs the pool served this checkout's Lake since its last
+/// `put` read Lake's outputs, one `<package>\t<input>` line each. Lake
+/// rewrites some records it took, as when it unpacks or packs a module's
+/// archive, which dates them like its own builds; the pool already holds
+/// those.
+fn served_list(project: &Project) -> PathBuf {
+    project.record.join("served")
+}
+
+fn served(project: &Project) -> Result<BTreeSet<(String, String)>> {
+    let path = served_list(project);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(source) => {
+            return Err(Error::Io {
+                operation: format!("read {}", path.display()),
+                source,
+            });
+        }
+    };
+    Ok(text
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(package, input)| (package.to_owned(), input.to_owned()))
+        .collect())
 }
 
 /// The inputs the traces under each package's build folder name, of the
@@ -115,15 +149,17 @@ fn traced(
 }
 
 /// The output records under `outputs` of the inputs `builds` traced, written
-/// since `since`, that Lake built itself.
+/// since `since`, that Lake built itself: none the pool `served`.
 fn records(
     outputs: &Path,
     builds: &[(String, PathBuf)],
     since: Option<std::time::SystemTime>,
+    served: &BTreeSet<(String, String)>,
 ) -> Result<Built> {
     let mut found = Vec::new();
     let mut unfinished = 0;
-    for (package, input) in traced(builds, since)? {
+    for (package, input) in traced(builds, since)?.difference(served) {
+        let (package, input) = (package.clone(), input.clone());
         let path = outputs.join(&package).join(format!("{input}.json"));
         let written = match fs::metadata(&path).and_then(|record| record.modified()) {
             Ok(written) => written,
@@ -156,8 +192,10 @@ fn records(
                 });
             }
         };
-        // Lake writes `"service": null` for what it built itself.
-        if record["service"].is_string() {
+        // Lake writes `"service": null` for what it built itself, and packs no
+        // archive when it builds: an output naming one is a module Lake
+        // unpacked from an archive it was given, which the pool holds.
+        if record["service"].is_string() || names_an_archive(&record["data"]) {
             continue;
         }
         found.push((package, input, record));
@@ -168,6 +206,12 @@ fn records(
         );
     }
     Ok(found)
+}
+
+/// Whether a Lake output descriptor is a module archive, or names one
+/// beside the files Lake unpacked from it (`l`).
+fn names_an_archive(data: &serde_json::Value) -> bool {
+    data.as_str().is_some_and(|name| name.ends_with(".ltar")) || data.get("l").is_some()
 }
 
 /// Publish what `built` found: each input's record and the artifacts the
@@ -223,9 +267,9 @@ fn publish_entry(
     key: &str,
     input: &str,
     entry: &Entry,
-    load: impl FnMut(&str) -> Result<Vec<u8>>,
+    mut load: impl FnMut(&str) -> Result<Vec<u8>>,
 ) -> Result<bool> {
-    let candidate = normalized::entry(entry, input, load)?;
+    let candidate = normalized::entry(entry, input, &mut load)?;
     if kv
         .put_new(key.as_bytes(), Bytes::from(encode(entry)?))
         .map_err(store_error("create output"))?
@@ -241,7 +285,12 @@ fn publish_entry(
             ))
         })?;
     let incumbent: Entry = json(&incumbent)?;
+    // A constituent whose content ID equals the candidate's is the same
+    // bytes, which this host already holds.
     let existing = normalized::entry(&incumbent, input, |name| {
+        if incumbent.artifacts.get(name) == entry.artifacts.get(name) {
+            return load(name);
+        }
         let cid: Sha256 = incumbent.artifacts[name]
             .parse()
             .map_err(|_| invalid("incumbent output names an invalid CID"))?;
@@ -387,6 +436,8 @@ const SOCKET: &str = "COVALENCE_LAKE_OUTPUTS_SOCKET";
 struct Service {
     socket: PathBuf,
     fetched: AtomicUsize,
+    /// This checkout's [`served_list`].
+    served: PathBuf,
     // Holds the socket's folder for the process's life.
     _folder: tempfile::TempDir,
 }
@@ -411,6 +462,7 @@ impl Service {
         let started: &'static Service = Box::leak(Box::new(Service {
             socket,
             fetched: AtomicUsize::new(0),
+            served: served_list(project),
             _folder: folder,
         }));
         let kv = crate::storage::store()?;
@@ -438,20 +490,35 @@ impl Service {
                     .ok_or_else(|| invalid("invalid output request"))?;
                 lookup(kv, rest, Path::new(path), artifacts)
             });
-        let code = match answer {
-            Ok(true) => {
-                self.fetched.fetch_add(1, Ordering::Relaxed);
-                0
-            }
-            Ok(false) => 22,
-            Err(error) => {
-                // Lake takes any failure as a miss and says nothing.
-                eprintln!("Lake cache: an outputs lookup failed: {error}");
-                1
-            }
-        };
+        let code =
+            match answer.and_then(|served| served.map(|served| self.note(&served)).transpose()) {
+                Ok(Some(())) => {
+                    self.fetched.fetch_add(1, Ordering::Relaxed);
+                    0
+                }
+                Ok(None) => 22,
+                Err(error) => {
+                    // Lake takes any failure as a miss and says nothing.
+                    eprintln!("Lake cache: an outputs lookup failed: {error}");
+                    1
+                }
+            };
         // Lake's stand-in gone means Lake no longer waits for the answer.
         let _ = writeln!(stream, "{code}");
+    }
+
+    /// Add a served `(package, input)` to this checkout's list. One short
+    /// appended line is one write, so concurrent lookups never interleave.
+    fn note(&self, (package, input): &(String, String)) -> Result<()> {
+        if let Some(folder) = self.served.parent() {
+            fs::create_dir_all(folder).operation("create build record folder")?;
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.served)
+            .and_then(|mut list| list.write_all(format!("{package}\t{input}\n").as_bytes()))
+            .operation("note a served output")
     }
 }
 
@@ -507,7 +574,13 @@ pub(crate) fn serve_request(rest: &str, path: &Path) -> Result<std::process::Exi
 /// Serve one request of `<os-arch>/<hash>/<package>/<input>.json` into
 /// `path`, which must be Lake's own outputs file for that input beside
 /// `artifacts`. Whether it found the outputs.
-fn lookup(kv: Arc<dyn Kv>, rest: &str, path: &Path, artifacts: &Path) -> Result<bool> {
+/// The `(package, input)` served, or `None` on a miss.
+fn lookup(
+    kv: Arc<dyn Kv>,
+    rest: &str,
+    path: &Path,
+    artifacts: &Path,
+) -> Result<Option<(String, String)>> {
     let parts = rest.split('/').collect::<Vec<_>>();
     let [platform, hash, package, file] = parts[..] else {
         return Err(invalid("invalid output request"));
@@ -536,7 +609,8 @@ fn lookup(kv: Arc<dyn Kv>, rest: &str, path: &Path, artifacts: &Path) -> Result<
     {
         return Err(invalid("unsafe Lake outputs destination"));
     }
-    serve(kv, &scope, package, input, path, artifacts)
+    Ok(serve(kv, &scope, package, input, path, artifacts)?
+        .then(|| (package.to_owned(), input.to_owned())))
 }
 
 /// Dated when this checkout's last `put` read Lake's outputs, or before
@@ -569,7 +643,13 @@ pub(crate) fn published(project: &Project, read: std::time::SystemTime) -> Resul
     fs::create_dir_all(&project.record).operation("create build record folder")?;
     fs::File::create(started_marker(project))
         .and_then(|marker| marker.set_modified(read))
-        .operation("mark what put published")
+        .operation("mark what put published")?;
+    match fs::remove_file(served_list(project)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error).operation("restart the served list")
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Say how many outputs this run's Lake fetched by input hash.
@@ -615,7 +695,7 @@ mod tests {
         let (_one, one) = checkout(&["00000000000000aa"]);
         let (_two, two) = checkout(&["00000000000000bb", "00000000000000dd"]);
         let inputs = |builds| {
-            records(outputs.path(), builds, None)
+            records(outputs.path(), builds, None, &BTreeSet::new())
                 .unwrap()
                 .into_iter()
                 .map(|(_, input, _)| input)
@@ -629,9 +709,64 @@ mod tests {
         // Nor does a trace older than the run, nor a record from before it.
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         assert!(
-            records(outputs.path(), &one, Some(later))
+            records(outputs.path(), &one, Some(later), &BTreeSet::new())
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_output_lake_unpacked_from_an_archive_is_no_build_of_this_checkout() {
+        let outputs = tempfile::tempdir().unwrap();
+        let package = outputs.path().join("demo");
+        fs::create_dir_all(&package).unwrap();
+        // As on the production floor: Lake's record of a module it unpacked
+        // names the archive beside the unpacked files, or is the archive.
+        for (input, data) in [
+            (
+                "00000000000000aa",
+                r#"{"o": ["1111111111111111.olean"], "l": "2222222222222222.ltar"}"#,
+            ),
+            ("00000000000000bb", r#""3333333333333333.ltar""#),
+            ("00000000000000cc", r#"{"o": ["4444444444444444.olean"]}"#),
+        ] {
+            fs::write(
+                package.join(format!("{input}.json")),
+                format!(r#"{{"service": null, "data": {data}}}"#),
+            )
+            .unwrap();
+        }
+        let (_root, builds) =
+            checkout(&["00000000000000aa", "00000000000000bb", "00000000000000cc"]);
+        let found = records(outputs.path(), &builds, None, &BTreeSet::new()).unwrap();
+        assert_eq!(
+            found
+                .into_iter()
+                .map(|(_, input, _)| input)
+                .collect::<Vec<_>>(),
+            ["00000000000000cc"]
+        );
+    }
+
+    #[test]
+    fn an_output_the_pool_served_is_no_build_of_this_checkout() {
+        let outputs = tempfile::tempdir().unwrap();
+        let package = outputs.path().join("demo");
+        fs::create_dir_all(&package).unwrap();
+        // Lake rewrote both records, as when it unpacks or packs an archive.
+        let record = r#"{"service": null, "data": {"o": ["1111111111111111.olean"]}}"#;
+        for input in ["00000000000000aa", "00000000000000bb"] {
+            fs::write(package.join(format!("{input}.json")), record).unwrap();
+        }
+        let (_root, builds) = checkout(&["00000000000000aa", "00000000000000bb"]);
+        let served = BTreeSet::from([("demo".to_owned(), "00000000000000aa".to_owned())]);
+        let found = records(outputs.path(), &builds, None, &served).unwrap();
+        assert_eq!(
+            found
+                .into_iter()
+                .map(|(_, input, _)| input)
+                .collect::<Vec<_>>(),
+            ["00000000000000bb"]
         );
     }
 
@@ -653,12 +788,12 @@ mod tests {
             "0123456789abcde1",
             "0123456789abcde2",
         ]);
-        let found = records(outputs.path(), &builds, None).unwrap();
+        let found = records(outputs.path(), &builds, None, &BTreeSet::new()).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].1, "0123456789abcdef");
         // A malformed record is no write in progress.
         fs::write(package.join("0123456789abcde2.json"), "{]").unwrap();
-        assert!(records(outputs.path(), &builds, None).is_err());
+        assert!(records(outputs.path(), &builds, None, &BTreeSet::new()).is_err());
     }
 
     #[test]
@@ -867,6 +1002,24 @@ mod atomic_tests {
         assert_eq!(kv.get(b"test/output").unwrap(), before);
     }
 
+    #[test]
+    fn an_incumbent_of_the_same_content_ids_is_accepted_without_reading_the_pool() {
+        let kv = MemoryKv::default().into_dyn();
+        let blobs = crate::pool::blobs(kv.clone(), "test").unwrap();
+        let (entry, files) = artifact_entry(1);
+        let mut incumbent = Entry {
+            record: entry.record.clone(),
+            artifacts: entry.artifacts.clone(),
+        };
+        incumbent.record["service"] = serde_json::json!("another route");
+        kv.put(b"test/output", Bytes::from(encode(&incumbent).unwrap()))
+            .unwrap();
+        // `publish` stores the candidate's constituents before this, so the
+        // pool holds them; this one compares the local bytes, and a read of
+        // the pool, which lacks them here, would fail.
+        assert!(!attempt(kv.as_ref(), &blobs, &entry, &files).unwrap());
+    }
+
     struct NoConditionalCreate;
     impl Kv for NoConditionalCreate {
         fn get(&self, _: &[u8]) -> std::result::Result<Option<Bytes>, covalence_kv_trait::Error> {
@@ -889,9 +1042,18 @@ mod atomic_tests {
         let blobs = crate::pool::blobs(kv.clone(), "test").unwrap();
         let (entry, files) = artifact_entry(1);
         assert!(attempt(&NoConditionalCreate, &blobs, &entry, &files).is_err());
-        // A legacy mapping whose CAS bytes vanished cannot establish equality,
-        // even when its JSON/CID claims happen to match the local candidate.
-        kv.put(b"test/output", Bytes::from(encode(&entry).unwrap()))
+        // An incumbent naming other bytes, which vanished from the pool, cannot
+        // establish equality.
+        let (other, _) = artifact_entry(2);
+        let name = entry.artifacts.keys().next().unwrap().clone();
+        let mut incumbent = Entry {
+            record: entry.record.clone(),
+            artifacts: entry.artifacts.clone(),
+        };
+        incumbent
+            .artifacts
+            .insert(name, other.artifacts.into_values().next().unwrap());
+        kv.put(b"test/output", Bytes::from(encode(&incumbent).unwrap()))
             .unwrap();
         let before = kv.get(b"test/output").unwrap();
         assert!(

@@ -59,6 +59,13 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
   lookup, even on a reused connection, so many parallel reads could overload a
   cluster's DNS and fail with "Temporary failure in name resolution".
 
+- `cov-lake-cache put` publishes only outputs that this checkout's own Lake
+  built after the last put. It used to publish every output in the host's Lake
+  cache that any checkout wrote since this checkout's first restore. It also
+  re-sent outputs it had already published, and ones the pool served this
+  checkout or Lake unpacked from an archive, after Lake rewrote them. A put that fails leaves them for the next
+  put. When an output the pool already holds names the same content IDs, a put
+  compares local bytes instead of downloading them.
 - Kernel replay can update cached receipts when declarations are removed and
   added together, by ordering all receipt-map edits by key before applying them.
 
