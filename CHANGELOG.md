@@ -15,6 +15,13 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+### Changed
+
+- Concurrent `cov-lake-cache get --seed` runs on one host seed a repository
+  once. The first takes a lock in Lake's cache folder and installs the seed;
+  the others wait, print how long, then take only what the pool maps add. A
+  killed run releases its lock.
+
 ## [0.1.0-dev.9] - 2026-11-16
 
 ### Added

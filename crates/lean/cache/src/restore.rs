@@ -325,8 +325,17 @@ pub(crate) fn restore(
         }
         let nearest = storage::nearest(&**kv, project, scope, &packages[0], &commits)?;
         let looked_up = started.elapsed();
-        let installed = local.installed(Installed::Mappings, scope, &packages[0].name)?;
-        let fresh = seed && installed.is_none();
+        let mut installed = local.installed(Installed::Mappings, scope, &packages[0].name)?;
+        // One run per host seeds a repository; the others wait, then find it
+        // installed and take only the pool maps' differences.
+        let seeding_lock = if seed && installed.is_none() {
+            let lock = seed_lock(&cache, scope, &project.namespace(), &project.repository)?;
+            installed = local.installed(Installed::Mappings, scope, &packages[0].name)?;
+            installed.is_none().then_some(lock)
+        } else {
+            None
+        };
+        let fresh = seeding_lock.is_some();
         let remote = match nearest.as_ref().filter(|_| fresh) {
             Some((commit, _)) => seed::find(&**kv, scope, &project.namespace(), commit, &commits)?,
             None => None,
@@ -433,6 +442,7 @@ pub(crate) fn restore(
             None => BTreeMap::new(),
         };
         session.install(project, &installs, lazy, &seeded, &prefetch)?;
+        drop(seeding_lock);
         println!(
             "Lake cache: installed {} pool maps in {:.1} s",
             installs.len(),
@@ -461,6 +471,36 @@ pub(crate) fn restore(
         }
         Ok(())
     })
+}
+
+/// Hold this host's seeding of the workspace `namespace` in `scope` until the
+/// lock drops: a `flock`, so a killed holder releases it. Says how long a run
+/// waited.
+fn seed_lock(cache: &Path, scope: &str, namespace: &str, repository: &str) -> Result<fs::File> {
+    use sha2::Digest;
+    let folder = cache.join("covalence/locks");
+    fs::create_dir_all(&folder).operation("create lock folder")?;
+    let namespace = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(namespace));
+    let path = folder.join(format!(
+        "seed-{}-{}.lock",
+        scope.replace('/', "-"),
+        &namespace[..16]
+    ));
+    let file = fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .operation(format!("open {}", path.display()))?;
+    if file.try_lock().is_err() {
+        let started = Instant::now();
+        file.lock().operation(format!("lock {}", path.display()))?;
+        println!(
+            "Lake cache: waited {:.1} s for this host's seed of {repository}",
+            started.elapsed().as_secs_f64(),
+        );
+    }
+    Ok(file)
 }
 
 /// Install a fetched seed into Lake's cache; `None` without one. A seed is
@@ -717,6 +757,35 @@ pub(crate) fn download(args: &[String]) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_run_per_host_seeds_a_workspace_and_a_dead_holder_frees_it() {
+        let cache = tempfile::tempdir().unwrap();
+        let held = seed_lock(cache.path(), "linux-x86_64/s", "t/p", "t/p").unwrap();
+        // Another workspace seeds at once.
+        drop(seed_lock(cache.path(), "linux-x86_64/s", "t/q", "t/q").unwrap());
+        let (sent, waited) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn({
+            let cache = cache.path().to_owned();
+            move || {
+                let lock = seed_lock(&cache, "linux-x86_64/s", "t/p", "t/p").unwrap();
+                sent.send(()).unwrap();
+                lock
+            }
+        });
+        assert!(
+            waited
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err()
+        );
+        // Closing the holder's descriptor, as its process's death does,
+        // releases the lock.
+        drop(held);
+        waited
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        drop(waiter.join().unwrap());
+    }
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_owned()).collect()

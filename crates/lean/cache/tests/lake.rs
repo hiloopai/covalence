@@ -1094,6 +1094,52 @@ fn a_seeded_fresh_host_fetches_no_artifacts_and_unpacks_nothing() {
 }
 
 #[test]
+fn concurrent_seeded_restores_on_one_host_seed_once() {
+    let fixture = Fixture::new();
+    fixture.build();
+    checked(fixture.cli("put").arg("--seed"));
+    fixture.reset_local();
+    // Four checkouts of this commit on one fresh host restore at once.
+    let checkouts = (0..4)
+        .map(|index| {
+            let copy = fixture.temporary.path().join(format!("checkout-{index}"));
+            checked(Command::new("cp").arg("-a").arg(&fixture.root).arg(&copy));
+            copy
+        })
+        .collect::<Vec<_>>();
+    let runs = checkouts
+        .iter()
+        .map(|copy| {
+            fixture
+                .cli("get")
+                .args(["--seed", "--", "Demo"])
+                .current_dir(copy)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let logs = runs
+        .into_iter()
+        .map(|run| {
+            let output = run.wait_with_output().unwrap();
+            let text = log(&output);
+            assert!(output.status.success(), "{text}");
+            text
+        })
+        .collect::<Vec<_>>();
+    let seeded = logs
+        .iter()
+        .filter(|log| log.contains("Lake cache: seeded"))
+        .count();
+    assert_eq!(seeded, 1, "{logs:#?}");
+    for log in &logs {
+        assert!(!log.contains("Built Demo"), "rebuilt: {log}");
+    }
+}
+
+#[test]
 fn toolchain_identity_is_checked_and_missing_pointers_are_misses() {
     let fixture = Fixture::new();
     let miss = log(&checked(&mut fixture.cli("get")));
