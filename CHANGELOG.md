@@ -15,6 +15,8 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+## [0.1.0-dev.9] - 2026-11-16
+
 ### Added
 
 - `S3Kv::address_reuse` sets how long an S3 store reuses its endpoint's
@@ -398,7 +400,8 @@ public repository. These notes are based on its published wheel.
   was published.
 
 [GitHub releases]: https://github.com/hiloopai/covalence/releases
-[Unreleased]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.8...HEAD
+[Unreleased]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.9...HEAD
+[0.1.0-dev.9]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.8...v0.1.0-dev.9
 [0.1.0-dev.8]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.7...v0.1.0-dev.8
 [0.1.0-dev.7]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.6...v0.1.0-dev.7
 [0.1.0-dev.6]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.5...v0.1.0-dev.6
