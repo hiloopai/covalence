@@ -15,6 +15,12 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+### Added
+
+- `S3Kv::address_reuse` sets how long an S3 store reuses its endpoint's
+  looked-up addresses; the default is `ADDRESS_REUSE`, 5 seconds.
+  `IDLE_CONNECTIONS` names `S3Kv::max_idle_connections`'s default, 16.
+
 ### Changed
 
 - `cov-kernel-checker receipt-cache push` uploads a pack of only the modules
@@ -46,6 +52,12 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
   `gc` deletes the archives of toolchains no kept scope uses.
 
 ### Fixed
+
+- An S3 store looks its endpoint up at most once every 5 seconds, the lifetime
+  of S3's DNS records, and requests that need it while a lookup is in flight
+  share that lookup, each within its own timeout. Before, every request did a
+  lookup, even on a reused connection, so many parallel reads could overload a
+  cluster's DNS and fail with "Temporary failure in name resolution".
 
 - Kernel replay can update cached receipts when declarations are removed and
   added together, by ordering all receipt-map edits by key before applying them.

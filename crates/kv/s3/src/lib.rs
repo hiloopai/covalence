@@ -29,6 +29,7 @@
 
 mod list;
 mod read;
+mod resolve;
 mod sign;
 mod write;
 
@@ -63,6 +64,7 @@ use covalence_lib_data::Bytes;
 use covalence_lib_error::snafu::{OptionExt, ResultExt, Snafu};
 pub use rusty_s3::Credentials;
 use rusty_s3::{Bucket, BucketError, UrlStyle};
+use ureq::unversioned::{resolver::DefaultResolver, transport::DefaultConnector};
 
 /// Errors from configuring and using an S3 store.
 ///
@@ -327,6 +329,11 @@ const MAX_SINGLE_PUT: u64 = 5_000_000_000;
 pub const PART: u64 = 8 << 20;
 /// The default number of parts or ranges moving at once, 16.
 pub const CONCURRENCY: usize = 16;
+/// The default number of idle connections kept for reuse, 16.
+pub const IDLE_CONNECTIONS: usize = 16;
+/// The default time the endpoint's looked-up addresses are reused, 5 seconds:
+/// the lifetime S3 gives its DNS records.
+pub const ADDRESS_REUSE: Duration = Duration::from_secs(5);
 /// Limit on the size of an error response body, in bytes.
 const MAX_ERROR: u64 = 64 << 10;
 /// Credentials closer than this to expiring are fetched again, leaving room
@@ -507,6 +514,9 @@ impl Cached {
 /// - Up to [`CONCURRENCY`] parts or ranges (unless set with
 ///   [`S3Kv::concurrency`]) move at once, each on its own thread, while the
 ///   reader or writer sees the bytes in order.
+/// - The endpoint is looked up at most once per [`ADDRESS_REUSE`] (unless set
+///   with [`S3Kv::address_reuse`]). Requests that need it while a lookup is in
+///   flight wait for that lookup's answer, within their own timeout.
 /// - A request is tried up to 4 times, waiting 0.5, 1 and 2 seconds between
 ///   attempts, when it gets status 429 or 5xx, or fails to complete for a
 ///   reason other than a bad URL or an oversized response body.
@@ -535,6 +545,8 @@ pub struct S3Kv {
     prefix: String,
     credentials: Source,
     agent: ureq::Agent,
+    idle_connections: usize,
+    address_reuse: Duration,
     part: u64,
     concurrency: usize,
     upload_budget: Option<UploadBudget>,
@@ -618,7 +630,9 @@ impl S3Kv {
             bucket,
             prefix: location.prefix,
             credentials,
-            agent: agent(CONCURRENCY),
+            agent: agent(IDLE_CONNECTIONS, ADDRESS_REUSE),
+            idle_connections: IDLE_CONNECTIONS,
+            address_reuse: ADDRESS_REUSE,
             part: PART,
             concurrency: CONCURRENCY,
             upload_budget: None,
@@ -645,11 +659,25 @@ impl S3Kv {
 
     /// Retain up to `connections` idle HTTP connections to the endpoint.
     ///
-    /// The default is 16, independently of per-value part concurrency. Zero
-    /// disables idle reuse. This does not limit active requests or reserve
-    /// upload buffers. Calling it replaces any existing pool.
+    /// The default is [`IDLE_CONNECTIONS`], independently of per-value part
+    /// concurrency. Zero disables idle reuse. This does not limit active
+    /// requests or reserve upload buffers. Calling it replaces any existing
+    /// pool and reused addresses.
     pub fn max_idle_connections(mut self, connections: usize) -> Self {
-        self.agent = agent(connections);
+        self.idle_connections = connections;
+        self.agent = agent(self.idle_connections, self.address_reuse);
+        self
+    }
+
+    /// Reuse the endpoint's looked-up addresses for `period`.
+    ///
+    /// The default is [`ADDRESS_REUSE`]. Zero looks the endpoint up for every
+    /// request, though requests that need it while a lookup is in flight still
+    /// share that lookup. A failed lookup is never reused. Calling it replaces
+    /// any existing pool and reused addresses.
+    pub fn address_reuse(mut self, period: Duration) -> Self {
+        self.address_reuse = period;
+        self.agent = agent(self.idle_connections, self.address_reuse);
         self
     }
 
@@ -910,16 +938,21 @@ impl S3Kv {
     }
 }
 
-/// An agent keeping up to `concurrency` idle connections across shared calls.
-fn agent(concurrency: usize) -> ureq::Agent {
-    ureq::Agent::config_builder()
+/// An agent keeping up to `connections` idle connections across shared calls,
+/// which reuses the endpoint's addresses for `address_reuse`.
+fn agent(connections: usize, address_reuse: Duration) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
         .timeout_global(Some(TIMEOUT))
-        .max_idle_connections(concurrency)
-        .max_idle_connections_per_host(concurrency)
-        .build()
-        .into()
+        .max_idle_connections(connections)
+        .max_idle_connections_per_host(connections)
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        DefaultConnector::default(),
+        resolve::Reusing::new(DefaultResolver::default(), address_reuse),
+    )
 }
 
 /// The status and body of a response, read into `buffer`, reading at most
