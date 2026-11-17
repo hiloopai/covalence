@@ -17,6 +17,16 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Changed
 
+- **Breaking:** `cov-kernel-checker receipt-cache push` writes an index of
+  only the ledger rows that changed since the revision the checkout pulled,
+  the pack of their receipts, and links to the earlier indexes it builds on
+  (`mor/receipt-pack/v3`). A push that would follow 64 such indexes, or that
+  changes the policy line, writes a full index of one pack again. A pull
+  fetches the linked indexes and their packs at once. It still reads the full
+  indexes earlier checkers wrote, and a push after an earlier checker's pull
+  writes a full index. A push fails rather than name a ledger row whose receipt
+  none of its packs hold. Earlier checkers cannot read the new indexes: upgrade
+  every reader of a receipt scope before its first push with this checker.
 - Concurrent `cov-lake-cache get --seed` runs on one host seed a repository
   once. The first takes a lock in Lake's cache folder and installs the seed;
   the others wait, print how long, then take only what the pool maps add. A

@@ -23,12 +23,22 @@ use std::{
     time::Instant,
 };
 
+/// A full index: the whole ledger and the packs that hold every module.
 const FORMAT: &str = "mor/receipt-pack/v2";
-/// What earlier checkers wrote: an index naming one pack of every module.
+/// What earlier checkers wrote: a full index naming one pack.
 const FORMAT_V1: &str = "mor/receipt-pack/v1";
-/// A push adds a pack of only the modules whose rows changed; an index naming
-/// more than this many packs is written as one merged pack instead.
+/// A delta index: the ledger rows and the pack a push changed, after the
+/// indexes of its ancestors.
+const FORMAT_DELTA: &str = "mor/receipt-pack/v3";
+/// The most packs a full index names; earlier checkers wrote up to this many.
 const MAX_PACKS: usize = 16;
+/// The most ancestors a delta index names; the next push writes a full index.
+///
+/// A delta push writes its changed rows, its pack and one ~110 byte link per
+/// ancestor, so at most ~7 KB of links; a full index rewrites the ledger and
+/// every receipt (3.2 MB and 33 MB for moria-lean), so every 64th push adds
+/// ~0.56 MB per push. A reader fetches the 64 indexes and their packs at once.
+const MAX_CHAIN: usize = 64;
 const REPLAY: &str = "mor/kernel-replay/v1";
 const MAX_PACK: u64 = 512 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 2 * 1024 * 1024 * 1024;
@@ -105,6 +115,46 @@ impl Index {
             _ => self.packs.clone(),
         }
     }
+}
+
+/// An earlier revision's index, by revision and the BLAKE3 hash of its bytes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(crate = "covalence_lib_serde::serde")]
+#[serde(deny_unknown_fields)]
+struct Link {
+    revision: String,
+    hash: String,
+}
+
+/// A revision's receipts as changes to its parent's: the ancestors' indexes,
+/// a full index first, the ledger rows added or changed, the modules removed,
+/// and the pack of the changed receipts.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "covalence_lib_serde::serde")]
+#[serde(deny_unknown_fields)]
+struct Delta {
+    format: String,
+    scope: String,
+    chain: Vec<Link>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    packs: Vec<Pack>,
+    rows: Vec<String>,
+    removed: Vec<String>,
+    /// Of the whole ledger the chain rebuilds.
+    ledger_hash: String,
+}
+
+/// A revision's receipts with its chain followed: what a pull leaves for the
+/// next push to name as its parent.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "covalence_lib_serde::serde")]
+#[serde(deny_unknown_fields)]
+struct Resolved {
+    link: Link,
+    chain: Vec<Link>,
+    /// Oldest first.
+    packs: Vec<Pack>,
+    ledger: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -314,10 +364,77 @@ fn write_pack<'a>(
     Ok(Pack { pack: hash, bytes })
 }
 
-/// Publish this ledger's receipts under `revision`. Against the index this
-/// checkout pulled, only the modules whose ledger rows changed go into a new
-/// pack; the index names it after the parent's packs, which still hold every
-/// other module. Past [`MAX_PACKS`] the packs are merged into one.
+fn shared_path(args: &Args) -> PathBuf {
+    args.state
+        .join("shared")
+        .join(format!("{}.json", args.scope))
+}
+
+/// The receipts this checkout pulled: a revision its next push can follow,
+/// or the full index an earlier checker kept, which names no revision. The
+/// scope is the caller's, so a checker upgrade can meet either.
+enum Parent {
+    Revision(Resolved),
+    Index(Index),
+}
+
+impl Parent {
+    fn ledger(&self) -> &str {
+        match self {
+            Self::Revision(resolved) => &resolved.ledger,
+            Self::Index(index) => &index.ledger,
+        }
+    }
+}
+
+fn read_parent(path: &Path, scope: &str) -> Result<Option<Parent>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).into_diagnostic(),
+    };
+    if let Ok(resolved) = serde_json::from_slice(&bytes) {
+        return Ok(Some(Parent::Revision(resolved)));
+    }
+    let index: Index = serde_json::from_slice(&bytes)
+        .into_diagnostic()
+        .wrap_err("unreadable pulled receipt state")?;
+    validate_index(&index, scope)?;
+    Ok(Some(Parent::Index(index)))
+}
+
+/// `ledger`'s rows, after its policy line, by module name.
+fn rows(ledger: &str) -> Result<BTreeMap<&str, &str>> {
+    ledger
+        .lines()
+        .skip(1)
+        .map(|row| Ok((module_name(row)?, row)))
+        .collect()
+}
+
+/// `ledger` with `changed` rows added or replaced and the `removed` modules
+/// left out, its rows in module order.
+fn apply(ledger: &str, changed: &[String], removed: &[String]) -> Result<String> {
+    let mut rows = rows(ledger)?;
+    for name in removed {
+        rows.remove(name.as_str());
+    }
+    for row in changed {
+        rows.insert(module_name(row)?, row);
+    }
+    let mut rebuilt = String::new();
+    for line in ledger.lines().take(1).chain(rows.into_values()) {
+        rebuilt.push_str(line);
+        rebuilt.push('\n');
+    }
+    Ok(rebuilt)
+}
+
+/// Publish this ledger's receipts under `revision`. Against the revision this
+/// checkout pulled, the index holds only the rows that changed and a pack of
+/// their receipts, after links to its ancestors' indexes. Past [`MAX_CHAIN`]
+/// ancestors, after a policy change, or without a parent, it is a full index
+/// of one pack of every receipt, which starts a new chain.
 fn publish(kv: &dyn Kv, args: &Args, revision: &str) -> Result<Value> {
     let key = index_key(&args.scope, revision)?;
     let mut phases = serde_json::Map::new();
@@ -327,93 +444,148 @@ fn publish(kv: &dyn Kv, args: &Args, revision: &str) -> Result<Value> {
         *phase = Instant::now();
     };
     let ledger = fs::read_to_string(&args.ledger).into_diagnostic()?;
-    let shared = args
-        .state
-        .join("shared")
-        .join(format!("{}.json", args.scope));
-    let parent = if shared.is_file() {
-        let index: Index =
-            serde_json::from_slice(&fs::read(&shared).into_diagnostic()?).into_diagnostic()?;
-        validate_index(&index, &args.scope)?;
-        // A changed policy line makes every row new.
-        (index.ledger.lines().next() == ledger.lines().next()).then_some(index)
-    } else {
-        None
-    };
+    let shared = shared_path(args);
+    // A changed policy line makes every row new.
+    let parent = read_parent(&shared, &args.scope)?
+        .filter(|parent| parent.ledger().lines().next() == ledger.lines().next());
     let before = parent
         .as_ref()
-        .map(|index| {
-            index
-                .ledger
-                .lines()
-                .skip(1)
-                .map(|row| Ok((module_name(row)?, row)))
-                .collect::<Result<BTreeMap<_, _>>>()
-        })
+        .map(|parent| rows(parent.ledger()))
         .transpose()?
         .unwrap_or_default();
     let mut current = BTreeSet::new();
+    let mut changed = Vec::new();
     let mut fresh = BTreeMap::new();
     for row in ledger.lines().skip(1) {
         let name = module_name(row)?;
-        current.insert(name.to_owned());
+        current.insert(name);
         if before.get(name) == Some(&row) {
             continue;
         }
-        if let Some(module) = export_module(&args.state, name)? {
-            let mut record = serde_json::to_vec(&module).into_diagnostic()?;
-            record.push(b'\n');
-            fresh.insert(name.to_owned(), record);
-        }
+        changed.push(row.to_owned());
+        // No index may name a row whose receipt none of its packs hold.
+        let module = export_module(&args.state, name)?
+            .ok_or_else(|| miette!("no receipt for changed module {name}"))?;
+        let mut record = serde_json::to_vec(&module).into_diagnostic()?;
+        record.push(b'\n');
+        fresh.insert(name.to_owned(), record);
     }
-    let changed = fresh.len();
+    let removed = before
+        .keys()
+        .filter(|name| !current.contains(*name))
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    let modules = fresh.len();
     mark("export", &mut phase);
-    let mut packs = parent.as_ref().map(Index::packs).unwrap_or_default();
-    let mut uploaded = Vec::new();
-    if packs.len() >= MAX_PACKS {
-        // Newest first: a module's latest receipt wins.
-        let mut merged = fresh;
-        for pack in packs.iter().rev() {
-            let mut file = fetch_pack(kv, pack)?;
-            each_module(&mut file, &args.scope, |record, module| {
-                if current.contains(&module.name) && !merged.contains_key(&module.name) {
-                    merged.insert(module.name, record.to_vec());
-                }
-                Ok(())
-            })?;
+    let ledger_hash = blake3::hash(ledger.as_bytes()).to_hex().to_string();
+    let follows = match parent {
+        Some(Parent::Revision(parent))
+            if parent.chain.len() < MAX_CHAIN
+                && apply(&parent.ledger, &changed, &removed)? == ledger =>
+        {
+            Ok(parent)
         }
-        mark("merge", &mut phase);
-        let pack = write_pack(kv, &args.scope, merged.values().map(Vec::as_slice))?;
-        uploaded.push(pack.clone());
-        packs = vec![pack];
-    } else if !fresh.is_empty() || packs.is_empty() {
-        let pack = write_pack(kv, &args.scope, fresh.values().map(Vec::as_slice))?;
-        uploaded.push(pack.clone());
-        packs.push(pack);
-    }
-    mark("upload", &mut phase);
-    let index = Index {
-        format: FORMAT.into(),
-        scope: args.scope.clone(),
-        packs,
-        pack: None,
-        bytes: None,
-        ledger_hash: blake3::hash(ledger.as_bytes()).to_hex().to_string(),
-        ledger,
+        Some(Parent::Revision(parent)) => Err(Some(parent.packs)),
+        Some(Parent::Index(index)) => Err(Some(index.packs())),
+        None => Err(None),
+    };
+    let (bytes, chain, packs, uploaded) = match follows {
+        Ok(parent) => {
+            let uploaded = if fresh.is_empty() {
+                Vec::new()
+            } else {
+                vec![write_pack(
+                    kv,
+                    &args.scope,
+                    fresh.values().map(Vec::as_slice),
+                )?]
+            };
+            mark("upload", &mut phase);
+            let mut chain = parent.chain;
+            chain.push(parent.link);
+            let delta = Delta {
+                format: FORMAT_DELTA.into(),
+                scope: args.scope.clone(),
+                chain: chain.clone(),
+                packs: uploaded.clone(),
+                rows: changed,
+                removed,
+                ledger_hash,
+            };
+            let mut packs = parent.packs;
+            packs.extend(uploaded.iter().cloned());
+            (
+                serde_json::to_vec(&delta).into_diagnostic()?,
+                chain,
+                packs,
+                uploaded,
+            )
+        }
+        Err(inherited) => {
+            // Newest first: a module's latest receipt wins.
+            let mut merged = fresh;
+            if let Some(inherited) = &inherited {
+                for pack in inherited.iter().rev() {
+                    let mut file = fetch_pack(kv, pack)?;
+                    each_module(&mut file, &args.scope, |record, module| {
+                        if current.contains(module.name.as_str())
+                            && !merged.contains_key(&module.name)
+                        {
+                            merged.insert(module.name, record.to_vec());
+                        }
+                        Ok(())
+                    })?;
+                }
+                mark("merge", &mut phase);
+            }
+            if let Some(name) = current.iter().find(|name| !merged.contains_key(**name)) {
+                return Err(miette!("no receipt for module {name} in a full index"));
+            }
+            let pack = write_pack(kv, &args.scope, merged.values().map(Vec::as_slice))?;
+            mark("upload", &mut phase);
+            let index = Index {
+                format: FORMAT.into(),
+                scope: args.scope.clone(),
+                packs: vec![pack.clone()],
+                pack: None,
+                bytes: None,
+                ledger: ledger.clone(),
+                ledger_hash,
+            };
+            (
+                serde_json::to_vec(&index).into_diagnostic()?,
+                Vec::new(),
+                vec![pack.clone()],
+                vec![pack],
+            )
+        }
     };
     let created = kv
-        .put_new(
-            key.as_bytes(),
-            serde_json::to_vec(&index).into_diagnostic()?.into(),
-        )
+        .put_new(key.as_bytes(), bytes.clone().into())
         .into_diagnostic()?;
     mark("index", &mut phase);
+    let resolved = Resolved {
+        link: Link {
+            revision: revision.into(),
+            hash: blake3::hash(&bytes).to_hex().to_string(),
+        },
+        chain,
+        packs,
+        ledger,
+    };
+    // The next push here follows this one; one that lost the race to another
+    // writer keeps the parent it pulled.
+    if created {
+        atomic(&shared, &serde_json::to_vec(&resolved).into_diagnostic()?)?;
+    }
     Ok(json!({
         "status": "published",
         "new_index": created,
-        "modules": changed,
-        "packs": index.packs.len(),
-        "bytes": uploaded.iter().map(|pack| pack.bytes).sum::<u64>(),
+        "modules": modules,
+        "chain": resolved.chain.len(),
+        "packs": resolved.packs.len(),
+        "index_bytes": bytes.len(),
+        "bytes": bytes.len() as u64 + uploaded.iter().map(|pack| pack.bytes).sum::<u64>(),
         "uploaded": uploaded.iter().map(|pack| pack.pack.clone()).collect::<Vec<_>>(),
         "phases": phases,
     }))
@@ -599,14 +771,122 @@ fn fetch_pack(kv: &dyn Kv, pack: &Pack) -> Result<fs::File> {
     Ok(file)
 }
 
-fn restore(kv: &dyn Kv, args: &Args, index: &Index) -> Result<usize> {
-    let mut packs = index
-        .packs()
-        .iter()
-        .rev()
-        .map(|pack| fetch_pack(kv, pack))
-        .collect::<Result<Vec<_>>>()?;
-    unpack(&mut packs, args, &index.ledger)
+fn validate_delta(delta: &Delta, scope: &str) -> Result<()> {
+    if delta.format != FORMAT_DELTA
+        || delta.scope != scope
+        || delta.chain.is_empty()
+        || delta.chain.len() > MAX_CHAIN
+        || delta.packs.len() > 1
+    {
+        return Err(miette!("invalid receipt index"));
+    }
+    for link in &delta.chain {
+        hex(&link.revision, &[40, 64])?;
+        hex(&link.hash, &[64])?;
+    }
+    for pack in &delta.packs {
+        if pack.bytes > MAX_PACK {
+            return Err(miette!("invalid receipt index"));
+        }
+        hex(&pack.pack, &[64])?;
+    }
+    for row in &delta.rows {
+        relative(module_name(row)?)?;
+    }
+    for name in &delta.removed {
+        relative(name)?;
+    }
+    hex(&delta.ledger_hash, &[64])
+}
+
+/// Run `fetch` on each of `items` at once, in order.
+fn each_at_once<T: Sync, R: Send>(
+    items: &[T],
+    fetch: impl Fn(&T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    std::thread::scope(|threads| {
+        let fetch = &fetch;
+        items
+            .iter()
+            .map(|item| threads.spawn(move || fetch(item)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|thread| {
+                thread
+                    .join()
+                    .map_err(|_| miette!("a receipt fetch panicked"))?
+            })
+            .collect()
+    })
+}
+
+/// The receipts of `revision`, whose index is `bytes`, with a delta index's
+/// ancestors followed, and the bytes of those ancestors' indexes.
+fn resolve(kv: &dyn Kv, scope: &str, revision: &str, bytes: &[u8]) -> Result<(Resolved, u64)> {
+    let link = Link {
+        revision: revision.into(),
+        hash: blake3::hash(bytes).to_hex().to_string(),
+    };
+    let format: Value = serde_json::from_slice(bytes).into_diagnostic()?;
+    if format["format"] != FORMAT_DELTA {
+        let index: Index = serde_json::from_slice(bytes).into_diagnostic()?;
+        validate_index(&index, scope)?;
+        let resolved = Resolved {
+            link,
+            chain: Vec::new(),
+            packs: index.packs(),
+            ledger: index.ledger,
+        };
+        return Ok((resolved, 0));
+    }
+    let delta: Delta = serde_json::from_slice(bytes).into_diagnostic()?;
+    validate_delta(&delta, scope)?;
+    let ancestors = each_at_once(&delta.chain, |link| {
+        let key = index_key(scope, &link.revision)?;
+        let bytes = kv
+            .get(key.as_bytes())
+            .into_diagnostic()?
+            .ok_or_else(|| miette!("missing receipt index {}", link.revision))?;
+        if blake3::hash(&bytes).to_hex().as_str() != link.hash {
+            return Err(miette!("receipt index {} changed", link.revision));
+        }
+        Ok(bytes)
+    })?;
+    let read = ancestors.iter().map(|bytes| bytes.len() as u64).sum();
+    let (base, later) = ancestors
+        .split_first()
+        .ok_or_else(|| miette!("invalid receipt index"))?;
+    let base: Index = serde_json::from_slice(base).into_diagnostic()?;
+    validate_index(&base, scope)?;
+    let mut packs = base.packs();
+    let mut ledger = base.ledger;
+    for (position, bytes) in later.iter().enumerate() {
+        let ancestor: Delta = serde_json::from_slice(bytes).into_diagnostic()?;
+        validate_delta(&ancestor, scope)?;
+        if ancestor.chain != delta.chain[..=position] {
+            return Err(miette!("invalid receipt index"));
+        }
+        ledger = apply(&ledger, &ancestor.rows, &ancestor.removed)?;
+        packs.extend(ancestor.packs);
+    }
+    ledger = apply(&ledger, &delta.rows, &delta.removed)?;
+    packs.extend(delta.packs);
+    if blake3::hash(ledger.as_bytes()).to_hex().as_str() != delta.ledger_hash {
+        return Err(miette!("invalid receipt index"));
+    }
+    let resolved = Resolved {
+        link,
+        chain: delta.chain,
+        packs,
+        ledger,
+    };
+    Ok((resolved, read))
+}
+
+fn restore(kv: &dyn Kv, args: &Args, resolved: &Resolved) -> Result<usize> {
+    let newest_first = resolved.packs.iter().rev().collect::<Vec<_>>();
+    let mut packs = each_at_once(&newest_first, |pack| fetch_pack(kv, pack))?;
+    unpack(&mut packs, args, &resolved.ledger)
 }
 
 fn pull(kv: &dyn Kv, args: &Args, revisions: &[String]) -> Result<Value> {
@@ -615,26 +895,29 @@ fn pull(kv: &dyn Kv, args: &Args, revisions: &[String]) -> Result<Value> {
         let Some(bytes) = kv.get(key.as_bytes()).into_diagnostic()? else {
             continue;
         };
-        let index: Index = serde_json::from_slice(&bytes).into_diagnostic()?;
-        validate_index(&index, &args.scope)?;
-        let parent = args
-            .state
-            .join("shared")
-            .join(format!("{}.json", args.scope));
-        let ledger_only = needed(args, &index.ledger)?.is_some_and(|modules| modules.is_empty());
+        let (resolved, ancestors) = resolve(kv, &args.scope, revision, &bytes)?;
+        let ledger_only = needed(args, &resolved.ledger)?.is_some_and(|modules| modules.is_empty());
         let modules = if ledger_only {
-            atomic(&args.ledger, index.ledger.as_bytes())?;
+            atomic(&args.ledger, resolved.ledger.as_bytes())?;
             0
         } else {
-            restore(kv, args, &index)?
+            restore(kv, args, &resolved)?
         };
-        atomic(&parent, &bytes)?;
-        let packs = index.packs();
+        atomic(
+            &shared_path(args),
+            &serde_json::to_vec(&resolved).into_diagnostic()?,
+        )?;
+        let packs: u64 = if ledger_only {
+            0
+        } else {
+            resolved.packs.iter().map(|pack| pack.bytes).sum()
+        };
         return Ok(json!({
             "status": "restored",
             "revision": revision,
-            "packs": packs.len(),
-            "bytes": bytes.len() as u64 + if ledger_only { 0 } else { packs.iter().map(|pack| pack.bytes).sum() },
+            "chain": resolved.chain.len(),
+            "packs": resolved.packs.len(),
+            "bytes": bytes.len() as u64 + ancestors + packs,
             "modules": modules,
             "ledger_only": ledger_only,
         }));
@@ -826,47 +1109,259 @@ mod tests {
     }
 
     #[test]
-    fn past_the_pack_limit_a_push_merges_every_pack() {
+    fn past_the_chain_limit_a_push_writes_a_full_index_and_a_pull_follows_every_chain() {
         let kv = covalence_kv_memory::MemoryKv::default();
         let root = tempfile::tempdir().unwrap();
-        let args = args(root.path());
-        replay(&args, &small("A", "a"));
-        let mut parent = None;
-        for n in 0..=MAX_PACKS {
-            replay(&args, &small("B", &format!("b{n}")));
-            fs::write(&args.ledger, ledger(&[("A", "1"), ("B", &n.to_string())])).unwrap();
+        let writer = args(root.path());
+        replay(&writer, &small("A", "a"));
+        let mut revisions = Vec::new();
+        for n in 0..=MAX_CHAIN + 1 {
+            replay(&writer, &small("B", &format!("b{n}")));
+            fs::write(&writer.ledger, ledger(&[("A", "1"), ("B", &n.to_string())])).unwrap();
             let revision = format!("{n:040}");
-            let published = publish(&kv, &args, &revision).unwrap();
-            let expected = if n + 1 > MAX_PACKS { 1 } else { n + 1 };
-            assert_eq!(
-                published["packs"].as_u64(),
-                Some(expected as u64),
-                "push {n}"
-            );
-            // Each push follows the previous one's index, as a pull leaves it.
-            let key = index_key(&args.scope, &revision).unwrap();
-            let index = kv.get(key.as_bytes()).unwrap().unwrap();
-            atomic(
-                &args
-                    .state
-                    .join("shared")
-                    .join(format!("{}.json", args.scope)),
-                &index,
-            )
-            .unwrap();
-            parent = Some(revision);
+            // Each push follows the previous one, which it wrote itself.
+            let published = publish(&kv, &writer, &revision).unwrap();
+            let chain = if n == MAX_CHAIN + 1 { 0 } else { n };
+            assert_eq!(published["chain"].as_u64(), Some(chain as u64), "push {n}");
+            if chain > 0 {
+                assert_eq!(published["modules"].as_u64(), Some(1), "push {n}");
+            }
+            revisions.push(revision);
         }
+        // The longest chain and the full index after it both restore.
+        for (revision, chain, packs) in [
+            (&revisions[MAX_CHAIN], MAX_CHAIN, MAX_CHAIN + 1),
+            (&revisions[MAX_CHAIN + 1], 0, 1),
+        ] {
+            let fresh = Args {
+                state: root.path().join(format!("fresh{chain}")),
+                ledger: root.path().join(format!("pulled{chain}")),
+                ..args(root.path())
+            };
+            let restored = pull(&kv, &fresh, std::slice::from_ref(revision)).unwrap();
+            assert_eq!(restored["chain"].as_u64(), Some(chain as u64));
+            assert_eq!(restored["packs"].as_u64(), Some(packs as u64));
+            assert_eq!(restored["modules"].as_u64(), Some(2));
+            let b = export_module(&fresh.state, "B").unwrap().unwrap();
+            let n: usize = revision.parse().unwrap();
+            assert_eq!(b.entries["proof0"], format!("b{n}0"));
+            assert_eq!(
+                fs::read_to_string(&fresh.ledger).unwrap(),
+                ledger(&[("A", "1"), ("B", &n.to_string())])
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_replay_starts_a_new_chain_and_removed_modules_leave_the_ledger() {
+        let kv = covalence_kv_memory::MemoryKv::default();
+        let root = tempfile::tempdir().unwrap();
+        let writer = args(root.path());
+        replay(&writer, &small("A", "a"));
+        replay(&writer, &small("B", "b"));
+        fs::write(&writer.ledger, ledger(&[("A", "1"), ("B", "1")])).unwrap();
+        publish(&kv, &writer, &"1".repeat(40)).unwrap();
+        // B is gone: a delta that removes it.
+        fs::write(&writer.ledger, ledger(&[("A", "1")])).unwrap();
+        let removed = publish(&kv, &writer, &"2".repeat(40)).unwrap();
+        assert_eq!(removed["chain"].as_u64(), Some(1));
+        assert_eq!(removed["modules"].as_u64(), Some(0));
+        // A new policy line replays every module: a full index again.
+        replay(&writer, &small("A", "a2"));
+        fs::write(
+            &writer.ledger,
+            ledger(&[("A", "1")]).replace("policy", "new policy"),
+        )
+        .unwrap();
+        let full = publish(&kv, &writer, &"3".repeat(40)).unwrap();
+        assert_eq!(
+            (full["chain"].as_u64(), full["packs"].as_u64()),
+            (Some(0), Some(1))
+        );
+        for (revision, expected, a) in [
+            ("2", ledger(&[("A", "1")]), "a0"),
+            (
+                "3",
+                ledger(&[("A", "1")]).replace("policy", "new policy"),
+                "a20",
+            ),
+        ] {
+            let fresh = Args {
+                state: root.path().join(format!("fresh{revision}")),
+                ledger: root.path().join(format!("pulled{revision}")),
+                ..args(root.path())
+            };
+            pull(&kv, &fresh, &[revision.repeat(40)]).unwrap();
+            assert_eq!(fs::read_to_string(&fresh.ledger).unwrap(), expected);
+            let module = export_module(&fresh.state, "A").unwrap().unwrap();
+            assert_eq!(module.entries["proof0"], a);
+        }
+    }
+
+    #[test]
+    fn a_tampered_ancestor_fails_the_pull() {
+        let kv = covalence_kv_memory::MemoryKv::default();
+        let root = tempfile::tempdir().unwrap();
+        let writer = args(root.path());
+        replay(&writer, &small("A", "a"));
+        fs::write(&writer.ledger, ledger(&[("A", "1")])).unwrap();
+        publish(&kv, &writer, &"1".repeat(40)).unwrap();
+        fs::write(&writer.ledger, ledger(&[("A", "2")])).unwrap();
+        publish(&kv, &writer, &"2".repeat(40)).unwrap();
+        let key = index_key(&writer.scope, &"1".repeat(40)).unwrap();
+        let mut base: Index =
+            serde_json::from_slice(&kv.get(key.as_bytes()).unwrap().unwrap()).unwrap();
+        base.ledger = ledger(&[("A", "forged")]);
+        base.ledger_hash = blake3::hash(base.ledger.as_bytes()).to_hex().to_string();
+        kv.put(key.as_bytes(), serde_json::to_vec(&base).unwrap().into())
+            .unwrap();
         let fresh = Args {
             state: root.path().join("fresh"),
-            ..args
+            ..writer
         };
-        let restored = pull(&kv, &fresh, &[parent.unwrap()]).unwrap();
-        assert_eq!(
-            (restored["modules"].as_u64(), restored["packs"].as_u64()),
-            (Some(2), Some(1))
+        assert!(
+            pull(&kv, &fresh, &["2".repeat(40)])
+                .unwrap_err()
+                .to_string()
+                .contains("changed")
         );
+    }
+
+    #[test]
+    fn a_push_after_an_earlier_checkers_pull_keeps_every_inherited_receipt() {
+        let kv = covalence_kv_memory::MemoryKv::default();
+        let root = tempfile::tempdir().unwrap();
+        let first = Args {
+            state: root.path().join("first"),
+            ..args(root.path())
+        };
+        replay(&first, &small("A", "a"));
+        replay(&first, &small("B", "b"));
+        fs::write(&first.ledger, ledger(&[("A", "1"), ("B", "1")])).unwrap();
+        publish(&kv, &first, &"1".repeat(40)).unwrap();
+        // An earlier checker's selective pull kept the raw full index and
+        // imported no receipt; this checkout then replays only B.
+        let second = Args {
+            state: root.path().join("second"),
+            ..args(root.path())
+        };
+        let key = index_key(&second.scope, &"1".repeat(40)).unwrap();
+        atomic(
+            &shared_path(&second),
+            &kv.get(key.as_bytes()).unwrap().unwrap(),
+        )
+        .unwrap();
+        replay(&second, &small("B", "b2"));
+        fs::write(&second.ledger, ledger(&[("A", "1"), ("B", "2")])).unwrap();
+        let published = publish(&kv, &second, &"2".repeat(40)).unwrap();
+        assert_eq!(
+            (published["chain"].as_u64(), published["packs"].as_u64()),
+            (Some(0), Some(1))
+        );
+        let fresh = Args {
+            state: root.path().join("fresh"),
+            ..args(root.path())
+        };
+        let restored = pull(&kv, &fresh, &["2".repeat(40)]).unwrap();
+        assert_eq!(restored["modules"].as_u64(), Some(2));
         let b = export_module(&fresh.state, "B").unwrap().unwrap();
-        assert_eq!(b.entries["proof0"], format!("b{MAX_PACKS}0"));
+        assert_eq!(b.entries["proof0"], "b20");
+        assert!(export_module(&fresh.state, "A").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_push_never_names_a_row_without_a_receipt() {
+        let kv = covalence_kv_memory::MemoryKv::default();
+        let root = tempfile::tempdir().unwrap();
+        let writer = args(root.path());
+        replay(&writer, &small("A", "a"));
+        fs::write(&writer.ledger, ledger(&[("A", "1"), ("B", "1")])).unwrap();
+        assert!(
+            publish(&kv, &writer, &"1".repeat(40))
+                .unwrap_err()
+                .to_string()
+                .contains("no receipt")
+        );
+        fs::write(&writer.ledger, ledger(&[("A", "1")])).unwrap();
+        publish(&kv, &writer, &"1".repeat(40)).unwrap();
+        fs::write(&writer.ledger, ledger(&[("A", "1"), ("B", "1")])).unwrap();
+        assert!(
+            publish(&kv, &writer, &"2".repeat(40))
+                .unwrap_err()
+                .to_string()
+                .contains("no receipt")
+        );
+    }
+
+    /// Bytes a push writes after one module changes, against moria-lean's
+    /// size: ~21,300 ledger rows of ~150 bytes, a 3.2 MB ledger.
+    #[test]
+    fn a_delta_push_of_a_large_ledger_writes_kilobytes() {
+        let kv = covalence_kv_memory::MemoryKv::default();
+        let root = tempfile::tempdir().unwrap();
+        let writer = args(root.path());
+        replay(
+            &writer,
+            &small("Moria.Foundations.Kernel.Module00007", "changed"),
+        );
+        let rows = (0..21_300)
+            .map(|n| {
+                (
+                    format!("Moria.Foundations.Kernel.Module{n:05}"),
+                    format!(
+                        "{n:016x}\t{n:016x}.olean,{n:016x}.olean.server,{n:016x}.olean.private"
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut full = String::from("policy\n");
+        for (name, rest) in &rows {
+            full.push_str(&format!("{name}\t{rest}\n"));
+        }
+        // The full index as a pull of it leaves this checkout: the push needs
+        // only the changed module's receipt.
+        let pack = write_pack(&kv, &writer.scope, []).unwrap();
+        let base = serde_json::to_vec(&Index {
+            format: FORMAT.into(),
+            scope: writer.scope.clone(),
+            packs: vec![pack],
+            pack: None,
+            bytes: None,
+            ledger: full.clone(),
+            ledger_hash: blake3::hash(full.as_bytes()).to_hex().to_string(),
+        })
+        .unwrap();
+        let revision = "1".repeat(40);
+        kv.put_new(
+            index_key(&writer.scope, &revision).unwrap().as_bytes(),
+            base.clone().into(),
+        )
+        .unwrap();
+        let (resolved, _) = resolve(&kv, &writer.scope, &revision, &base).unwrap();
+        atomic(
+            &shared_path(&writer),
+            &serde_json::to_vec(&resolved).unwrap(),
+        )
+        .unwrap();
+        let mut sizes = vec![base.len() as u64];
+        for push in 2..=MAX_CHAIN + 1 {
+            fs::write(
+                &writer.ledger,
+                full.replace(
+                    "Kernel.Module00007\t",
+                    &format!("Kernel.Module00007\t{push}"),
+                ),
+            )
+            .unwrap();
+            let delta = publish(&kv, &writer, &format!("{push:040}")).unwrap();
+            sizes.push(delta["index_bytes"].as_u64().unwrap());
+        }
+        eprintln!(
+            "index bytes: full {}, first delta {}, delta at chain {MAX_CHAIN} {}",
+            sizes[0], sizes[1], sizes[MAX_CHAIN]
+        );
+        assert!(sizes[0] > 3_000_000);
+        assert!(sizes[1..].iter().all(|bytes| *bytes < 10_000), "{sizes:?}");
     }
 
     #[test]

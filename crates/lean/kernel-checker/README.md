@@ -23,7 +23,10 @@ cov-kernel-checker receipt-cache --remote s3://bucket/prefix --scope "$SCOPE" \
   has one. It imports only the modules whose input row has changed. Revisions
   are only hints; the caller's scope and ledger decide what is reused.
 - `receipt-cache push` publishes a pack and then its index. An index never
-  points at an incomplete pack.
+  points at an incomplete pack. Against the revision the checkout pulled, the
+  index holds only the ledger rows that changed and links to the earlier
+  indexes it builds on. After 64 such indexes, or when the policy line
+  changes, a push writes a full index again.
 
 Write access to the S3 prefix is trust. Give it only to CI that runs on
 reviewed code, never to pull requests.
