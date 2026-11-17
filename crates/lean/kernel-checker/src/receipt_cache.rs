@@ -39,6 +39,8 @@ const MAX_PACKS: usize = 16;
 /// every receipt (3.2 MB and 33 MB for moria-lean), so every 64th push adds
 /// ~0.56 MB per push. A reader fetches the 64 indexes and their packs at once.
 const MAX_CHAIN: usize = 64;
+/// The most checkpoints of one revision, `<revision>.1` and up.
+const MAX_CHECKPOINTS: u32 = 999;
 const REPLAY: &str = "mor/kernel-replay/v1";
 const MAX_PACK: u64 = 512 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 2 * 1024 * 1024 * 1024;
@@ -70,6 +72,16 @@ enum Command {
     Pull {
         #[arg(long, required = true)]
         revision: Vec<String>,
+    },
+    /// Publish the receipts of the modules checked so far as checkpoint
+    /// `<revision>.<n>`, which a later pull of `revision` takes when the
+    /// revision itself has no index
+    Checkpoint {
+        #[arg(long)]
+        revision: String,
+        /// The modules checked so far, one per line (`replay-built --done`)
+        #[arg(long)]
+        done: PathBuf,
     },
     /// Publish after all checks succeed; index publication is atomic and last
     Push {
@@ -321,10 +333,22 @@ fn digest(file: &mut fs::File) -> Result<String> {
     Ok(hash.finalize().to_hex().to_string())
 }
 
-fn index_key(scope: &str, revision: &str) -> Result<String> {
-    hex(scope, &[64])?;
+/// An index's name: a revision, or `<revision>.<n>` for its `n`th checkpoint.
+fn index_name(name: &str) -> Result<()> {
+    let Some((revision, number)) = name.split_once('.') else {
+        return hex(name, &[40, 64]);
+    };
     hex(revision, &[40, 64])?;
-    Ok(format!("indexes/{scope}/{revision}.json"))
+    match number.parse::<u32>() {
+        Ok(n) if (1..=MAX_CHECKPOINTS).contains(&n) && n.to_string() == number => Ok(()),
+        _ => Err(miette!("invalid receipt checkpoint {name:?}")),
+    }
+}
+
+fn index_key(scope: &str, name: &str) -> Result<String> {
+    hex(scope, &[64])?;
+    index_name(name)?;
+    Ok(format!("indexes/{scope}/{name}.json"))
 }
 
 fn module_name(row: &str) -> Result<&str> {
@@ -436,14 +460,23 @@ fn apply(ledger: &str, changed: &[String], removed: &[String]) -> Result<String>
 /// ancestors, after a policy change, or without a parent, it is a full index
 /// of one pack of every receipt, which starts a new chain.
 fn publish(kv: &dyn Kv, args: &Args, revision: &str) -> Result<Value> {
-    let key = index_key(&args.scope, revision)?;
+    let ledger = fs::read_to_string(&args.ledger).into_diagnostic()?;
+    publish_ledger(kv, args, [revision.to_owned()], ledger)
+}
+
+/// Publish `ledger`'s receipts under the first of `names` no index has.
+fn publish_ledger(
+    kv: &dyn Kv,
+    args: &Args,
+    names: impl IntoIterator<Item = String>,
+    ledger: String,
+) -> Result<Value> {
     let mut phases = serde_json::Map::new();
     let mut phase = Instant::now();
     let mut mark = |name: &str, phase: &mut Instant| {
         phases.insert(name.into(), json!(phase.elapsed().as_secs_f64()));
         *phase = Instant::now();
     };
-    let ledger = fs::read_to_string(&args.ledger).into_diagnostic()?;
     let shared = shared_path(args);
     // A changed policy line makes every row new.
     let parent = read_parent(&shared, &args.scope)?
@@ -560,13 +593,28 @@ fn publish(kv: &dyn Kv, args: &Args, revision: &str) -> Result<Value> {
             )
         }
     };
-    let created = kv
-        .put_new(key.as_bytes(), bytes.clone().into())
-        .into_diagnostic()?;
+    let mut created = None;
+    let mut last = None;
+    for name in names {
+        let key = index_key(&args.scope, &name)?;
+        if kv
+            .put_new(key.as_bytes(), bytes.clone().into())
+            .into_diagnostic()?
+        {
+            created = Some(name);
+            break;
+        }
+        last = Some(name);
+    }
     mark("index", &mut phase);
+    let name = created
+        .clone()
+        .or(last)
+        .ok_or_else(|| miette!("no receipt index name"))?;
+    let created = created.is_some();
     let resolved = Resolved {
         link: Link {
-            revision: revision.into(),
+            revision: name.clone(),
             hash: blake3::hash(&bytes).to_hex().to_string(),
         },
         chain,
@@ -580,6 +628,7 @@ fn publish(kv: &dyn Kv, args: &Args, revision: &str) -> Result<Value> {
     }
     Ok(json!({
         "status": "published",
+        "index": name,
         "new_index": created,
         "modules": modules,
         "chain": resolved.chain.len(),
@@ -589,6 +638,83 @@ fn publish(kv: &dyn Kv, args: &Args, revision: &str) -> Result<Value> {
         "uploaded": uploaded.iter().map(|pack| pack.pack.clone()).collect::<Vec<_>>(),
         "phases": phases,
     }))
+}
+
+/// Publish, as the next checkpoint of `revision`, the rows of the ledger
+/// whose modules `done` lists or the pulled parent already checked. A pull of
+/// `revision` takes the newest checkpoint only while `revision` has no index,
+/// and replays every module whose row it lacks.
+fn checkpoint(kv: &dyn Kv, args: &Args, revision: &str, done: &Path) -> Result<Value> {
+    hex(revision, &[40, 64])?;
+    let target = fs::read_to_string(&args.ledger).into_diagnostic()?;
+    let done = fs::read_to_string(done)
+        .into_diagnostic()?
+        .lines()
+        .map(|name| {
+            relative(name)?;
+            Ok(name.to_owned())
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let parent = read_parent(&shared_path(args), &args.scope)?
+        .filter(|parent| parent.ledger().lines().next() == target.lines().next());
+    let checked = parent
+        .as_ref()
+        .map(|parent| parent.ledger().lines().skip(1).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let mut ledger = String::new();
+    for (position, row) in target.lines().enumerate() {
+        if position == 0 || done.contains(module_name(row)?) || checked.contains(row) {
+            ledger.push_str(row);
+            ledger.push('\n');
+        }
+    }
+    if ledger.lines().skip(1).all(|row| checked.contains(row)) {
+        return Ok(json!({"status": "unchanged"}));
+    }
+    // After this checkout's own checkpoint of `revision`, the next number.
+    let first = match &parent {
+        Some(Parent::Revision(resolved)) => resolved
+            .link
+            .revision
+            .strip_prefix(revision)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .and_then(|n| n.parse::<u32>().ok())
+            .map_or(1, |n| n + 1),
+        _ => 1,
+    };
+    publish_ledger(
+        kv,
+        args,
+        (first..=MAX_CHECKPOINTS).map(|n| format!("{revision}.{n}")),
+        ledger,
+    )
+}
+
+/// The index of `revision`, else its newest checkpoint, by name.
+fn find(kv: &dyn Kv, scope: &str, revision: &str) -> Result<Option<(String, Vec<u8>)>> {
+    let key = index_key(scope, revision)?;
+    if let Some(bytes) = kv.get(key.as_bytes()).into_diagnostic()? {
+        return Ok(Some((revision.to_owned(), bytes.to_vec())));
+    }
+    let mut newest = None;
+    for n in 1..=MAX_CHECKPOINTS {
+        let name = format!("{revision}.{n}");
+        if !kv
+            .exists(index_key(scope, &name)?.as_bytes())
+            .into_diagnostic()?
+        {
+            break;
+        }
+        newest = Some(name);
+    }
+    let Some(name) = newest else {
+        return Ok(None);
+    };
+    let bytes = kv
+        .get(index_key(scope, &name)?.as_bytes())
+        .into_diagnostic()?
+        .ok_or_else(|| miette!("receipt checkpoint {name} disappeared"))?;
+    Ok(Some((name, bytes.to_vec())))
 }
 
 fn read_line(input: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
@@ -781,7 +907,7 @@ fn validate_delta(delta: &Delta, scope: &str) -> Result<()> {
         return Err(miette!("invalid receipt index"));
     }
     for link in &delta.chain {
-        hex(&link.revision, &[40, 64])?;
+        index_name(&link.revision)?;
         hex(&link.hash, &[64])?;
     }
     for pack in &delta.packs {
@@ -891,11 +1017,11 @@ fn restore(kv: &dyn Kv, args: &Args, resolved: &Resolved) -> Result<usize> {
 
 fn pull(kv: &dyn Kv, args: &Args, revisions: &[String]) -> Result<Value> {
     for revision in revisions {
-        let key = index_key(&args.scope, revision)?;
-        let Some(bytes) = kv.get(key.as_bytes()).into_diagnostic()? else {
+        hex(revision, &[40, 64])?;
+        let Some((name, bytes)) = find(kv, &args.scope, revision)? else {
             continue;
         };
-        let (resolved, ancestors) = resolve(kv, &args.scope, revision, &bytes)?;
+        let (resolved, ancestors) = resolve(kv, &args.scope, &name, &bytes)?;
         let ledger_only = needed(args, &resolved.ledger)?.is_some_and(|modules| modules.is_empty());
         let modules = if ledger_only {
             atomic(&args.ledger, resolved.ledger.as_bytes())?;
@@ -915,6 +1041,7 @@ fn pull(kv: &dyn Kv, args: &Args, revisions: &[String]) -> Result<Value> {
         return Ok(json!({
             "status": "restored",
             "revision": revision,
+            "index": name,
             "chain": resolved.chain.len(),
             "packs": resolved.packs.len(),
             "bytes": bytes.len() as u64 + ancestors + packs,
@@ -934,6 +1061,7 @@ pub fn run(args: Args) -> Result<()> {
     .into_diagnostic()?;
     let mut report = match &args.command {
         Command::Pull { revision } => pull(&kv, &args, revision),
+        Command::Checkpoint { revision, done } => checkpoint(&kv, &args, revision, done),
         Command::Push { revision } => publish(&kv, &args, revision),
     }
     .wrap_err("shared receipt cache")?;
@@ -1291,6 +1419,186 @@ mod tests {
                 .to_string()
                 .contains("no receipt")
         );
+    }
+
+    #[test]
+    fn a_checkpoint_publishes_only_checked_modules_and_a_retry_replays_the_rest() {
+        let kv = covalence_kv_memory::MemoryKv::default();
+        let root = tempfile::tempdir().unwrap();
+        let first = Args {
+            state: root.path().join("first"),
+            ..args(root.path())
+        };
+        replay(&first, &small("A", "a"));
+        replay(&first, &small("B", "b"));
+        fs::write(&first.ledger, ledger(&[("A", "1"), ("B", "1")])).unwrap();
+        let zero = "0".repeat(40);
+        publish(&kv, &first, &zero).unwrap();
+        // The next revision changes B and adds C; its run checks B, then is lost.
+        let target = ledger(&[("A", "1"), ("B", "2"), ("C", "1")]);
+        let one = "1".repeat(40);
+        let run = Args {
+            state: root.path().join("run"),
+            ledger: root.path().join("previous"),
+            current_inputs: Some(root.path().join("current")),
+            ..args(root.path())
+        };
+        fs::write(root.path().join("current"), &target).unwrap();
+        pull(&kv, &run, std::slice::from_ref(&zero)).unwrap();
+        let checking = Args {
+            ledger: root.path().join("current"),
+            current_inputs: None,
+            ..run
+        };
+        let done = root.path().join("done");
+        fs::write(&done, "").unwrap();
+        let idle = checkpoint(&kv, &checking, &one, &done).unwrap();
+        assert_eq!(idle["status"], "unchanged");
+        replay(&checking, &small("B", "b2"));
+        fs::write(&done, "B\n").unwrap();
+        let saved = checkpoint(&kv, &checking, &one, &done).unwrap();
+        assert_eq!(saved["index"], format!("{one}.1"));
+        assert_eq!(saved["modules"].as_u64(), Some(1));
+        // Nothing reads the checkpoint as the revision's own index.
+        assert!(
+            kv.get(index_key(&checking.scope, &one).unwrap().as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        // A retry takes the checkpoint, whose ledger lacks C, so it replays C.
+        let retry = Args {
+            state: root.path().join("retry"),
+            ledger: root.path().join("retry-previous"),
+            current_inputs: Some(root.path().join("current")),
+            ..args(root.path())
+        };
+        let pulled = pull(&kv, &retry, &[one.clone(), zero.clone()]).unwrap();
+        assert_eq!(pulled["index"], format!("{one}.1"));
+        assert_eq!(
+            fs::read_to_string(&retry.ledger).unwrap(),
+            ledger(&[("A", "1"), ("B", "2")])
+        );
+        assert_eq!(
+            needed(&retry, &fs::read_to_string(&retry.ledger).unwrap()).unwrap(),
+            Some(BTreeSet::from(["C".to_owned()]))
+        );
+        // It checks C, checkpoints after its own, then pushes the revision.
+        let finishing = Args {
+            ledger: root.path().join("current"),
+            current_inputs: None,
+            ..retry
+        };
+        replay(&finishing, &small("C", "c"));
+        fs::write(&done, "C\n").unwrap();
+        let next = checkpoint(&kv, &finishing, &one, &done).unwrap();
+        assert_eq!(next["index"], format!("{one}.2"));
+        let pushed = publish(&kv, &finishing, &one).unwrap();
+        assert_eq!(
+            (pushed["index"].as_str(), pushed["modules"].as_u64()),
+            (Some(one.as_str()), Some(0))
+        );
+        // Once the revision has its index, a pull takes that, with every row.
+        let fresh = Args {
+            state: root.path().join("fresh"),
+            ledger: root.path().join("fresh-ledger"),
+            ..args(root.path())
+        };
+        let complete = pull(&kv, &fresh, std::slice::from_ref(&one)).unwrap();
+        assert_eq!(complete["index"], one.as_str());
+        assert_eq!(fs::read_to_string(&fresh.ledger).unwrap(), target);
+        for (name, proof) in [("A", "a0"), ("B", "b20"), ("C", "c0")] {
+            let module = export_module(&fresh.state, name).unwrap().unwrap();
+            assert_eq!(module.entries["proof0"], proof);
+        }
+    }
+
+    #[test]
+    fn the_next_revision_resumes_from_a_lost_parents_checkpoint() {
+        let kv = covalence_kv_memory::MemoryKv::default();
+        let root = tempfile::tempdir().unwrap();
+        let grandparent = "0".repeat(40);
+        let parent = "1".repeat(40);
+        let child = "2".repeat(40);
+        let first = Args {
+            state: root.path().join("first"),
+            ..args(root.path())
+        };
+        replay(&first, &small("A", "a"));
+        fs::write(&first.ledger, ledger(&[("A", "1")])).unwrap();
+        publish(&kv, &first, &grandparent).unwrap();
+        // The parent's run checks B, checkpoints, then its job times out.
+        let lost = Args {
+            state: root.path().join("lost"),
+            ledger: root.path().join("lost-ledger"),
+            ..args(root.path())
+        };
+        pull(&kv, &lost, std::slice::from_ref(&grandparent)).unwrap();
+        fs::write(&lost.ledger, ledger(&[("A", "1"), ("B", "1"), ("C", "1")])).unwrap();
+        replay(&lost, &small("B", "b"));
+        let done = root.path().join("done");
+        fs::write(&done, "B\n").unwrap();
+        checkpoint(&kv, &lost, &parent, &done).unwrap();
+        // The next push's run pulls its own revision, then its parents.
+        let next = Args {
+            state: root.path().join("next"),
+            ledger: root.path().join("next-previous"),
+            current_inputs: Some(root.path().join("next-current")),
+            ..args(root.path())
+        };
+        fs::write(
+            root.path().join("next-current"),
+            ledger(&[("A", "1"), ("B", "1"), ("C", "1"), ("D", "1")]),
+        )
+        .unwrap();
+        let pulled = pull(&kv, &next, &[child, parent.clone(), grandparent]).unwrap();
+        assert_eq!(pulled["index"], format!("{parent}.1"));
+        assert_eq!(
+            needed(&next, &fs::read_to_string(&next.ledger).unwrap()).unwrap(),
+            Some(BTreeSet::from(["C".to_owned(), "D".to_owned()]))
+        );
+    }
+
+    #[test]
+    fn racing_checkpoints_of_one_revision_take_their_own_names() {
+        let kv = covalence_kv_memory::MemoryKv::default();
+        let root = tempfile::tempdir().unwrap();
+        let one = "1".repeat(40);
+        let done = root.path().join("done");
+        let mut names = Vec::new();
+        for (run, module) in [("x", "A"), ("y", "B")] {
+            let racer = Args {
+                state: root.path().join(run),
+                ledger: root.path().join("current"),
+                ..args(root.path())
+            };
+            fs::write(&racer.ledger, ledger(&[("A", "1"), ("B", "1")])).unwrap();
+            replay(&racer, &small(module, run));
+            fs::write(&done, format!("{module}\n")).unwrap();
+            names.push(checkpoint(&kv, &racer, &one, &done).unwrap()["index"].clone());
+        }
+        assert_eq!(names, [format!("{one}.1"), format!("{one}.2")]);
+        // A pull takes the newest, which holds only its own run's module.
+        let reader = Args {
+            state: root.path().join("reader"),
+            ledger: root.path().join("pulled"),
+            ..args(root.path())
+        };
+        pull(&kv, &reader, std::slice::from_ref(&one)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&reader.ledger).unwrap(),
+            ledger(&[("B", "1")])
+        );
+    }
+
+    #[test]
+    fn checkpoint_names_are_checked() {
+        let revision = "a".repeat(40);
+        index_name(&format!("{revision}.1")).unwrap();
+        index_name(&format!("{revision}.{MAX_CHECKPOINTS}")).unwrap();
+        for bad in ["0", "01", "1000", "", "x", "1.1"] {
+            assert!(index_name(&format!("{revision}.{bad}")).is_err(), "{bad}");
+        }
+        assert!(index_name("main.1").is_err());
     }
 
     /// Bytes a push writes after one module changes, against moria-lean's

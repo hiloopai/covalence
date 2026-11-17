@@ -27,6 +27,11 @@ cov-kernel-checker receipt-cache --remote s3://bucket/prefix --scope "$SCOPE" \
   index holds only the ledger rows that changed and links to the earlier
   indexes it builds on. After 64 such indexes, or when the policy line
   changes, a push writes a full index again.
+- `receipt-cache checkpoint --revision R --done done.txt` publishes the
+  receipts of the modules checked so far, which `lean-check replay-built
+  --done done.txt` lists, as checkpoint `R.<n>`. A pull of `R` takes `R`'s
+  index, else its newest checkpoint; a checkpoint's ledger holds only checked
+  modules, so a resumed run replays the rest. Only `push` writes `R`'s index.
 
 Write access to the S3 prefix is trust. Give it only to CI that runs on
 reviewed code, never to pull requests.

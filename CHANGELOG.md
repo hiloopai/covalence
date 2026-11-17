@@ -15,6 +15,17 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+### Added
+
+- `cov-kernel-checker receipt-cache checkpoint --revision R --done FILE`
+  publishes, as `R.1`, `R.2` and so on, the ledger rows of the modules checked
+  so far, and `lean-check replay-built --done FILE` lists each module once its
+  check succeeds. A pull of `R` takes `R`'s own index, else its newest
+  checkpoint, whose ledger lacks every row not yet checked, so the run that
+  pulls it replays the rest. Run a checkpoint every few minutes during a long
+  replay, and pull the run's own revision before its parents, so a lost run is
+  resumed rather than started again.
+
 ### Changed
 
 - **Breaking:** `cov-kernel-checker receipt-cache push` writes an index of

@@ -17,6 +17,22 @@ pub struct Built {
     state: PathBuf,
     #[arg(long, default_value_t = 1)]
     jobs: usize,
+    /// Append each module whose check succeeds, one per line, once its
+    /// receipt is written (`receipt-cache checkpoint --done`)
+    #[arg(long)]
+    done: Option<PathBuf>,
+}
+
+/// Add `module` to the `done` list. One short appended line is one write,
+/// so workers never interleave and a reader sees whole lines.
+fn record_done(done: &Path, module: &str) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(done)
+        .into_diagnostic()?;
+    file.write_all(format!("{module}\n").as_bytes())
+        .into_diagnostic()
 }
 
 /// A file's identity and content stamp. Not its ctime: Lake hard-links
@@ -262,6 +278,7 @@ pub(crate) fn run(args: Built) -> Result<()> {
         build_bridge(&toolchain, pending.path())?;
         fs::rename(pending.path(), &bridge_dir).into_diagnostic()?;
     }
+    let done = args.done.as_deref();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::thread::scope(|scope| -> Result<Vec<Value>> {
         let mut handles = Vec::new();
@@ -326,6 +343,9 @@ pub(crate) fn run(args: Built) -> Result<()> {
                     .wrap_err_with(|| format!("replay {module}"))?;
                     result["module"] = json!(module);
                     write_json(&receipt, &result)?;
+                    if let Some(done) = done {
+                        record_done(done, module)?;
+                    }
                     eprintln!(
                         "replay: [{}/{}] {module}: {} reused, {} fresh theorems",
                         i + 1,
