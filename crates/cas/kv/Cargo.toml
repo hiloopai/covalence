@@ -20,6 +20,7 @@ brotli = ["dep:brotli"]
 [dependencies]
 blake3.workspace = true
 brotli = { version = "9.1", default-features = false, features = ["std"], optional = true }
+covalence-blob-verify.workspace = true
 covalence-cas-trait.workspace = true
 covalence-kv-trait.workspace = true
 covalence-lib-cid.workspace = true

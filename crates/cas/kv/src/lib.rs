@@ -53,6 +53,7 @@ use std::{
     sync::Arc,
 };
 
+use covalence_blob_verify::{Error as VerifyError, Expected, HashFn, VerifyingReader};
 use covalence_cas_trait::{
     AsyncGet, AsyncGetExt, AsyncPut, Cas, CasFuture, Error, Get, GetExt, Op, Put, map,
 };
@@ -426,34 +427,9 @@ fn hashes_to(hasher: &blake3::Hasher, cid: &Blake3) -> bool {
     hasher.finalize().as_bytes() == cid.digest()
 }
 
-/// The next `left` bytes of `reader`, which must hash to `cid`: the read
-/// returning the last of them fails instead if they do not.
-struct Checked<'a> {
-    reader: &'a mut dyn Read,
-    hasher: blake3::Hasher,
-    left: u64,
-    cid: Blake3,
-    mismatch: bool,
-}
-
-impl Read for Checked<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let max = buf
-            .len()
-            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
-        if max == 0 {
-            return Ok(0);
-        }
-        let read = self.reader.read(&mut buf[..max])?;
-        self.hasher.update(&buf[..read]);
-        self.left -= read as u64;
-        if self.left == 0 && !hashes_to(&self.hasher, &self.cid) {
-            self.mismatch = true;
-            let error = covalence_lib_cid::Error::Mismatch;
-            return Err(io::Error::new(io::ErrorKind::InvalidData, error));
-        }
-        Ok(read)
-    }
+/// The next `len` bytes of a stream, which must hash to `cid`.
+fn expected(cid: &Blake3, len: u64) -> Expected {
+    Expected::new(len, HashFn::Blake3, *cid.digest())
 }
 
 /// A writer hashing what it passes on.
@@ -770,19 +746,17 @@ impl Cas for KvCas {
         if len == 0 && !hashes_to(&blake3::Hasher::new(), &cid) {
             return Err(covalence_lib_cid::Error::Mismatch.into());
         }
-        let mut checked = Checked {
-            reader,
-            hasher: blake3::Hasher::new(),
-            left: len,
-            cid,
-            mismatch: false,
-        };
+        // The last byte is withheld unless the bytes match, so the store
+        // never completes a write of other bytes.
+        let mut checked = VerifyingReader::new(reader, expected(&cid, len));
         let key = self.key(&cid);
         match self.kv.put_new_from(key.as_bytes(), &mut checked, len) {
             Ok(_) => Ok(cid.into()),
             // The store failed as asked; a store error beyond that, such as a
             // failed cleanup, is the one to report.
-            Err(covalence_kv_trait::Error::Io { .. }) if checked.mismatch => {
+            Err(covalence_kv_trait::Error::Io { .. })
+                if matches!(checked.error(), Some(VerifyError::Mismatch { .. })) =>
+            {
                 Err(covalence_lib_cid::Error::Mismatch.into())
             }
             Err(error) => Err(backend(error)),

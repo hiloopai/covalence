@@ -194,7 +194,7 @@ fn ci_builds_one_wheel_and_tests_an_isolated_install() {
         calls.lines().collect::<Vec<_>>(),
         [
             "cargo", "cargo", "python3", "cargo", "cargo", "cargo", "maturin", "cargo", "cargo",
-            "cargo", "cargo", "cargo", "python3", "python", "python"
+            "cargo", "cargo", "cargo", "cargo", "python3", "python", "python"
         ]
     );
     let args = fixture.args();
@@ -202,7 +202,11 @@ fn ci_builds_one_wheel_and_tests_an_isolated_install() {
         args.iter()
             .filter(|arg| *arg == "--no-default-features")
             .count(),
-        4
+        5
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["-p", "covalence-blob-verify"])
     );
     for codec in ["zstd", "deflate", "brotli"] {
         assert!(args.windows(2).any(|pair| pair == ["--features", codec]));

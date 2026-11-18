@@ -53,7 +53,8 @@ dispatcher and its dependencies on launch. `glu build` builds the Rust workspace
 and the Python wheel.
 
 `glu test` and `glu ci` also test `covalence-cas-kv` with its codec features
-disabled and with each codec family enabled separately.
+disabled and with each codec family enabled separately, and
+`covalence-blob-verify` without its Tokio feature.
 
 `glu check` (also run by `glu ci`) checks the changelog's
 [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/) conventions:
@@ -69,6 +70,8 @@ Content addressing:
 - [`crates/lib/cid`](crates/lib/cid/README.md): content identifiers.
 - [`crates/lib/dasl`](crates/lib/dasl/README.md): DASL values and the DRISL codec.
 - `crates/blob/trait`: the blob trait: bytes read by range.
+- [`crates/blob/verify`](crates/blob/verify/README.md): byte streams checked
+  against an expected size and digest, in constant memory.
 
 Stores:
 

@@ -4,11 +4,12 @@ use std::io::{self, Read, Seek, Write};
 
 use ::brotli::{BrotliCompress, DecompressorWriter, enc::BrotliEncoderParams};
 
+use covalence_blob_verify::{Error as VerifyError, VerifyingReader};
 use covalence_cas_trait::Error;
 use covalence_lib_cid::Blake3;
 use covalence_lib_data::Bytes;
 
-use super::{Checked, Hashing, corrupt, hashes_to, io_error};
+use super::{Hashing, corrupt, expected, io_error};
 
 fn params(level: u32) -> BrotliEncoderParams {
     BrotliEncoderParams {
@@ -33,19 +34,13 @@ pub(super) fn stage(
     level: u32,
 ) -> Result<std::fs::File, Error> {
     let mut file = tempfile::tempfile().map_err(io_error)?;
-    let mut checked = Checked {
-        reader,
-        hasher: blake3::Hasher::new(),
-        left: len,
-        cid: *cid,
-        mismatch: false,
-    };
+    let mut checked = VerifyingReader::new(reader, expected(cid, len));
     let result = BrotliCompress(&mut checked, &mut file, &params(level));
-    if checked.mismatch || (checked.left == 0 && !hashes_to(&checked.hasher, cid)) {
+    if matches!(checked.error(), Some(VerifyError::Mismatch { .. })) {
         return Err(corrupt());
     }
     result.map_err(io_error)?;
-    if checked.left != 0 {
+    if checked.verified().is_none() {
         return Err(io_error(io::ErrorKind::UnexpectedEof.into()));
     }
     file.rewind().map_err(io_error)?;

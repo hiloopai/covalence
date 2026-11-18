@@ -825,11 +825,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "covalence-blob-verify"
+version = "0.1.0-dev.9"
+dependencies = [
+ "blake3",
+ "covalence-lib-cid",
+ "covalence-lib-error",
+ "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "covalence-cas-kv"
 version = "0.1.0-dev.9"
 dependencies = [
  "blake3",
  "brotli",
+ "covalence-blob-verify",
  "covalence-cas-trait",
  "covalence-kv-memory",
  "covalence-kv-s3",

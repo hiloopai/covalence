@@ -1,4 +1,5 @@
 use std::{
+    io,
     net::TcpListener,
     path::Path,
     sync::Arc,
@@ -307,6 +308,15 @@ fn s3_sizes_and_ranges_are_untrusted() {
     ));
 }
 
+/// A reader that always fails.
+struct Failing;
+
+impl io::Read for Failing {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::other("source failed"))
+    }
+}
+
 /// The key of the block with `cid`.
 fn key(cid: &Blake3) -> String {
     let digest = data_encoding::BASE32_NOPAD.encode(cid.digest());
@@ -349,6 +359,30 @@ fn streams(store: &KvCas, data: &[u8], corrupt: impl FnOnce(&Blake3)) {
         store.put_from(empty, &mut &b""[..], 0).unwrap(),
         empty.into()
     );
+
+    // Only the last byte differs: the store still writes nothing.
+    let mut last = data.to_vec();
+    *last.last_mut().unwrap() ^= 1;
+    let error = store.put_from(cid, &mut &last[..], len).unwrap_err();
+    assert!(matches!(error, Error::Check { .. }), "{error}");
+    let changed = Blake3::of(&last);
+    let error = store.put_from(changed, &mut &data[..], len).unwrap_err();
+    assert!(matches!(error, Error::Check { .. }), "{error}");
+    assert!(!store.has(&changed.into()).unwrap());
+
+    // Exactly `len` bytes are read; what follows stays in the reader.
+    let fresh = [data, b"x"].concat();
+    let fresh_cid = Blake3::of(&fresh[..fresh.len() - 1]);
+    let mut source = &[&fresh[..], b"tail"].concat()[..];
+    let stored = store.put_from(fresh_cid, &mut source, len).unwrap();
+    assert_eq!(stored, fresh_cid.into());
+    assert_eq!(source, b"xtail");
+
+    // A source that fails partway stores nothing and reports I/O.
+    let mut failing = io::Read::chain(&last[..last.len() / 2], Failing);
+    let error = store.put_from(changed, &mut failing, len).unwrap_err();
+    assert!(matches!(error, Error::Io { .. }), "{error}");
+    assert!(!store.has(&changed.into()).unwrap());
 
     corrupt(&cid);
     let error = store.get_to(&cid.into(), &mut Vec::new()).unwrap_err();

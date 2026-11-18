@@ -17,6 +17,13 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ### Added
 
+- `covalence-blob-verify` checks byte streams against an expected size and
+  SHA-256 or BLAKE3 digest in constant memory. Its reader withholds the last
+  byte until the stream passes, so a consumer that waits for the whole stream
+  never receives unverified bytes; its writer refuses bytes past the expected
+  size. Both work with `std::io` and Tokio, and stop on a cancel flag or
+  deadline.
+
 - `cov-kernel-checker receipt-cache checkpoint --revision R --done FILE`
   publishes, as `R.1`, `R.2` and so on, the ledger rows of the modules checked
   so far, and `lean-check replay-built --done FILE` lists each module once its

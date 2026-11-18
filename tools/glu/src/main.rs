@@ -272,7 +272,14 @@ fn test_rust() -> Result<(), Error> {
         eprintln!("Testing KvCas with only the {codec} codec feature");
         cargo(minimal.into_iter().chain(["--features", codec]))?;
     }
-    Ok(())
+    eprintln!("Testing covalence-blob-verify without Tokio");
+    cargo([
+        "test",
+        "-p",
+        "covalence-blob-verify",
+        "--locked",
+        "--no-default-features",
+    ])
 }
 fn test() -> Result<(), Error> {
     test_rust()?;
