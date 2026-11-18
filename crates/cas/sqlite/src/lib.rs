@@ -24,6 +24,7 @@
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use covalence_cas_trait::{
     AsyncGet, AsyncPut, Cas, CasFuture, Error, Get, GetExt, Op, Put, map, ready,
@@ -54,7 +55,18 @@ use covalence_lib_sqlite::{Connection, OptionalExtension};
 /// - Rows can be corrupted on disk, so `get` checks the bytes it returns
 ///   against the requested hash, whichever row found them; `get_unchecked`,
 ///   sizes and ranges do not.
-/// - Sizes and ranges read only the bytes they need from the block.
+/// - Sizes and ranges read only the pages they need from the block when the
+///   database keeps SQLite's pointer map (`auto_vacuum` of `INCREMENTAL` or
+///   `FULL`), as databases this store creates do. Without one, as in
+///   databases created by earlier versions, a range reads the block from its
+///   start to the range's end.
+/// - Opening a database never changes its `auto_vacuum` mode. Adding the map
+///   to an existing file takes `PRAGMA auto_vacuum = INCREMENTAL;` then
+///   `VACUUM;`, which rewrites the whole file, needs exclusive access and
+///   free space for a copy, and is left to the database's operator.
+/// - The map lets a read skip only over a block whose pages lie in order in
+///   the file, as a block appended to it does. In a fragmented file a range
+///   may still read more than its own length.
 /// - `has` consults the hash index and block metadata, without loading or
 ///   checking the bytes.
 /// - Puts hash in Rust. The SQL function `hash(code, data)`, registered on the
@@ -146,7 +158,9 @@ impl SqliteCas {
 
     /// A store in a fresh in-memory database, with `policy`.
     pub fn open_in_memory_with(policy: Sha256Policy) -> Result<Self, Error> {
-        Self::new(Connection::open_in_memory().map_err(backend)?, Some(policy))
+        let db = Connection::open_in_memory().map_err(backend)?;
+        db.execute_batch(POINTER_MAP).map_err(backend)?;
+        Self::new(db, Some(policy))
     }
 
     /// A store in the database file at `path`, created if missing, with the
@@ -409,12 +423,77 @@ fn add_row(db: &Connection, digest: &[u8], hash: Multicodec, blobid: i64) -> rus
     Ok(())
 }
 
-/// A file database in WAL mode.
+/// Keep SQLite's pointer map in a new database, so a read can skip to the
+/// page it needs in a long block instead of following the block's chain of
+/// overflow pages from its start.
+///
+/// It takes effect only before the first table is created, and before
+/// `journal_mode = WAL` writes a new file's header.
+const POINTER_MAP: &str = "PRAGMA auto_vacuum = INCREMENTAL;";
+
+/// A file database in WAL mode, with a pointer map if this call creates it.
 fn open_file(path: &Path) -> Result<Connection, Error> {
     let db = Connection::open(path).map_err(backend)?;
-    db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+    retry_busy(|| init_pointer_map(&db)).map_err(backend)?;
+    retry_busy(|| db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;"))
         .map_err(backend)?;
     Ok(db)
+}
+
+/// How long [`retry_busy`] keeps trying: SQLite's busy timeout as rusqlite
+/// sets it.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `step`, tried again while it fails with `SQLITE_BUSY`, for up to
+/// [`BUSY_TIMEOUT`].
+///
+/// Connections opening a new file at once can each hold a shared lock while
+/// asking for a write lock. SQLite then fails one with `SQLITE_BUSY` at once
+/// rather than wait for a lock it could never get. That one has released its
+/// locks, so trying again after the other finishes succeeds.
+fn retry_busy<T>(mut step: impl FnMut() -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+    let deadline = Instant::now() + BUSY_TIMEOUT;
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match step() {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy
+                    && Instant::now() + pause < deadline =>
+            {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Ask for a pointer map if the database has no pages yet, and leave any
+/// existing database's `auto_vacuum` mode as it is.
+///
+/// - On an existing `FULL` database the pragma would switch it to
+///   `INCREMENTAL`, so a database with pages is left alone.
+/// - An empty database is checked again inside a read transaction. Its shared
+///   lock keeps any other connection from creating the database before the
+///   pragma runs. A write transaction would not do: starting one creates the
+///   database at once, with no map.
+fn init_pointer_map(db: &Connection) -> rusqlite::Result<()> {
+    let pages = || db.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0));
+    if pages()? > 0 {
+        return Ok(());
+    }
+    db.execute_batch("BEGIN DEFERRED")?;
+    let result = pages()
+        .and_then(|pages| match pages {
+            0 => db.execute_batch(POINTER_MAP),
+            _ => Ok(()),
+        })
+        .and_then(|()| db.execute_batch("COMMIT"));
+    if result.is_err() && !db.is_autocommit() {
+        // The error to report is the step's, not the rollback's.
+        let _ = db.execute_batch("ROLLBACK");
+    }
+    result
 }
 
 /// The policy recorded in `meta`, if any.
@@ -770,6 +849,17 @@ mod tests {
             store.get_unchecked(&cid),
             Err(Error::Backend { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn new_databases_keep_a_pointer_map() -> Result<(), Error> {
+        let store = SqliteCas::open_in_memory()?;
+        let mode: i64 = store
+            .db()
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .map_err(backend)?;
+        assert_eq!(mode, 2, "incremental");
         Ok(())
     }
 

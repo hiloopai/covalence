@@ -43,6 +43,19 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
   the others wait, print how long, then take only what the pool maps add. A
   killed run releases its lock.
 
+### Fixed
+
+- `SqliteCas` range reads in new database files read about the range's own
+  length, rather than the block from its start to the range's end: 32 reads of
+  8 MiB from a 256 MiB block read 256 MiB instead of 4.2 GiB. The store now
+  creates files with SQLite's pointer map (`auto_vacuum = INCREMENTAL`).
+  Opening an existing file never changes it, so files created earlier keep
+  the old cost unless their operator runs `PRAGMA auto_vacuum = INCREMENTAL;`
+  then `VACUUM;`. The same applies to Python `Cas.sqlite`.
+- Opening a new `SqliteCas` file from several connections at once no longer
+  fails with "database is locked" when SQLite refuses a lock it could never
+  grant; the open tries again for up to 5 seconds.
+
 ## [0.1.0-dev.9] - 2026-11-16
 
 ### Added
