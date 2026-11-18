@@ -817,7 +817,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "covalence-blob-trait"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "covalence-lib-cid",
  "covalence-lib-data",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-blob-verify"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "blake3",
  "covalence-lib-cid",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-cas-kv"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "blake3",
  "brotli",
@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-cas-memory"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "covalence-cas-trait",
  "covalence-lib-cid",
@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-cas-prolly"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "covalence-cas-memory",
  "covalence-cas-trait",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-cas-sqlite"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "covalence-cas-trait",
  "covalence-lib-cid",
@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-cas-trait"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "covalence-lib-cid",
  "covalence-lib-dasl",
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-kv-memory"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "covalence-kv-trait",
  "covalence-lib-dasl",
@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-kv-s3"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -952,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-kv-trait"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "covalence-lib-dasl",
  "covalence-lib-data",
@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-lean-cache"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "covalence-cas-kv",
  "covalence-cas-memory",
@@ -994,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-lean-kernel-checker"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "blake3",
  "covalence-cas-kv",
@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-lean-ltar"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "covalence-lib-error",
  "serde_json",
@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-lib-cid"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "blake3",
  "covalence-lib-data",
@@ -1042,14 +1042,14 @@ dependencies = [
 
 [[package]]
 name = "covalence-lib-cli"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "covalence-lib-config"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "covalence-lib-error",
  "covalence-lib-serde",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-lib-dasl"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "blake3",
  "covalence-lib-cid",
@@ -1075,7 +1075,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-lib-data"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-lib-error"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "miette",
  "snafu",
@@ -1095,14 +1095,14 @@ dependencies = [
 
 [[package]]
 name = "covalence-lib-python"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "pyo3",
 ]
 
 [[package]]
 name = "covalence-lib-rand"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "getrandom 0.3.4",
  "rand",
@@ -1110,21 +1110,21 @@ dependencies = [
 
 [[package]]
 name = "covalence-lib-serde"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "covalence-lib-sqlite"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "rusqlite",
 ]
 
 [[package]]
 name = "covalence-python"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "blake3",
  "covalence-blob-trait",
@@ -1147,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "covalence-tools-glu"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "covalence-lib-cli",
  "covalence-lib-error",

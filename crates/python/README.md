@@ -23,7 +23,7 @@ True
 ## Install
 
 ```sh
-pip install covalence==0.1.0.dev9
+pip install covalence==0.1.0.dev10
 ```
 
 - Pre-releases need an exact pin like this one, or `pip install --pre`.
@@ -397,15 +397,15 @@ stub; this package writes its stub by hand and checks it against `__doc__`:
 later) for manylinux_2_28 x86_64 and aarch64 and macOS arm64, and an sdist,
 and runs `tests/` against each wheel. Pull requests and pushes keep them as
 workflow artifacts. A release tag must match the workspace version, such as
-`0.1.0-dev.9`; the files carry its PEP 440 form, `0.1.0.dev9`:
+`0.1.0-dev.10`; the files carry its PEP 440 form, `0.1.0.dev10`:
 
 - `v<version>` attaches them to that GitHub release. In the public
   `hiloopai/covalence` repository it also publishes them to PyPI, and
   `.github/workflows/crates.yml` publishes the crates to crates.io.
 - `python-v<version>` only attaches them to the GitHub release.
 
-To publish `0.1.0-dev.9`:
+To publish `0.1.0-dev.10`:
 
 ```sh
-git tag v0.1.0-dev.9 && git push origin v0.1.0-dev.9
+git tag v0.1.0-dev.10 && git push origin v0.1.0-dev.10
 ```
