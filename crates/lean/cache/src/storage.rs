@@ -8,12 +8,12 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::Instant,
 };
 
 use covalence_cas_prolly::Map;
 use covalence_cas_trait::Cas;
-use covalence_kv_s3::{AwsOptions, Credentials, S3Kv, S3Location};
+use covalence_kv_s3::{AwsOptions, S3Kv, S3Location};
 use covalence_kv_trait::Kv;
 use covalence_lib_cid::{Bdasl, Cid, Sha256};
 use covalence_lib_data::Bytes;
@@ -53,65 +53,12 @@ pub(crate) fn store_with(parts: usize) -> Result<Arc<dyn Kv>> {
     ))
 }
 
-/// The environment that hands resolved credentials to a download process.
-const LEASE: [&str; 4] = [
-    "COVALENCE_LAKE_AWS_ACCESS_KEY_ID",
-    "COVALENCE_LAKE_AWS_SECRET_ACCESS_KEY",
-    "COVALENCE_LAKE_AWS_SESSION_TOKEN",
-    "COVALENCE_LAKE_AWS_EXPIRY",
-];
-
-/// The pool bucket, signing with leased credentials while they last.
+/// The pool bucket, signing with the AWS credential chain's credentials.
 fn s3() -> Result<S3Kv> {
     let bucket = env::var("LAKE_CI_BUCKET").map_err(|_| invalid("LAKE_CI_BUCKET is required"))?;
     let location = S3Location::new(&bucket, "").map_err(|source| Error::S3 { source })?;
-    let options = AwsOptions::default();
-    let lease = LEASE.map(|name| env::var(name).ok());
-    match lease {
-        [Some(key), Some(secret), Some(token), Some(expiry)] => {
-            let expiry = expiry
-                .parse::<u64>()
-                .map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
-                .map_err(|_| invalid("invalid leased credential expiry"))?;
-            S3Kv::from_aws_with(
-                location,
-                &options,
-                Credentials::new_with_token(key, secret, token),
-                expiry,
-            )
-        }
-        _ => S3Kv::from_aws(location, &options),
-    }
-    .map_err(|source| Error::S3 { source })
+    S3Kv::from_aws(location, &AwsOptions::default()).map_err(|source| Error::S3 { source })
 }
-
-/// The environment to hand to download processes, resolved once, so none
-/// asks the credential chain again. It carries no credentials that do not
-/// expire, which the chain finds cheaply.
-pub(crate) fn lease() -> Result<Vec<(&'static str, String)>> {
-    let (credentials, expiry) = s3()?
-        .credential_lease()
-        .map_err(|source| Error::S3 { source })?;
-    let (Some(expiry), Some(token)) = (expiry, credentials.token()) else {
-        return Ok(Vec::new());
-    };
-    let expiry = expiry
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|_| invalid("credential expiry precedes the epoch"))?
-        .as_secs();
-    Ok(LEASE
-        .into_iter()
-        .zip([
-            credentials.key().to_owned(),
-            credentials.secret().to_owned(),
-            token.to_owned(),
-            expiry.to_string(),
-        ])
-        .collect())
-}
-
-/// The leased-credential variables, which other services must not see.
-pub(crate) const LEASED: [&str; 4] = LEASE;
 
 /// `work` on every item, sixteen at a time; results keep the items' order.
 /// The first failure stops further work.

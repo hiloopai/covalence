@@ -47,8 +47,11 @@ own repository and pinned commit.
 
 Every Lake run of `get` and `build` sets `LAKE_OUTPUTS_ENDPOINT`: the bundled
 overlay's Lake asks it for `out/<package>/<input>.json` of each input its
-cache lacks, and one process per command answers from the pool (stock Lake
-never asks). `COVALENCE_LAKE_COMMITS` names the commits `get` searches for a
+cache lacks (stock Lake never asks). Lake reaches the pool only through the
+`cov-lake-cache` process that ran it: each request of Lake's for an output or
+an artifact goes, by the `curl` stand-in Lake runs, over a local socket to
+that process, which alone reads the pool. Lake and the lakefiles it runs get
+none of the process's `AWS_*` variables. `COVALENCE_LAKE_COMMITS` names the commits `get` searches for a
 published build, nearest first, instead of `HEAD` and its ancestors.
 `COVALENCE_LAKE_COMMIT` names the commit `build` records and `put` publishes
 under instead of `HEAD`, for a remote build of a client's tree; where the
@@ -354,7 +357,8 @@ records existed counts as used at its first `gc`.
 Set `LAKE_CI_BUCKET`. Credentials, region and endpoint follow the AWS
 credential chain (`AWS_REGION`, `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, web identity, profiles or machine
-roles). Do not pass credentials on the command line.
+roles), in the `cov-lake-cache` process only. Do not pass credentials on the
+command line.
 
 Transfers use the bucket's regional endpoint. Bucket permissions decide who
 writes.

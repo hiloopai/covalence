@@ -156,6 +156,23 @@ fn remove(path: &Path) -> Result<()> {
     }
 }
 
+/// Run `command` without the `AWS_*` variables among `inherited`, this
+/// process's environment.
+///
+/// Lake and the lakefiles it runs get no AWS credentials, nor a way to find
+/// them: this process serves every pool request of theirs
+/// (`outputs::Service`).
+pub(crate) fn without_aws(
+    command: &mut Command,
+    inherited: impl IntoIterator<Item = std::ffi::OsString>,
+) {
+    for name in inherited {
+        if name.to_str().is_some_and(|name| name.starts_with("AWS_")) {
+            command.env_remove(name);
+        }
+    }
+}
+
 impl Project {
     /// Lake in this project, once its toolchain is ready, with
     /// `LAKE_CACHE_DIR` defaulting to `$XDG_CACHE_HOME/lake`, else
@@ -165,6 +182,7 @@ impl Project {
         self.lean.ready(&self.root)?;
         let mut command = Command::new(self.lean.program());
         command.current_dir(&self.root);
+        without_aws(&mut command, env::vars_os().map(|(name, _)| name));
         if let Some(directory) = host_cache_dir() {
             command.env("LAKE_CACHE_DIR", directory);
         }
@@ -840,6 +858,34 @@ fn named_commits(text: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lake_inherits_no_aws_variable() {
+        let mut command = Command::new("lake");
+        let inherited = [
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_REGION",
+            "LAKE_CI_BUCKET",
+            "PATH",
+        ];
+        without_aws(&mut command, inherited.map(std::ffi::OsString::from));
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            removed,
+            [
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                "AWS_REGION",
+                "AWS_SECRET_ACCESS_KEY",
+            ]
+        );
+    }
 
     #[test]
     fn a_recorded_archive_of_another_build_takes_its_traces_outputs() {

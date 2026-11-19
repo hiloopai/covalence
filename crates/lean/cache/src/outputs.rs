@@ -33,6 +33,7 @@ use crate::{
     error::{Error, IoResult, Result, encode, invalid, json},
     mapping,
     project::Project,
+    restore::Request,
 };
 
 mod normalized;
@@ -426,13 +427,14 @@ pub(crate) fn installed(file: &fs::File) -> Result<()> {
 /// runs.
 const SOCKET: &str = "COVALENCE_LAKE_OUTPUTS_SOCKET";
 
-/// Answers every outputs lookup of this process's Lake runs from one warm
-/// store. Lake asks once per input its cache lacks, through a `curl`
-/// stand-in process each time, and a module's lookup waits for its imports'
-/// builds, so lookups add up along the build's longest chain: a stand-in
-/// that opened its own store paid a client start, credential load and TLS
-/// handshake every time. Each one now costs a local socket round trip and
-/// one pooled request.
+/// Answers every request of this process's Lake runs that the pool serves,
+/// outputs lookups and artifact downloads, from one warm store, in this
+/// process: Lake and the lakefiles it runs hold no AWS credentials. Lake asks
+/// through a `curl` stand-in process each time, which hands its arguments
+/// here ([`forward`]). A module's lookup waits for its imports' builds, so
+/// lookups add up along the build's longest chain: a stand-in that opened its
+/// own store paid a client start, credential load and TLS handshake every
+/// time. Each one now costs a local socket round trip and one pooled request.
 struct Service {
     socket: PathBuf,
     fetched: AtomicUsize,
@@ -440,6 +442,15 @@ struct Service {
     served: PathBuf,
     // Holds the socket's folder for the process's life.
     _folder: tempfile::TempDir,
+}
+
+/// What [`Service`] answers a stand-in: curl's exit status, and what curl
+/// would have written to its stderr.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(crate = "covalence_lib_serde::serde", deny_unknown_fields)]
+struct Answer {
+    code: u8,
+    stderr: String,
 }
 
 static SERVICE: Mutex<Option<&'static Service>> = Mutex::new(None);
@@ -466,7 +477,11 @@ impl Service {
             _folder: folder,
         }));
         let kv = crate::storage::store()?;
-        let artifacts = project.cache_dir()?.join("artifacts");
+        let artifacts = project
+            .cache_dir()?
+            .join("artifacts")
+            .canonicalize()
+            .operation("locate artifact directory")?;
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let (kv, artifacts) = (kv.clone(), artifacts.clone());
@@ -477,34 +492,44 @@ impl Service {
         Ok(started)
     }
 
-    /// One lookup: `<request>\t<outputs file>\n` in, curl's exit status out.
+    /// One [`Request`] in as a JSON line, its [`Answer`] out.
     fn answer(&self, mut stream: UnixStream, kv: Arc<dyn Kv>, artifacts: &Path) {
         let mut line = String::new();
-        let answer = BufReader::new(&stream)
+        let mut stderr = Vec::new();
+        let code = BufReader::new(&stream)
             .read_line(&mut line)
-            .operation("read an outputs lookup")
-            .and_then(|_| {
-                let (rest, path) = line
-                    .trim_end_matches('\n')
-                    .split_once('\t')
-                    .ok_or_else(|| invalid("invalid output request"))?;
-                lookup(kv, rest, Path::new(path), artifacts)
+            .operation("read a Lake request")
+            .and_then(|_| json::<Request>(line.as_bytes()))
+            .and_then(|request| match request.outputs() {
+                Some((rest, path)) => self.lookup(kv, rest, path, artifacts),
+                None => crate::restore::serve(&kv, &request, artifacts, &mut stderr),
+            })
+            .unwrap_or_else(|error| {
+                // Lake takes any failure as a miss and says nothing.
+                eprintln!("Lake cache: a Lake request failed: {error}");
+                1
             });
-        let code =
-            match answer.and_then(|served| served.map(|served| self.note(&served)).transpose()) {
-                Ok(Some(())) => {
-                    self.fetched.fetch_add(1, Ordering::Relaxed);
-                    0
-                }
-                Ok(None) => 22,
-                Err(error) => {
-                    // Lake takes any failure as a miss and says nothing.
-                    eprintln!("Lake cache: an outputs lookup failed: {error}");
-                    1
-                }
-            };
+        let answer = Answer {
+            code,
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        };
         // Lake's stand-in gone means Lake no longer waits for the answer.
-        let _ = writeln!(stream, "{code}");
+        if let Ok(mut answer) = encode(&answer) {
+            answer.push(b'\n');
+            let _ = stream.write_all(&answer);
+        }
+    }
+
+    /// An outputs lookup's exit status: 0 served, 22 a miss.
+    fn lookup(&self, kv: Arc<dyn Kv>, rest: &str, path: &Path, artifacts: &Path) -> Result<u8> {
+        match lookup(kv, rest, path, artifacts)? {
+            Some(served) => {
+                self.note(&served)?;
+                self.fetched.fetch_add(1, Ordering::Relaxed);
+                Ok(0)
+            }
+            None => Ok(22),
+        }
     }
 
     /// Add a served `(package, input)` to this checkout's list. One short
@@ -537,10 +562,6 @@ pub(crate) fn lookups(
         )
         .env("COVALENCE_LAKE_SCOPE", scope)
         .env(
-            "COVALENCE_LAKE_ARTIFACTS",
-            project.cache_dir()?.join("artifacts"),
-        )
-        .env(
             "LAKE_OUTPUTS_ENDPOINT",
             format!("{}/o/{scope}", crate::restore::BASE),
         )
@@ -548,27 +569,23 @@ pub(crate) fn lookups(
     Ok(())
 }
 
-/// Lake's `curl` of `<endpoint>/<os-arch>/<hash>/<package>/<input>.json`
-/// into `path`, sent to the [`Service`] that ran Lake. Curl's exit status:
-/// 22 on a miss.
-pub(crate) fn serve_request(rest: &str, path: &Path) -> Result<std::process::ExitCode> {
+/// Hand Lake's `curl` `request` to the [`Service`] of the process that ran
+/// Lake, write what it answers to stderr, and exit with its status.
+pub(crate) fn forward(request: &Request) -> Result<std::process::ExitCode> {
     let socket = std::env::var_os(SOCKET).ok_or_else(|| invalid("no outputs service"))?;
-    let path = path.to_str().filter(|path| !path.contains(['\t', '\n']));
-    let path = path.ok_or_else(|| invalid("unsupported Lake outputs path"))?;
-    if rest.contains(['\t', '\n']) {
-        return Err(invalid("invalid output request"));
-    }
     let mut stream = UnixStream::connect(socket).operation("reach the outputs service")?;
-    writeln!(stream, "{rest}\t{path}").operation("send an outputs lookup")?;
-    let mut code = String::new();
+    let mut line = encode(request)?;
+    line.push(b'\n');
+    stream.write_all(&line).operation("send a Lake request")?;
+    let mut answer = Vec::new();
     stream
-        .read_to_string(&mut code)
+        .read_to_end(&mut answer)
         .operation("read the outputs service's answer")?;
-    match code.trim() {
-        "0" => Ok(std::process::ExitCode::SUCCESS),
-        "22" => Ok(std::process::ExitCode::from(22)),
-        _ => Ok(std::process::ExitCode::FAILURE),
-    }
+    let answer: Answer = json(&answer)?;
+    std::io::stderr()
+        .write_all(answer.stderr.as_bytes())
+        .operation("write Lake transfer status")?;
+    Ok(std::process::ExitCode::from(answer.code))
 }
 
 /// Serve one request of `<os-arch>/<hash>/<package>/<input>.json` into

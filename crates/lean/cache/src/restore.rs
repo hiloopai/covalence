@@ -11,7 +11,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
     time::Instant,
 };
@@ -20,6 +20,7 @@ use covalence_cas_kv::KvCas;
 use covalence_cas_prolly::Map;
 use covalence_kv_trait::Kv;
 use covalence_lib_cid::{Bdasl, Cid, Sha256};
+use covalence_lib_serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
@@ -47,8 +48,6 @@ pub(crate) struct Session {
     remote: KvCas,
     blobs: Blobs,
     index: BTreeMap<String, String>,
-    /// Credentials resolved once for every download process.
-    lease: Vec<(&'static str, String)>,
     /// Whether a Lake run has loaded the workspace alone.
     configured: bool,
 }
@@ -77,7 +76,6 @@ impl Session {
             remote: pool::store(kv.clone(), scope)?,
             blobs: pool::blobs(kv.clone(), scope)?,
             index: BTreeMap::new(),
-            lease: storage::lease()?,
             configured: false,
         };
         session.save_index()?;
@@ -110,12 +108,7 @@ impl Session {
                 "CURL",
                 env::current_exe().operation("locate cache executable")?,
             )
-            .envs(self.lease.iter().map(|(name, value)| (*name, value)))
             .env("COVALENCE_LAKE_SCOPE", &self.scope)
-            .env(
-                "COVALENCE_LAKE_ARTIFACTS",
-                self.local.directory().join("artifacts"),
-            )
             .env(
                 "COVALENCE_LAKE_INDEX",
                 self.directory.path().join("index.json"),
@@ -536,32 +529,19 @@ fn key(url: &str, scope: &str) -> Result<String> {
     }
 }
 
-fn report(index: usize, found: Option<u64>) -> Result<()> {
-    let row = encode(
+fn report(log: &Mutex<Vec<u8>>, index: usize, found: Option<u64>) -> Result<()> {
+    let mut row = encode(
         &json!({ "urlnum": index, "exitcode": 0, "http_code": if found.is_some() { 200 } else { 404 }, "response_code": if found.is_some() { 200 } else { 404 }, "size_download": found.unwrap_or(0), "content_type": "application/octet-stream" }),
     )?;
-    let mut stderr = io::stderr().lock();
-    stderr
-        .write_all(&row)
-        .operation("write Lake transfer status")?;
-    stderr
-        .write_all(b"\n")
-        .operation("write Lake transfer status")
-}
-
-fn artifact_directory() -> Result<PathBuf> {
-    PathBuf::from(
-        env::var_os("COVALENCE_LAKE_ARTIFACTS")
-            .ok_or_else(|| invalid("missing Lake artifact directory"))?,
-    )
-    .canonicalize()
-    .operation("locate artifact directory")
+    row.push(b'\n');
+    log.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .extend_from_slice(&row);
+    Ok(())
 }
 
 /// The CIDs of the artifacts this session may serve, by Lake hash.
-fn index() -> Result<BTreeMap<String, Sha256>> {
-    let path =
-        env::var_os("COVALENCE_LAKE_INDEX").ok_or_else(|| invalid("missing artifact index"))?;
+fn index(path: &Path) -> Result<BTreeMap<String, Sha256>> {
     let index: BTreeMap<String, String> = json(&fs::read(path).operation("read artifact index")?)?;
     index
         .into_iter()
@@ -603,19 +583,22 @@ fn fetch(store: &Blobs, cid: &Sha256, path: &Path) -> Result<Option<u64>> {
     }
 }
 
-fn pool_store(scope: &str) -> Result<Blobs> {
-    pool::blobs(storage::store()?, scope)
-}
-
 /// Serves one artifact a build finds missing; a miss makes Lake build it.
-fn download_file(scope: &str, url: &str, path: &Path) -> Result<ExitCode> {
-    let hash = key(url, scope)?;
+fn download_file(
+    store: &Blobs,
+    request: &Request,
+    artifacts: &Path,
+    path: &Path,
+    log: &mut Vec<u8>,
+) -> Result<u8> {
+    let url = request.args.last().map(String::as_str).unwrap_or_default();
+    let hash = key(url, &request.scope)?;
     let parent = path
         .parent()
         .ok_or_else(|| invalid("output has no parent"))?
         .canonicalize()
         .operation("locate download parent")?;
-    if parent != artifact_directory()?
+    if parent != artifacts
         || !path
             .file_name()
             .and_then(|s| s.to_str())
@@ -624,14 +607,14 @@ fn download_file(scope: &str, url: &str, path: &Path) -> Result<ExitCode> {
     {
         return Err(invalid("unsafe artifact destination"));
     }
-    let Some(cid) = index()?.remove(&hash) else {
-        eprintln!("{hash} is not in the installed maps");
+    let Some(cid) = index(request.index()?)?.remove(&hash) else {
+        log.extend_from_slice(format!("{hash} is not in the installed maps\n").as_bytes());
         // curl's exit status for an HTTP error under `--fail`.
-        return Ok(ExitCode::from(22));
+        return Ok(22);
     };
-    match fetch(&pool_store(scope)?, &cid, path)? {
-        Some(_) => Ok(ExitCode::SUCCESS),
-        None => Ok(ExitCode::from(22)),
+    match fetch(store, &cid, path)? {
+        Some(_) => Ok(0),
+        None => Ok(22),
     }
 }
 
@@ -664,48 +647,95 @@ fn bulk_tail(args: &[String]) -> Option<&str> {
     }
 }
 
+/// One `curl` of Lake's that the pool answers, as its stand-in hands it to
+/// the process that ran Lake: the stand-in holds no AWS credentials, since
+/// Lake and the lakefiles it runs get none ([`Project::lake`]).
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(crate = "covalence_lib_serde::serde", deny_unknown_fields)]
+pub(crate) struct Request {
+    pub scope: String,
+    /// The session's artifact index: what an artifact download may serve.
+    pub index: Option<PathBuf>,
+    pub args: Vec<String>,
+}
+
+impl Request {
+    fn index(&self) -> Result<&Path> {
+        self.index
+            .as_deref()
+            .ok_or_else(|| invalid("missing artifact index"))
+    }
+
+    /// The input path and outputs file of an outputs lookup, if this is one.
+    pub fn outputs(&self) -> Option<(&str, &Path)> {
+        match &self.args[..] {
+            [s, big_s, f, o, path, l, url]
+                if [s, big_s, f, o, l] == ["-s", "-S", "-f", "-o", "-L"] =>
+            {
+                url.strip_prefix(&format!("{BASE}/o/"))
+                    .map(|rest| (rest, Path::new(path)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Lake's `curl`, run as its `CURL`: a request for another service goes to
+/// `curl`, and one the pool answers to the process that ran Lake.
 pub(crate) fn download(args: &[String]) -> Result<ExitCode> {
     let scope =
         env::var("COVALENCE_LAKE_SCOPE").map_err(|_| invalid("missing Lake transfer scope"))?;
     mapping::segment_path(&scope)?;
-    let file = ["-s", "-S", "-f", "-o"];
     let url = args.last().map(String::as_str).unwrap_or_default();
-    let bulk = bulk_config(args);
-    if !(bulk.is_some() || url.starts_with(&format!("{BASE}/"))) {
-        // Another service's request, such as a dependency artifact. Curl gets
-        // Lake's arguments but none of the cache's AWS credentials.
+    if !(bulk_config(args).is_some() || url.starts_with(&format!("{BASE}/"))) {
+        // Another service's request, such as a dependency artifact.
         let mut curl = Command::new("curl");
-        curl.args(args)
-            .env_remove("AWS_ACCESS_KEY_ID")
-            .env_remove("AWS_SECRET_ACCESS_KEY")
-            .env_remove("AWS_SESSION_TOKEN");
-        for name in storage::LEASED {
-            curl.env_remove(name);
-        }
+        crate::project::without_aws(curl.args(args), env::vars_os().map(|(name, _)| name));
         let status = curl.status().operation("start curl")?;
         return Ok(status
             .code()
             .and_then(|code| u8::try_from(code).ok())
             .map_or(ExitCode::FAILURE, ExitCode::from));
     }
+    let request = Request {
+        scope,
+        index: env::var_os("COVALENCE_LAKE_INDEX").map(PathBuf::from),
+        args: args.to_vec(),
+    };
+    crate::outputs::forward(&request)
+}
+
+/// Serve an artifact download of Lake's in this process, which alone holds
+/// the pool's credentials: one file, or a bulk download whose status rows go
+/// to `log`, as curl writes them to its stderr. Curl's exit status.
+pub(crate) fn serve(
+    kv: &Arc<dyn Kv>,
+    request: &Request,
+    artifacts: &Path,
+    log: &mut Vec<u8>,
+) -> Result<u8> {
+    let args = &request.args;
+    let store = pool::blobs(kv.clone(), &request.scope)?;
+    let file = ["-s", "-S", "-f", "-o"];
     if args.len() == file.len() + 3 && args[..file.len()] == file && args[file.len() + 1] == "-L" {
-        let path = Path::new(&args[file.len()]);
-        if let Some(rest) = url.strip_prefix(&format!("{BASE}/o/")) {
-            return crate::outputs::serve_request(rest, path);
-        }
-        return download_file(&scope, url, path);
+        return download_file(
+            &store,
+            request,
+            artifacts,
+            Path::new(&args[file.len()]),
+            log,
+        );
     }
-    let Some(config) = bulk else {
+    let Some(config) = bulk_config(args) else {
         return Err(invalid("unsupported Lake download protocol"));
     };
     let config = fs::read_to_string(config).operation("read Lake transfer configuration")?;
-    let directory = artifact_directory()?;
     let lines = config.lines().collect::<Vec<_>>();
     if lines.is_empty() || !lines.len().is_multiple_of(2) {
         return Err(invalid("incomplete Lake transfer configuration"));
     }
-    let index = index()?;
-    let mut destinations = std::collections::BTreeSet::new();
+    let index = index(request.index()?)?;
+    let mut destinations = BTreeSet::new();
     // Validate every requested artifact before starting any downloads.
     let transfers = lines
         .as_chunks::<2>()
@@ -724,7 +754,7 @@ pub(crate) fn download(args: &[String]) -> Result<ExitCode> {
                     .ok_or_else(|| invalid("expected Lake output path"))?
                     .as_bytes(),
             )?;
-            let hash = key(&url, &scope)?;
+            let hash = key(&url, &request.scope)?;
             let parent = path
                 .parent()
                 .ok_or_else(|| invalid("output has no parent"))?
@@ -734,7 +764,7 @@ pub(crate) fn download(args: &[String]) -> Result<ExitCode> {
                 .file_name()
                 .and_then(|s| s.to_str())
                 .ok_or_else(|| invalid("invalid download filename"))?;
-            if parent != directory
+            if parent != artifacts
                 || !name.starts_with(&hash)
                 || !name.ends_with(".tmp")
                 || !destinations.insert(path.clone())
@@ -747,11 +777,15 @@ pub(crate) fn download(args: &[String]) -> Result<ExitCode> {
             Ok((*cid, path))
         })
         .collect::<Result<Vec<_>>>()?;
-    let store = pool_store(&scope)?;
+    let rows = Mutex::new(Vec::new());
     storage::parallel(&transfers, |index, (cid, path)| {
-        report(index, fetch(&store, cid, path)?)
+        report(&rows, index, fetch(&store, cid, path)?)
     })?;
-    Ok(ExitCode::SUCCESS)
+    log.extend(
+        rows.into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -817,6 +851,78 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(names, [name.as_str()]);
+    }
+
+    #[test]
+    fn this_process_serves_an_artifact_its_lake_asks_for() {
+        use covalence_kv_memory::MemoryKv;
+        let kv = MemoryKv::default().into_dyn();
+        let scope = "linux-x86_64/s";
+        let bytes = vec![7u8; 1 << 16];
+        let staging = tempfile::tempdir().unwrap();
+        let source = staging.path().join("source");
+        fs::write(&source, &bytes).unwrap();
+        let (cid, _) = crate::blobs::hash_file(&source).unwrap();
+        pool::blobs(kv.clone(), scope)
+            .unwrap()
+            .put_file(&cid, &source)
+            .unwrap();
+        let hash = format!("{:016x}", crate::lake_hash::of(&bytes));
+        let index = staging.path().join("index.json");
+        fs::write(
+            &index,
+            encode(&BTreeMap::from([(hash.clone(), cid.to_string())])).unwrap(),
+        )
+        .unwrap();
+        let artifacts = tempfile::tempdir().unwrap();
+        let artifacts = artifacts.path().canonicalize().unwrap();
+        let ask = |hash: &str| Request {
+            scope: scope.to_owned(),
+            index: Some(index.clone()),
+            args: argv(&[
+                "-s",
+                "-S",
+                "-f",
+                "-o",
+                artifacts.join(format!("{hash}.ltar")).to_str().unwrap(),
+                "-L",
+                &format!("{BASE}/a/{scope}/{hash}.art"),
+            ]),
+        };
+        let mut log = Vec::new();
+        assert_eq!(serve(&kv, &ask(&hash), &artifacts, &mut log).unwrap(), 0);
+        assert_eq!(
+            fs::read(artifacts.join(format!("{hash}.ltar"))).unwrap(),
+            bytes
+        );
+        // One the installed maps do not name is a miss, as curl's 404.
+        let other = "fedcba9876543210";
+        assert_eq!(serve(&kv, &ask(other), &artifacts, &mut log).unwrap(), 22);
+        assert_eq!(
+            String::from_utf8(log).unwrap(),
+            format!("{other} is not in the installed maps\n")
+        );
+        // An outputs lookup is the service's own.
+        let lookup = Request {
+            args: argv(&[
+                "-s",
+                "-S",
+                "-f",
+                "-o",
+                "/c/outputs/p/i.json",
+                "-L",
+                &format!("{BASE}/o/{scope}/p/i.json"),
+            ]),
+            ..ask(&hash)
+        };
+        assert_eq!(
+            lookup.outputs(),
+            Some((
+                &*format!("{scope}/p/i.json"),
+                Path::new("/c/outputs/p/i.json")
+            ))
+        );
+        assert_eq!(ask(&hash).outputs(), None);
     }
 
     #[test]

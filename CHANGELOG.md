@@ -15,6 +15,14 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+### Security
+
+- `cov-lake-cache` keeps its AWS credentials to itself. Lake, and the
+  lakefile code it runs, no longer inherit `AWS_*` variables or the leased
+  `COVALENCE_LAKE_AWS_*` credentials. Every artifact download and outputs
+  lookup Lake asks for is served by the `cov-lake-cache` process that ran
+  it, over a local socket.
+
 ## [0.1.0-dev.10] - 2026-11-18
 
 ### Added
