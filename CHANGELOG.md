@@ -15,6 +15,8 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+## [0.1.0-dev.11] - 2026-11-20
+
 ### Added
 
 - Async streaming for Rust stores, for bodies too large to hold in memory.
@@ -512,7 +514,8 @@ public repository. These notes are based on its published wheel.
   was published.
 
 [GitHub releases]: https://github.com/hiloopai/covalence/releases
-[Unreleased]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.10...HEAD
+[Unreleased]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.11...HEAD
+[0.1.0-dev.11]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.10...v0.1.0-dev.11
 [0.1.0-dev.10]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.9...v0.1.0-dev.10
 [0.1.0-dev.9]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.8...v0.1.0-dev.9
 [0.1.0-dev.8]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.7...v0.1.0-dev.8
