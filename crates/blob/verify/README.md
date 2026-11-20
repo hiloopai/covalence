@@ -1,6 +1,7 @@
 # covalence-blob-verify
 
-Byte streams checked against an expected size and digest, in constant memory.
+Byte streams measured or checked against an expected size and digest, in
+constant memory.
 
 A caller that knows how long a stream should be and what it should hash to
 wraps the stream's reader or writer. The wrapper passes bytes through, hashes
@@ -13,6 +14,9 @@ another digest.
   [SHA-256](https://csrc.nist.gov/pubs/fips/180-4/upd1/final) or
   [BLAKE3](https://github.com/BLAKE3-team/BLAKE3-specs), as named by
   `HashFn` from `covalence-lib-cid`.
+- A [CID](https://dasl.ing/cid.html) (content identifier) names bytes by a
+  hash function, digest and codec. A raw CID does not assign an encoding to
+  the bytes.
 - `Expected` is a size in bytes, a hash function and a digest.
 - `Verified` is proof that a stream had exactly the expected size and digest.
   Only a check that has seen every byte makes one.
@@ -30,6 +34,30 @@ another digest.
 
 Readers and writers implement `std::io::Read` and `Write` and, with the
 default `tokio` feature, Tokio's `AsyncRead` and `AsyncWrite`.
+
+## Measuring without an expected digest
+
+Use `DigestAccumulator` when the length or digest is not known in advance.
+Choose SHA-256, BLAKE3 or both, and optionally cap the number of bytes. The
+result describes the bytes read; it does not check them against a claim.
+
+```rust
+use covalence_blob_verify::{DigestAccumulator, DigestAlgorithms};
+
+let source = &b"hello"[..];
+let result = DigestAccumulator::new(DigestAlgorithms::Both, Some(5)).read(source)?;
+assert_eq!(result.len(), 5);
+assert_eq!(result.raw_blake3(), Some(covalence_lib_cid::Blake3::of(b"hello")));
+# Ok::<(), std::io::Error>(())
+```
+
+- Feed chunks with `update` and consume the accumulator with `finish`, or
+  use `read` (or `read_async` with Tokio) to hash through EOF and finish.
+- An update that would exceed the inclusive limit hashes none of that chunk
+  and permanently fails the accumulator. Reader helpers consume at most one
+  extra byte to detect input beyond the limit.
+- The result includes the exact byte count and only the requested digests.
+  If BLAKE3 was requested, `raw_blake3` builds a CID without hashing again.
 
 ## What is guaranteed, and what the caller does
 

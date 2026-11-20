@@ -1,9 +1,11 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
+mod digest;
 mod read;
 mod write;
 
+pub use digest::{DigestAccumulator, DigestAlgorithms, DigestError, DigestResult};
 pub use read::VerifyingReader;
 pub use write::VerifyingWriter;
 

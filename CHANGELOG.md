@@ -15,6 +15,12 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+### Added
+
+- Rust, Python and JavaScript can measure a byte stream's length and compute
+  SHA-256, BLAKE3 or both in one pass with an optional byte limit. The result
+  can also give the raw BLAKE3 CID without hashing the bytes again.
+
 ## [0.1.0-dev.11] - 2026-11-20
 
 ### Added

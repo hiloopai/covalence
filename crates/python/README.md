@@ -47,6 +47,25 @@ pip install covalence==0.1.0.dev11
 - A **CAS** (content-addressed store) keeps bytes and finds them by their
   CIDs.
 
+## Measuring a Binary Stream
+
+Use `digest_fileobj` to read a binary stream through EOF from its current
+position. It does not rewind or close the stream. Use `DigestAccumulator`
+instead when the caller supplies the chunks with `update` and calls `finish`.
+Both can set `max_len` and select `"sha256"`, `"blake3"` or `"both"` (the
+default). A result describes the bytes read; it does not verify a claim.
+
+```pycon
+>>> from io import BytesIO
+>>> from covalence import Cid, digest_fileobj
+>>> result = digest_fileobj(BytesIO(b"hello"), max_len=5)
+>>> result.len, result.raw_blake3 == Cid.of(b"hello", "blake3")
+(5, True)
+>>> result.sha256.hex()
+'2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824'
+
+```
+
 ## Configuration
 
 `covalence.config` selects application directories and reads TOML using the

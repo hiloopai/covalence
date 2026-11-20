@@ -1148,6 +1148,7 @@ version = "0.1.0-dev.11"
 dependencies = [
  "blake3",
  "covalence-blob-trait",
+ "covalence-blob-verify",
  "covalence-cas-kv",
  "covalence-cas-memory",
  "covalence-cas-sqlite",

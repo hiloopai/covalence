@@ -1,6 +1,6 @@
 from collections.abc import Iterable, Sequence
 from os import PathLike
-from typing import Any, BinaryIO, Literal, Self, TypeAlias, final
+from typing import Any, BinaryIO, Literal, Protocol, Self, TypeAlias, final
 
 from _typeshed import SupportsWrite as _SupportsWrite
 
@@ -14,6 +14,9 @@ __all__ = [
     "Codec",
     "Hash",
     "Cid",
+    "DigestAccumulator",
+    "DigestResult",
+    "digest_fileobj",
     "Value",
     "Kv",
     "Cas",
@@ -29,8 +32,12 @@ __all__ = [
 __version__: str
 
 _BytesLike: TypeAlias = bytes | bytearray
+_DigestAlgorithms: TypeAlias = Literal["sha256", "blake3", "both"]
 _NativeInput: TypeAlias = None | bool | int | str | _BytesLike | Cid | Value | list[Any] | tuple[Any, ...] | dict[str, Any]
 _Native: TypeAlias = None | bool | int | str | bytes | Cid | list["_Native"] | dict[str, "_Native"]
+
+class _BinaryReader(Protocol):
+    def read(self, size: int, /) -> _BytesLike: ...
 
 class Error(Exception):
     """The base class of IntegrityError, StoreError and UnsupportedError."""
@@ -40,6 +47,81 @@ class StoreError(Error, OSError):
     """The storage under a store failed."""
 class UnsupportedError(Error, NotImplementedError):
     """Covalence or a store does not support the operation."""
+
+@final
+class DigestResult:
+    """The observed byte length and requested digests, not proof of integrity.
+
+    Results compare and hash by value.
+    """
+    @property
+    def len(self) -> int:
+        """The exact number of bytes hashed."""
+    @property
+    def sha256(self) -> bytes | None:
+        """The 32-byte SHA-256 digest, or None if not requested."""
+    @property
+    def blake3(self) -> bytes | None:
+        """The 32-byte BLAKE3 digest, or None if not requested."""
+    @property
+    def raw_blake3(self) -> Cid | None:
+        """The raw BLAKE3 CID, or None if BLAKE3 was not requested."""
+    def __eq__(self, other: object, /) -> bool: ...
+    def __hash__(self) -> int: ...
+
+@final
+class DigestAccumulator:
+    """Measure bytes in order without retaining the input.
+
+    Choose 'sha256', 'blake3' or 'both' (the default); other names raise
+    ValueError. The optional max_len is an inclusive byte limit. The effective
+    limit is at most 2**64 - 1 bytes, or 2**61 - 1 when computing SHA-256.
+
+    >>> from covalence import DigestAccumulator
+    >>> digest = DigestAccumulator(max_len=5)
+    >>> digest.update(b'he')
+    >>> digest.update(bytearray(b'llo'))
+    >>> digest.finish().len
+    5
+    """
+    def __new__(cls, algorithms: _DigestAlgorithms = "both", *, max_len: int | None = None) -> Self: ...
+    def update(self, chunk: _BytesLike) -> None:
+        """Hash the next bytes or bytearray, releasing the GIL while hashing.
+
+        Exceeding the byte limit raises ValueError, hashes none of the supplied
+        bytes, and prevents any later update or result. Updating after finish
+        also raises ValueError.
+        """
+    def finish(self) -> DigestResult:
+        """Return the measurement and close the accumulator.
+
+        Raises ValueError after a limit error or if already closed.
+        """
+
+def digest_fileobj(
+    source: _BinaryReader,
+    /,
+    *,
+    algorithms: _DigestAlgorithms = "both",
+    max_len: int | None = None,
+) -> DigestResult:
+    """Measure a binary stream from its current position through EOF in one pass.
+
+    The source must implement read(size) and return bytes or bytearray, with
+    b'' marking EOF. It is not rewound or closed. Reads are at most 64 KiB; if
+    the byte limit is reached, one more byte is requested to check for EOF.
+    Hashing runs without the GIL. The algorithms and limits are those of
+    DigestAccumulator.
+
+    - ValueError if the limit is exceeded or read returns too many bytes.
+    - TypeError if read returns anything other than bytes or bytearray.
+    - Exceptions from read pass through unchanged.
+
+    >>> from io import BytesIO
+    >>> from covalence import digest_fileobj
+    >>> digest_fileobj(BytesIO(b'hello'), algorithms='blake3', max_len=5).len
+    5
+    """
 
 @final
 class Codec:

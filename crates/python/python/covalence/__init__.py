@@ -9,6 +9,8 @@ from ._native import (
     Cas,
     Cid,
     Codec,
+    DigestAccumulator,
+    DigestResult,
     Error,
     Hash,
     IntegrityError,
@@ -17,6 +19,7 @@ from ._native import (
     UnsupportedError,
     Value,
     __version__,
+    digest_fileobj,
 )
 
 
@@ -46,6 +49,8 @@ __all__ = [
     "Cas",
     "Cid",
     "Codec",
+    "DigestAccumulator",
+    "DigestResult",
     "Error",
     "Fact",
     "Hash",
@@ -56,4 +61,5 @@ __all__ = [
     "Value",
     "__version__",
     "config",
+    "digest_fileobj",
 ]

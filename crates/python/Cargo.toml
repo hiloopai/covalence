@@ -18,6 +18,7 @@ extension-module = ["covalence-lib-python/extension-module"]
 [dependencies]
 blake3.workspace = true
 covalence-blob-trait.workspace = true
+covalence-blob-verify.workspace = true
 covalence-cas-kv.workspace = true
 covalence-cas-memory.workspace = true
 covalence-cas-sqlite.workspace = true

@@ -1,9 +1,13 @@
 """Typed use of the public API, which `mypy --strict` checks in test_stubs.py."""
 
 from typing import assert_type
+from io import BytesIO
 from pathlib import Path
 
-from covalence import Blob, BlobFact, Cas, Cid, Codec, Error, Fact, Hash, IntegrityError, Kv, Value
+from covalence import (
+    Blob, BlobFact, Cas, Cid, Codec, DigestAccumulator, DigestResult, Error,
+    Fact, Hash, IntegrityError, Kv, Value, digest_fileobj,
+)
 from covalence import config
 
 
@@ -41,6 +45,21 @@ def use_values(cid: Cid) -> None:
     native = value.to_native()
     if isinstance(native, dict) and isinstance(native["link"], Cid):
         assert_type(native["link"], Cid)
+
+
+def use_digests() -> None:
+    digest = DigestAccumulator("both", max_len=6)
+    digest.update(b"abc")
+    digest.update(bytearray(b"def"))
+    finished = digest.finish()
+    assert_type(finished, DigestResult)
+    assert_type(finished == finished, bool)
+    assert_type(hash(finished), int)
+    result = digest_fileobj(BytesIO(b"abc"), algorithms="blake3", max_len=3)
+    assert_type(result.len, int)
+    assert_type(result.sha256, bytes | None)
+    assert_type(result.blake3, bytes | None)
+    assert_type(result.raw_blake3, Cid | None)
 
 
 def use_stores(path: str) -> None:

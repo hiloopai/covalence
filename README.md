@@ -6,7 +6,8 @@ JavaScript bindings.
 - Content identifiers (CIDs) and DASL values, encoded as DRISL.
 - Content-addressed stores in memory, in SQLite and over key-value stores such
   as S3.
-- Blobs: bytes read whole or by range, and checked against a CID.
+- Blobs: bytes read whole or by range, measured in one pass or checked
+  against a CID.
 
 Status: pre-alpha. APIs may change without notice.
 
@@ -77,8 +78,8 @@ Content addressing:
 - [`crates/lib/cid`](crates/lib/cid/README.md): content identifiers.
 - [`crates/lib/dasl`](crates/lib/dasl/README.md): DASL values and the DRISL codec.
 - `crates/blob/trait`: the blob trait: bytes read by range.
-- [`crates/blob/verify`](crates/blob/verify/README.md): byte streams checked
-  against an expected size and digest, in constant memory.
+- [`crates/blob/verify`](crates/blob/verify/README.md): measure byte streams
+  or check them against an expected size and digest, in constant memory.
 
 Stores:
 

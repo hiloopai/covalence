@@ -35,12 +35,37 @@ empty.
   binding never stages a block to compute its CID.
 - `Hasher`: the raw BLAKE3 CID of bytes fed chunk by chunk, holding only
   the hash state.
+- `DigestAccumulator`: measures an unknown byte stream's exact length and
+  SHA-256, BLAKE3 or both, with an optional byte limit.
 - `Verifier`: checks a stream against a CID and length, chunk by chunk.
 - `parseCid`, `formatCid` and `blake3Cid`: CIDs between text and bytes, and
   the CID of some bytes.
 
-Objects of the `Cas`, `Hasher` and `Verifier` classes hold WebAssembly
-memory; call `free()` when done with one.
+Objects of the `Cas`, `Hasher`, `Verifier` and `DigestAccumulator` classes
+hold WebAssembly memory; call `free()` when done with one.
+
+## Measuring a Stream
+
+After initializing the package, feed `Uint8Array` chunks to the accumulator
+and call `finish()` after the last chunk. It does not read, cancel or close
+the source. The result describes the bytes fed to it, not proof that they
+match a claim.
+
+```js
+const digest = new DigestAccumulator("both", 1024);
+try {
+  digest.update(new TextEncoder().encode("hello"));
+  const { len, sha256, blake3, rawBlake3 } = digest.finish();
+} finally {
+  digest.free();
+}
+```
+
+The second argument is an inclusive byte limit. An update that would exceed
+it throws an `"io"` error before hashing any of that chunk and closes the
+accumulator; later calls to `update` or `finish` throw `"invalid"`. With one
+algorithm selected, the other digest is `null`, and `rawBlake3` is `null`
+when BLAKE3 was not requested.
 
 ## Limits
 

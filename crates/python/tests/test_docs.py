@@ -19,6 +19,14 @@ def public_classes():
             yield name, value
 
 
+def native_functions():
+    """Public functions defined in the extension module."""
+    for name in covalence.__all__:
+        value = getattr(covalence, name)
+        if inspect.isbuiltin(value):
+            yield name, value
+
+
 def public_members(cls):
     """The members `cls` defines: public names, and dunder methods with docs of their own."""
     for name, value in vars(cls).items():
@@ -34,6 +42,8 @@ def public_docs():
         yield name, cls.__doc__
         for member, value in public_members(cls):
             yield f"{name}.{member}", value.__doc__
+    for name, value in native_functions():
+        yield name, value.__doc__
     for name in covalence.config.__all__:
         yield f"config.{name}", getattr(covalence.config, name).__doc__
 
@@ -48,6 +58,9 @@ class DocsTests(unittest.TestCase):
                     qualname = getattr(value, "__qualname__", None)
                     if qualname is not None:
                         self.assertEqual(qualname, f"{name}.{member}")
+        for name, value in native_functions():
+            with self.subTest(name=name):
+                self.assertEqual((value.__module__, value.__qualname__), ("covalence", name))
 
     def test_public_api_is_documented(self):
         self.assertTrue(covalence.__doc__)
@@ -60,7 +73,15 @@ class DocsTests(unittest.TestCase):
 
     def test_stub_docstrings_match_runtime(self):
         stub = importlib.resources.files("covalence").joinpath("_native.pyi").read_text(encoding="utf-8")
-        classes = {node.name: node for node in ast.parse(stub).body if isinstance(node, ast.ClassDef)}
+        nodes = ast.parse(stub).body
+        classes = {
+            node.name: node for node in nodes
+            if isinstance(node, ast.ClassDef) and not node.name.startswith("_")
+        }
+        functions = {node.name: node for node in nodes if isinstance(node, ast.FunctionDef)}
+        for name, value in native_functions():
+            with self.subTest(name=name):
+                self.assertEqual(ast.get_docstring(functions[name]), inspect.cleandoc(value.__doc__))
         for name, cls in public_classes():
             if hasattr(covalence._native, name):
                 with self.subTest(name=name):

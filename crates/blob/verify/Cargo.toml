@@ -1,6 +1,6 @@
 [package]
 name = "covalence-blob-verify"
-description = "Byte streams checked against an expected length and digest"
+description = "Measure byte streams or check them against an expected length and digest"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,7 +14,7 @@ publish = true
 
 [features]
 default = ["tokio"]
-# `AsyncRead` and `AsyncWrite` for the reader and writer.
+# Tokio stream adapters.
 tokio = ["dep:tokio"]
 
 [dependencies]

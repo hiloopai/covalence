@@ -2,6 +2,7 @@
 #![deny(missing_docs)]
 #![cfg(target_arch = "wasm32")]
 
+mod digest;
 mod errors;
 mod host;
 mod stream;
@@ -16,6 +17,7 @@ use js_sys::{Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use web_sys::ReadableStream;
 
+pub use digest::DigestAccumulator;
 pub use host::HostStorage;
 
 /// The largest whole number JavaScript numbers hold exactly: 2^53 - 1.
