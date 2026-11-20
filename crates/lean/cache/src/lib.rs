@@ -168,7 +168,7 @@ fn execute(cli: Cli) -> Result<()> {
                 } else {
                     let kv = store()?;
                     let scope = project.identity()?.scope;
-                    outputs::publish(&project, kv.clone(), &scope, &built)?;
+                    outputs::publish(&project.cache_dir()?, kv.clone(), &scope, &built)?;
                     outputs::published(&project, read)?;
                     if recorded {
                         storage::publish(&project, &kv, cli.seed)?;

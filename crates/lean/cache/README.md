@@ -92,7 +92,9 @@ This equality deliberately excludes diagnostic logs, timing, extraction-supplied
 trace hashes, service routing and archive packaging. Logged messages may differ
 between builds with the same actual outputs; the first publisher's complete
 record and diagnostics stay unchanged. A different constituent or module mode
-is a conflict, and unsupported atomic creation fails without a replacement put.
+is a conflict: the pool keeps its output, and `put` publishes the rest, counts
+the conflicts in its output and succeeds. Unsupported atomic creation fails
+without a replacement put.
 This comparison does not establish successful-compiler provenance or validate
 legacy stripped archive bindings. A contradictory retained archive input hash
 is rejected before that archive's outputs are installed; a matching or absent

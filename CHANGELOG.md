@@ -15,6 +15,14 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+### Fixed
+
+- `cov-lake-cache put` no longer fails when the pool holds other bytes for an
+  output this host built, as when Lean writes a module's server or private
+  data differently from build to build. The pool keeps its output, the put
+  publishes the rest and prints how many outputs conflicted. Before, one such
+  output failed every later put of the checkout.
+
 ### Security
 
 - `cov-lake-cache` keeps its AWS credentials to itself. Lake, and the

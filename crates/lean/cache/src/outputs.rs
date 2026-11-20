@@ -215,16 +215,30 @@ fn names_an_archive(data: &serde_json::Value) -> bool {
     data.as_str().is_some_and(|name| name.ends_with(".ltar")) || data.get("l").is_some()
 }
 
+/// What publishing one output did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Published {
+    /// The pool took this host's output.
+    Created,
+    /// The pool held equal content, or this host lacks an artifact another
+    /// build supplies.
+    Held,
+    /// The pool holds other bytes for this input, which it keeps: Lean writes
+    /// a module's server and private data differently from build to build.
+    Conflict(String),
+}
+
 /// Publish what `built` found: each input's record and the artifacts the
-/// pool lacks.
+/// pool lacks. An output whose input the pool holds other bytes for keeps
+/// the pool's and is counted, never an error: the incumbent never changes,
+/// so failing on it would fail every later put of the checkout.
 pub(crate) fn publish(
-    project: &Project,
+    cache: &Path,
     kv: Arc<dyn Kv>,
     scope: &str,
     found: &Built,
-) -> Result<()> {
+) -> Result<Vec<Published>> {
     let started = Instant::now();
-    let cache = project.cache_dir()?;
     let blobs = crate::pool::blobs(kv.clone(), scope)?;
     let published = crate::storage::parallel(found, |_, (package, input, record)| {
         let key = key(scope, package, input)?;
@@ -234,7 +248,7 @@ pub(crate) fn publish(
             if !path.is_file() {
                 // Lake keeps only what it restored or built; another build
                 // supplies this input.
-                return Ok(false);
+                return Ok(Published::Held);
             }
             let (cid, _) = crate::blobs::hash_artifact(&name, &path)?;
             if !blobs.has(&cid)? {
@@ -250,13 +264,32 @@ pub(crate) fn publish(
             fs::read(cache.join("artifacts").join(name)).operation("read output constituent")
         })
     })?;
+    let conflicts = published
+        .iter()
+        .filter_map(|published| match published {
+            Published::Conflict(key) => Some(key),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for key in &conflicts {
+        println!("Lake cache: kept the pool's other output for {key}");
+    }
     println!(
         "Lake cache: published {} of the {} outputs this host built in {:.1} s",
-        published.iter().filter(|published| **published).count(),
+        published
+            .iter()
+            .filter(|published| **published == Published::Created)
+            .count(),
         found.len(),
         started.elapsed().as_secs_f64()
     );
-    Ok(())
+    if !conflicts.is_empty() {
+        println!(
+            "Lake cache: {} outputs conflicted with the pool's, which keeps its own",
+            conflicts.len()
+        );
+    }
+    Ok(published)
 }
 
 /// Atomically retain the first output. A losing publisher resolves actual
@@ -269,13 +302,13 @@ fn publish_entry(
     input: &str,
     entry: &Entry,
     mut load: impl FnMut(&str) -> Result<Vec<u8>>,
-) -> Result<bool> {
+) -> Result<Published> {
     let candidate = normalized::entry(entry, input, &mut load)?;
     if kv
         .put_new(key.as_bytes(), Bytes::from(encode(entry)?))
         .map_err(store_error("create output"))?
     {
-        return Ok(true);
+        return Ok(Published::Created);
     }
     let incumbent = kv
         .get(key.as_bytes())
@@ -302,11 +335,9 @@ fn publish_entry(
         Ok(bytes)
     })?;
     if candidate != existing {
-        return Err(invalid(format!(
-            "conflicting outputs for {key}; incumbent retained"
-        )));
+        return Ok(Published::Conflict(key.to_owned()));
     }
-    Ok(false)
+    Ok(Published::Held)
 }
 
 fn store_error(
@@ -788,6 +819,79 @@ mod tests {
     }
 
     #[test]
+    fn a_conflict_keeps_the_pools_output_publishes_the_rest_and_the_next_put_finds_nothing() {
+        let cache = tempfile::tempdir().unwrap();
+        let artifacts = cache.path().join("artifacts");
+        let package = cache.path().join("outputs/demo");
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::create_dir_all(&package).unwrap();
+        let named = |bytes: &[u8]| format!("{:016x}.olean", crate::lake_hash::of(bytes));
+        let inputs = ["00000000000000aa", "00000000000000bb", "00000000000000cc"];
+        for input in inputs {
+            let bytes = format!("built {input}").into_bytes();
+            let name = named(&bytes);
+            fs::write(artifacts.join(&name), &bytes).unwrap();
+            let record = serde_json::json!({"service": null, "data": name});
+            fs::write(package.join(format!("{input}.json")), record.to_string()).unwrap();
+        }
+        // The pool holds another build of `bb`, with other bytes.
+        let kv = MemoryKv::default().into_dyn();
+        let blobs = crate::pool::blobs(kv.clone(), "scope").unwrap();
+        let bytes = b"another build".to_vec();
+        let name = named(&bytes);
+        let path = cache.path().join(&name);
+        fs::write(&path, &bytes).unwrap();
+        let (cid, _) = crate::blobs::hash_artifact(&name, &path).unwrap();
+        blobs.put_file(&cid, &path).unwrap();
+        let incumbent = Entry {
+            record: serde_json::json!({"service": null, "data": name}),
+            artifacts: BTreeMap::from([(name, cid.to_string())]),
+        };
+        let conflicted = key("scope", "demo", "00000000000000bb").unwrap();
+        kv.put(
+            conflicted.as_bytes(),
+            Bytes::from(encode(&incumbent).unwrap()),
+        )
+        .unwrap();
+        let (root, builds) = checkout(&inputs);
+        let outputs = cache.path().join("outputs");
+        let found = records(&outputs, &builds, None, &BTreeSet::new()).unwrap();
+        let outcomes = publish(cache.path(), kv.clone(), "scope", &found).unwrap();
+        let created = outcomes
+            .iter()
+            .filter(|outcome| **outcome == Published::Created)
+            .count();
+        assert_eq!(created, 2, "{outcomes:?}");
+        assert!(outcomes.contains(&Published::Conflict(conflicted.clone())));
+        for input in ["00000000000000aa", "00000000000000cc"] {
+            let published = key("scope", "demo", input).unwrap();
+            assert!(kv.get(published.as_bytes()).unwrap().is_some());
+        }
+        assert_eq!(
+            kv.get(conflicted.as_bytes()).unwrap().unwrap().as_ref(),
+            encode(&incumbent).unwrap()
+        );
+        // The put succeeds, so it dates the marker at its read, and the
+        // checkout's next put finds nothing left to publish.
+        let project = Project {
+            root: root.path().to_owned(),
+            repository: "o/r".into(),
+            workspace: String::new(),
+            record: root.path().join("record"),
+            lean: crate::toolchain::Lean::default(),
+        };
+        published(&project, std::time::SystemTime::now()).unwrap();
+        let since = fs::metadata(started_marker(&project))
+            .and_then(|marker| marker.modified())
+            .unwrap();
+        assert!(
+            records(&outputs, &builds, Some(since), &BTreeSet::new())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn a_record_another_build_is_still_writing_is_left_to_it() {
         let outputs = tempfile::tempdir().unwrap();
         let package = outputs.path().join("demo");
@@ -928,7 +1032,7 @@ mod atomic_tests {
         blobs: &crate::blobs::Blobs,
         entry: &Entry,
         files: &BTreeMap<String, Vec<u8>>,
-    ) -> Result<bool> {
+    ) -> Result<Published> {
         publish_entry(
             kv,
             blobs,
@@ -972,13 +1076,20 @@ mod atomic_tests {
             )
         });
         assert_ne!(results.0, results.1);
-        let expected = if results.0 { &entry } else { &other };
+        let expected = if results.0 == Published::Created {
+            &entry
+        } else {
+            &other
+        };
         assert_eq!(
             kv.get(b"test/output").unwrap().unwrap().as_ref(),
             encode(expected).unwrap()
         );
         let before = kv.get(b"test/output").unwrap();
-        assert!(!attempt(kv.as_ref(), &blobs, &other, &files).unwrap());
+        assert_eq!(
+            attempt(kv.as_ref(), &blobs, &other, &files).unwrap(),
+            Published::Held
+        );
         assert_eq!(kv.get(b"test/output").unwrap(), before);
     }
 
@@ -1000,21 +1111,22 @@ mod atomic_tests {
                 barrier.wait();
                 attempt(kv.as_ref(), &blobs, &other, &other_files)
             });
-            (first.join().unwrap(), second.join().unwrap())
+            (
+                first.join().unwrap().unwrap(),
+                second.join().unwrap().unwrap(),
+            )
         });
-        assert_ne!(results.0.is_ok(), results.1.is_ok());
-        let (winner, loser, loser_files) = if results.0.is_ok() {
-            (&entry, &other, &other_files)
-        } else {
-            (&other, &entry, &files)
+        let conflict = Published::Conflict("test/output".to_owned());
+        let (winner, loser, loser_files) = match results {
+            (Published::Created, lost) if lost == conflict => (&entry, &other, &other_files),
+            (lost, Published::Created) if lost == conflict => (&other, &entry, &files),
+            results => panic!("not one winner and one conflict: {results:?}"),
         };
         let before = kv.get(b"test/output").unwrap();
         assert_eq!(before.as_ref().unwrap().as_ref(), encode(winner).unwrap());
-        assert!(
-            attempt(kv.as_ref(), &blobs, loser, loser_files)
-                .unwrap_err()
-                .to_string()
-                .contains("conflicting outputs")
+        assert_eq!(
+            attempt(kv.as_ref(), &blobs, loser, loser_files).unwrap(),
+            conflict
         );
         assert_eq!(kv.get(b"test/output").unwrap(), before);
     }
@@ -1034,7 +1146,10 @@ mod atomic_tests {
         // `publish` stores the candidate's constituents before this, so the
         // pool holds them; this one compares the local bytes, and a read of
         // the pool, which lacks them here, would fail.
-        assert!(!attempt(kv.as_ref(), &blobs, &entry, &files).unwrap());
+        assert_eq!(
+            attempt(kv.as_ref(), &blobs, &entry, &files).unwrap(),
+            Published::Held
+        );
     }
 
     struct NoConditionalCreate;
