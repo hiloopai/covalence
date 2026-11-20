@@ -1,0 +1,32 @@
+[package]
+name = "covalence-js"
+description = "JavaScript bindings for Covalence content-addressed stores, built with wasm-bindgen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# The bindings exist only on wasm32; on other targets the crate is empty.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+blake3.workspace = true
+covalence-blob-verify.workspace = true
+covalence-cas-kv = { path = "../cas/kv", default-features = false }
+covalence-cas-trait.workspace = true
+covalence-kv-trait.workspace = true
+covalence-lib-cid.workspace = true
+covalence-lib-data.workspace = true
+futures-util = { version = "0.3.34", default-features = false }
+js-sys = "0.3.107"
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4.80"
+wasm-streams = "0.7.1"
+web-sys = { version = "0.3.107", features = ["ReadableStream"] }
+
+[lints]
+workspace = true

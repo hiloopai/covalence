@@ -18,7 +18,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Task {
-    /// Build the Rust workspace and Python wheel.
+    /// Build the Rust workspace, Python wheel and JavaScript package.
     Build {
         #[arg(long)]
         release: bool,
@@ -52,6 +52,8 @@ enum Error {
     Filesystem { source: io::Error },
     #[snafu(display("expected one built Python wheel, found {count}"))]
     WheelCount { count: usize },
+    #[snafu(display("Cargo.lock does not pin one {package} version"))]
+    Locked { package: &'static str },
     #[snafu(display("{program} failed with {status}"))]
     Failed {
         program: &'static str,
@@ -93,10 +95,13 @@ fn cargo(args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Result<(), Error>
     run_command("Cargo", cargo_command().args(args))
 }
 
+/// Cargo's target directory: `CARGO_TARGET_DIR`, or `target` in the checkout.
+fn target_dir() -> PathBuf {
+    root().join(std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()))
+}
+
 fn artifacts() -> PathBuf {
-    root()
-        .join(std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()))
-        .join("glu")
+    target_dir().join("glu")
 }
 
 fn artifact_lock() -> Result<fs::File, Error> {
@@ -201,13 +206,137 @@ fn test_python() -> Result<(), Error> {
     )
 }
 
+/// The target the JavaScript package compiles for.
+const WASM: &str = "wasm32-unknown-unknown";
+
+/// The one version of `package` in `Cargo.lock`.
+fn locked_version(package: &'static str) -> Result<String, Error> {
+    let lock = fs::read_to_string(root().join("Cargo.lock")).context(FilesystemSnafu)?;
+    version_in(&lock, package)
+}
+
+/// The one version of `package` in the text of a `Cargo.lock`, whatever its
+/// line endings.
+fn version_in(lock: &str, package: &'static str) -> Result<String, Error> {
+    let name = format!("name = \"{package}\"");
+    let mut versions = lock.split("[[package]]").filter_map(|entry| {
+        let mut lines = entry.lines().map(str::trim).filter(|line| !line.is_empty());
+        if lines.next()? != name {
+            return None;
+        }
+        let version = lines
+            .next()?
+            .strip_prefix("version = \"")?
+            .strip_suffix('"')?;
+        Some(version.to_owned())
+    });
+    match (versions.next(), versions.next()) {
+        (Some(version), None) => Ok(version),
+        _ => LockedSnafu { package }.fail(),
+    }
+}
+
+/// The wasm-bindgen command at the version `Cargo.lock` pins, installed
+/// under the artifacts directory on first use.
+fn wasm_bindgen() -> Result<PathBuf, Error> {
+    let version = locked_version("wasm-bindgen")?;
+    let tools = artifacts().join("tools");
+    let command = tools
+        .join("bin")
+        .join(format!("wasm-bindgen{}", std::env::consts::EXE_SUFFIX));
+    let installed = Command::new(&command)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .split_whitespace()
+                    .nth(1)
+                    == Some(version.as_str())
+        });
+    if !installed {
+        cargo([
+            OsStr::new("install"),
+            OsStr::new("--locked"),
+            OsStr::new("wasm-bindgen-cli"),
+            OsStr::new("--version"),
+            OsStr::new(&format!("={version}")),
+            OsStr::new("--root"),
+            tools.as_os_str(),
+        ])?;
+    }
+    Ok(command)
+}
+
+fn build_js(release: bool) -> Result<(), Error> {
+    let mut args = vec!["build", "--locked", "-p", "covalence-js", "--target", WASM];
+    if release {
+        args.push("--release");
+    }
+    cargo(args)?;
+    let wasm = target_dir()
+        .join(WASM)
+        .join(if release { "release" } else { "debug" })
+        .join("covalence_js.wasm");
+    let package = artifacts().join("js");
+    if package.exists() {
+        fs::remove_dir_all(&package).context(FilesystemSnafu)?;
+    }
+    subprocess(
+        "wasm-bindgen",
+        wasm_bindgen()?,
+        [
+            OsStr::new("--target"),
+            OsStr::new("web"),
+            OsStr::new("--out-dir"),
+            package.as_os_str(),
+            wasm.as_os_str(),
+        ],
+        &root(),
+    )?;
+    fs::copy(
+        root().join("crates/js/package.json"),
+        package.join("package.json"),
+    )
+    .context(FilesystemSnafu)?;
+    Ok(())
+}
+
+/// Every `*.test.mjs` file in `crates/js/tests`, in name order.
+fn js_tests() -> Result<Vec<PathBuf>, Error> {
+    let mut tests = fs::read_dir(root().join("crates/js/tests"))
+        .context(FilesystemSnafu)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .context(FilesystemSnafu)?;
+    tests.retain(|path| {
+        path.file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.ends_with(".test.mjs"))
+    });
+    tests.sort();
+    Ok(tests)
+}
+
+fn test_js() -> Result<(), Error> {
+    run_command(
+        "JavaScript tests",
+        Command::new("node")
+            .arg("--test")
+            .args(js_tests()?)
+            .env("COVALENCE_JS", artifacts().join("js"))
+            .current_dir(root()),
+    )
+}
+
 fn build(release: bool) -> Result<(), Error> {
     let mut args = vec!["build", "--workspace", "--locked"];
     if release {
         args.push("--release");
     }
     cargo(args)?;
-    build_python(release)
+    build_python(release)?;
+    build_js(release)
 }
 
 fn check() -> Result<(), Error> {
@@ -216,6 +345,17 @@ fn check() -> Result<(), Error> {
         "clippy",
         "--workspace",
         "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+    cargo([
+        "clippy",
+        "-p",
+        "covalence-js",
+        "--target",
+        WASM,
         "--locked",
         "--",
         "-D",
@@ -234,14 +374,20 @@ fn check() -> Result<(), Error> {
 }
 
 fn doc() -> Result<(), Error> {
+    let flags =
+        "-D warnings -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links";
     run_command(
         "Cargo",
         cargo_command()
             .args(["doc", "--no-deps", "--workspace", "--locked"])
-            .env(
-                "RUSTDOCFLAGS",
-                "-D warnings -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links",
-            ),
+            .env("RUSTDOCFLAGS", flags),
+    )?;
+    run_command(
+        "Cargo",
+        cargo_command()
+            .args(["doc", "--no-deps", "-p", "covalence-js", "--locked"])
+            .args(["--target", WASM])
+            .env("RUSTDOCFLAGS", flags),
     )
 }
 
@@ -284,11 +430,14 @@ fn test_rust() -> Result<(), Error> {
 fn test() -> Result<(), Error> {
     test_rust()?;
     build_python(false)?;
-    test_python()
+    test_python()?;
+    build_js(false)?;
+    test_js()
 }
 
 fn run(task: Task) -> Result<(), Error> {
-    // Coordinate the wheel and test environment across simultaneous glu tasks.
+    // Coordinate the wheel, the JavaScript package, the installed tools and
+    // the test environment across simultaneous glu tasks.
     let _lock = if matches!(&task, Task::Build { .. } | Task::Test | Task::Ci) {
         Some(artifact_lock()?)
     } else {
@@ -307,7 +456,8 @@ fn run(task: Task) -> Result<(), Error> {
             package()?;
             build(false)?;
             test_rust()?;
-            test_python()
+            test_python()?;
+            test_js()
         }
         Task::Cargo { args } => cargo(args),
     }
@@ -348,6 +498,28 @@ mod tests {
     #[test]
     fn command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn lock_versions_parse_with_either_line_ending() {
+        let lock = "[[package]]\nname = \"a\"\nversion = \"1.2.3\"\n\n[[package]]\nname = \"ab\"\nversion = \"9.9.9\"\n";
+        assert_eq!(version_in(lock, "a").unwrap(), "1.2.3");
+        assert_eq!(
+            version_in(&lock.replace('\n', "\r\n"), "a").unwrap(),
+            "1.2.3"
+        );
+        let twice = format!("{lock}[[package]]\nname = \"a\"\nversion = \"2.0.0\"\n");
+        assert!(matches!(version_in(&twice, "a"), Err(Error::Locked { .. })));
+    }
+
+    #[test]
+    fn locked_versions_come_from_cargo_lock() {
+        let version = locked_version("wasm-bindgen").unwrap();
+        assert!(version.starts_with("0.2."), "{version}");
+        assert!(matches!(
+            locked_version("no-such-package"),
+            Err(Error::Locked { .. })
+        ));
     }
 
     #[test]

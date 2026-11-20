@@ -1,6 +1,7 @@
 # Covalence
 
-Shared libraries for content-addressed data, in Rust with Python bindings.
+Shared libraries for content-addressed data, in Rust with Python and
+JavaScript bindings.
 
 - Content identifiers (CIDs) and DASL values, encoded as DRISL.
 - Content-addressed stores in memory, in SQLite and over key-value stores such
@@ -31,7 +32,8 @@ a new terminal after setup to activate the development environment.
 `flake.lock` pins the tools used locally, in the container, and in Linux CI.
 Without Nix, install the Rust version in `rust-toolchain.toml` and a native
 linker; ordinary `cargo build` and `cargo test` work
-with `python3` on `PATH` or `PYO3_PYTHON` set. The Nix shell checks that
+with `python3` on `PATH` or `PYO3_PYTHON` set. The JavaScript package also
+needs the `wasm32-unknown-unknown` Rust target and Node.js. The Nix shell checks that
 its Rust version matches. macOS and ARM shells are defined but not yet tested
 in CI.
 
@@ -49,12 +51,17 @@ in CI.
 | `glu cargo <arguments...>` | Run Cargo from the checkout root |
 
 Cargo owns Rust compilation and caching. `bin/glu` compiles only the Rust
-dispatcher and its dependencies on launch. `glu build` builds the Rust workspace
-and the Python wheel.
+dispatcher and its dependencies on launch. `glu build` builds the Rust workspace,
+the Python wheel and the JavaScript package, in `target/glu/js`. It installs
+the `wasm-bindgen` command at the version `Cargo.lock` pins under
+`target/glu/tools` on first use.
 
 `glu test` and `glu ci` also test `covalence-cas-kv` with its codec features
 disabled and with each codec family enabled separately, and
-`covalence-blob-verify` without its Tokio feature.
+`covalence-blob-verify` without its Tokio feature. They run every
+`crates/js/tests/*.test.mjs` file with Node.js against the built JavaScript
+package. `glu check` lints `covalence-js`, and `glu doc` documents it, for
+`wasm32-unknown-unknown`.
 
 `glu check` (also run by `glu ci`) checks the changelog's
 [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/) conventions:
@@ -84,9 +91,11 @@ Stores:
 - `crates/kv/memory`: an in-memory key-value store.
 - `crates/kv/s3`: a key-value store on S3.
 
-Python:
+Bindings:
 
 - [`crates/python`](crates/python/README.md): the `covalence` Python package.
+- [`crates/js`](crates/js/README.md): a JavaScript package of a CAS over
+  host-provided storage, built with wasm-bindgen. It is not published.
 
 Configuration:
 

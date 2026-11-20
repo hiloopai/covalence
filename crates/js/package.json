@@ -1,0 +1,22 @@
+{
+  "name": "covalence-js",
+  "private": true,
+  "description": "JavaScript bindings for Covalence content-addressed stores",
+  "license": "CC0-1.0 OR MIT OR Apache-2.0",
+  "type": "module",
+  "main": "covalence_js.js",
+  "types": "covalence_js.d.ts",
+  "exports": {
+    ".": {
+      "types": "./covalence_js.d.ts",
+      "import": "./covalence_js.js"
+    },
+    "./covalence_js_bg.wasm": "./covalence_js_bg.wasm"
+  },
+  "files": [
+    "covalence_js.js",
+    "covalence_js.d.ts",
+    "covalence_js_bg.wasm",
+    "covalence_js_bg.wasm.d.ts"
+  ]
+}

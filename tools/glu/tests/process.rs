@@ -23,16 +23,27 @@ impl Fixture {
             r#"#!/bin/sh
 printf '%s\0' "$@" >> "$GLU_TEST_LOG"
 printf '%s\n' "${0##*/}" >> "$GLU_TEST_CALLS"
-pwd > "$GLU_TEST_CWD"
+pwd >> "$GLU_TEST_CWD"
 printf '%s\n' "${RUSTDOCFLAGS:-}" >> "$GLU_TEST_RUSTDOCFLAGS"
 if [ "${GLU_TEST_FAIL_PROGRAM:-}" = "${0##*/}" ]; then exit 23; fi
 if [ "${GLU_TEST_STATUS:-0}" != 0 ]; then exit "$GLU_TEST_STATUS"; fi
 if [ "${3:-}" = pip ] && [ "${PIP_CONFIG_FILE:-}" != /dev/null ]; then exit 24; fi
 case "${0##*/}" in
+  cargo)
+    if [ "${1:-}" = install ]; then
+      while [ "$1" != --root ]; do shift; done
+      mkdir -p "$2/bin"
+      cp "$0" "$2/bin/wasm-bindgen"
+    fi
+    ;;
   maturin)
     while [ "$1" != --out ]; do shift; done
     mkdir -p "$2"
     touch "$2/covalence-test.whl"
+    ;;
+  wasm-bindgen)
+    while [ "$1" != --out-dir ]; do shift; done
+    mkdir -p "$2"
     ;;
   python3)
     if [ "${1:-}" = -I ] && [ "${2:-}" = -m ] && [ "${3:-}" = venv ]; then
@@ -47,6 +58,7 @@ esac
         fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
         fs::copy(&cargo, dir.join("maturin")).unwrap();
         fs::copy(&cargo, dir.join("python3")).unwrap();
+        fs::copy(&cargo, dir.join("node")).unwrap();
         Self { dir }
     }
 
@@ -77,6 +89,15 @@ esac
             .args(args)
             .output()
             .unwrap()
+    }
+
+    /// The working directory of each call, in order.
+    fn cwds(&self) -> Vec<PathBuf> {
+        fs::read_to_string(self.dir.join("cwd"))
+            .unwrap()
+            .lines()
+            .map(PathBuf::from)
+            .collect()
     }
 
     fn args(&self) -> Vec<String> {
@@ -112,8 +133,7 @@ fn forwards_arguments_and_runs_from_checkout() {
             .success()
     );
     assert_eq!(fixture.args(), ["test", "--", "a test"]);
-    let cwd = fs::read_to_string(fixture.dir.join("cwd")).unwrap();
-    assert_eq!(PathBuf::from(cwd.trim()), root());
+    assert_eq!(fixture.cwds().last().unwrap(), &root());
 }
 
 #[test]
@@ -151,8 +171,62 @@ fn build_selects_the_whole_workspace() {
             "--out"
         ]
     );
-    assert_eq!(args.last().unwrap(), "--release");
     assert!(args[11].starts_with(fixture.dir.to_str().unwrap()));
+    assert_eq!(args[12], "--release");
+    assert_eq!(
+        &args[13..20],
+        [
+            "build",
+            "--locked",
+            "-p",
+            "covalence-js",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--release"
+        ]
+    );
+    let tools = fixture.dir.join("target/glu/tools");
+    assert_eq!(
+        &args[20..27],
+        [
+            "install",
+            "--locked",
+            "wasm-bindgen-cli",
+            "--version",
+            &format!("={}", locked_wasm_bindgen()),
+            "--root",
+            tools.to_str().unwrap()
+        ]
+    );
+    let package = fixture.dir.join("target/glu/js");
+    let wasm = fixture
+        .dir
+        .join("target/wasm32-unknown-unknown/release/covalence_js.wasm");
+    assert_eq!(
+        &args[27..],
+        [
+            "--target",
+            "web",
+            "--out-dir",
+            package.to_str().unwrap(),
+            wasm.to_str().unwrap()
+        ]
+    );
+    assert_eq!(
+        fs::read(package.join("package.json")).unwrap(),
+        fs::read(root().join("crates/js/package.json")).unwrap()
+    );
+}
+
+/// The wasm-bindgen version in the checkout's `Cargo.lock`.
+fn locked_wasm_bindgen() -> String {
+    let lock = fs::read_to_string(root().join("Cargo.lock")).unwrap();
+    let mut lines = lock.lines().map(str::trim);
+    lines
+        .find(|line| *line == "name = \"wasm-bindgen\"")
+        .unwrap();
+    let version = lines.next().unwrap();
+    version.split('"').nth(1).unwrap().to_owned()
 }
 
 #[test]
@@ -167,8 +241,7 @@ fn launcher_compiles_only_glu() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    let cwd = fs::read_to_string(fixture.dir.join("cwd")).unwrap();
-    assert_eq!(PathBuf::from(cwd.trim()), root());
+    assert_eq!(fixture.cwds().last().unwrap(), &root());
     let args = fixture.args();
     assert!(
         args.windows(2)
@@ -193,8 +266,28 @@ fn ci_builds_one_wheel_and_tests_an_isolated_install() {
     assert_eq!(
         calls.lines().collect::<Vec<_>>(),
         [
-            "cargo", "cargo", "python3", "cargo", "cargo", "cargo", "maturin", "cargo", "cargo",
-            "cargo", "cargo", "cargo", "cargo", "python3", "python", "python"
+            "cargo",
+            "cargo",
+            "cargo",
+            "python3",
+            "cargo",
+            "cargo",
+            "cargo",
+            "cargo",
+            "maturin",
+            "cargo",
+            "cargo",
+            "wasm-bindgen",
+            "cargo",
+            "cargo",
+            "cargo",
+            "cargo",
+            "cargo",
+            "cargo",
+            "python3",
+            "python",
+            "python",
+            "node"
         ]
     );
     let args = fixture.args();
@@ -214,11 +307,14 @@ fn ci_builds_one_wheel_and_tests_an_isolated_install() {
     assert_eq!(args.iter().filter(|arg| *arg == "--isolated").count(), 1);
     assert_eq!(args.iter().filter(|arg| *arg == "-I").count(), 4);
     assert!(!args.iter().any(|arg| arg == "--clear"));
-    let cwd = fs::read_to_string(fixture.dir.join("cwd")).unwrap();
+    // Python runs in its test environment; the JavaScript tests last, from
+    // the checkout.
+    let cwds = fixture.cwds();
     assert_eq!(
-        PathBuf::from(cwd.trim()),
+        cwds[cwds.len() - 2],
         fixture.dir.join("target/glu/python-test")
     );
+    assert_eq!(cwds[cwds.len() - 1], root());
 }
 
 #[test]
@@ -228,12 +324,25 @@ fn doc_denies_rustdoc_warnings_for_the_workspace() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         fixture.args(),
-        ["doc", "--no-deps", "--workspace", "--locked"]
+        [
+            "doc",
+            "--no-deps",
+            "--workspace",
+            "--locked",
+            "doc",
+            "--no-deps",
+            "-p",
+            "covalence-js",
+            "--locked",
+            "--target",
+            "wasm32-unknown-unknown"
+        ]
     );
     let flags = fs::read_to_string(fixture.dir.join("rustdocflags")).unwrap();
+    let flags: Vec<_> = flags.lines().collect();
     assert_eq!(
-        flags.trim(),
-        "-D warnings -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links"
+        flags,
+        ["-D warnings -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links"; 2]
     );
 }
 

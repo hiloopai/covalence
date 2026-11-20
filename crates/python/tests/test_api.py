@@ -850,6 +850,26 @@ class CasTests(ApiCase):
             with self.subTest(prefix=prefix):
                 self.assert_fails(Cas.kv, kv, prefix)
 
+    # The Rust and JavaScript stream tests assert the same CIDs and keys.
+    def test_kv_layout_vectors(self):
+        vectors = {
+            "hello": (b"hello", "bafkr4ihkr4ld3m4gqkjf4reryxsy2s5tkbxprqkow6fin2iiyvreuzzab4", "5khrmpntq2bjexseshc6ldklwnig56gbj23yvbxjbdcwestheahq"),
+            "empty": (b"", EMPTY_BLAKE3, "v4jutopv7gq2nicajxvdnxgjjgn4wjojvxarfn6mtkj4vza7gjra"),
+            "range256x5": (bytes(range(256)) * 5, "bafkr4idvq35ccjdoryl3hbfy7z4jjdmrncaoltskqdidb5cvasksu2paka", "owdpuijen2hbpm4exd7hrfensfuibzoojkanamhukucjkktj4bia"),
+        }
+        for name, (data, cid, digest) in vectors.items():
+            for prefix in (None, "cas"):
+                with self.subTest(vector=name, prefix=prefix):
+                    key = f"{prefix + '/' if prefix else ''}blake3/{digest}/bytes".encode()
+                    kv = Kv.memory()
+                    self.assertEqual(str(Cas.kv(kv, prefix).put(data)), cid)
+                    self.assertEqual(kv.get(key), data)
+                    kv = Kv.memory()
+                    chunks = [data[i : i + 7] for i in range(0, len(data), 7)]
+                    stored = Cas.kv(kv, prefix).put_from(Cid(cid), chunks, len(data))
+                    self.assertEqual(str(stored), cid)
+                    self.assertEqual(kv.get(key), data)
+
     def test_put_many_stores_each_value_and_returns_its_cid_in_order(self):
         for name, cas in self.stores().items():
             with self.subTest(store=name):

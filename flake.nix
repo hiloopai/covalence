@@ -12,7 +12,7 @@
         let pkgs = import nixpkgs { inherit system; };
         in {
           default = assert pkgs.rustc.version == toolchain; pkgs.mkShell {
-            packages = with pkgs; [ cargo rustc rustfmt clippy rust-analyzer git direnv python313 python313Packages.mypy maturin ];
+            packages = with pkgs; [ cargo rustc rustfmt clippy rust-analyzer git direnv python313 python313Packages.mypy maturin lld nodejs ];
             PYO3_PYTHON = "${pkgs.python313}/bin/python3";
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
             shellHook = ''

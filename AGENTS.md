@@ -10,8 +10,8 @@ Name crates after their paths: `crates/lib/error` is `covalence-lib-error`, and
 `tools/glu` is `covalence-tools-glu`.
 
 `glu build` must build every configured artifact family: today the Rust
-workspace and the Python wheel. Add new build steps, such as JS, there when
-those packages are introduced. Plain `cargo build` must remain
+workspace, the Python wheel and the JavaScript package. Add new build steps
+there when new packages are introduced. Plain `cargo build` must remain
 usable for the Rust workspace.
 
 Use the shared error and CLI facades. Keep concrete domain errors in their
