@@ -15,6 +15,8 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+## [0.1.0-dev.12] - 2026-11-20
+
 ### Added
 
 - Rust, Python and JavaScript can measure a byte stream's length and compute
@@ -520,7 +522,8 @@ public repository. These notes are based on its published wheel.
   was published.
 
 [GitHub releases]: https://github.com/hiloopai/covalence/releases
-[Unreleased]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.11...HEAD
+[Unreleased]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.12...HEAD
+[0.1.0-dev.12]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.11...v0.1.0-dev.12
 [0.1.0-dev.11]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.10...v0.1.0-dev.11
 [0.1.0-dev.10]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.9...v0.1.0-dev.10
 [0.1.0-dev.9]: https://github.com/hiloopai/covalence/compare/v0.1.0-dev.8...v0.1.0-dev.9

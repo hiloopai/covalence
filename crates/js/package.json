@@ -1,6 +1,6 @@
 {
   "name": "@hiloopai/covalence-js",
-  "version": "0.1.0-dev.11",
+  "version": "0.1.0-dev.12",
   "description": "JavaScript bindings for Covalence content-addressed stores",
   "license": "CC0-1.0 OR MIT OR Apache-2.0",
   "repository": {
