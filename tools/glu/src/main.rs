@@ -54,6 +54,8 @@ enum Error {
     WheelCount { count: usize },
     #[snafu(display("Cargo.lock does not pin one {package} version"))]
     Locked { package: &'static str },
+    #[snafu(display("crates/js/package.json does not give the workspace version {version}"))]
+    PackageVersion { version: &'static str },
     #[snafu(display("{program} failed with {status}"))]
     Failed {
         program: &'static str,
@@ -268,7 +270,20 @@ fn wasm_bindgen() -> Result<PathBuf, Error> {
     Ok(command)
 }
 
+/// Whether `package.json` text gives the workspace version.
+fn gives_workspace_version(manifest: &str) -> bool {
+    manifest.contains(&format!("\"version\": \"{}\"", env!("CARGO_PKG_VERSION")))
+}
+
 fn build_js(release: bool) -> Result<(), Error> {
+    let manifest = root().join("crates/js/package.json");
+    let text = fs::read_to_string(&manifest).context(FilesystemSnafu)?;
+    snafu::ensure!(
+        gives_workspace_version(&text),
+        PackageVersionSnafu {
+            version: env!("CARGO_PKG_VERSION")
+        }
+    );
     let mut args = vec!["build", "--locked", "-p", "covalence-js", "--target", WASM];
     if release {
         args.push("--release");
@@ -294,11 +309,7 @@ fn build_js(release: bool) -> Result<(), Error> {
         ],
         &root(),
     )?;
-    fs::copy(
-        root().join("crates/js/package.json"),
-        package.join("package.json"),
-    )
-    .context(FilesystemSnafu)?;
+    fs::write(package.join("package.json"), text).context(FilesystemSnafu)?;
     Ok(())
 }
 
@@ -498,6 +509,13 @@ mod tests {
     #[test]
     fn command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn the_package_version_is_the_workspace_version() {
+        let manifest = fs::read_to_string(root().join("crates/js/package.json")).unwrap();
+        assert!(gives_workspace_version(&manifest));
+        assert!(!gives_workspace_version(r#"{ "version": "0.0.0" }"#));
     }
 
     #[test]

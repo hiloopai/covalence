@@ -1,4 +1,4 @@
-# covalence-js
+# @hiloopai/covalence-js
 
 JavaScript bindings for Covalence content-addressed stores, compiled to
 WebAssembly with [wasm-bindgen](https://wasm-bindgen.github.io/wasm-bindgen/).
@@ -82,8 +82,8 @@ A host storage over a Cloudflare R2 bucket, which creates objects only if
 absent:
 
 ```js
-import init, { Cas } from "covalence-js";
-import wasm from "covalence-js/covalence_js_bg.wasm";
+import init, { Cas } from "@hiloopai/covalence-js";
+import wasm from "@hiloopai/covalence-js/covalence_js_bg.wasm";
 
 const r2 = (bucket) => ({
   async get(key) {
@@ -120,8 +120,10 @@ try {
 
 ## Build
 
-The package is not published. Build it from a checkout with
-`glu build`, which writes it to `target/glu/js`, or by hand:
+The package is not on npm yet. Each [GitHub release] attaches it as
+`hiloopai-covalence-js-<version>.tgz`, which `npm install` accepts as a
+file or URL. Build it from a checkout with `glu build`, which writes it to
+`target/glu/js`, or by hand:
 
 ```sh
 cargo build --locked --release -p covalence-js --target wasm32-unknown-unknown
@@ -134,3 +136,5 @@ The `wasm-bindgen` command-line tool must be the version of the
 `wasm-bindgen` crate in `Cargo.lock` (`glu` installs that version under
 `target/glu/tools`). The generated JavaScript and WebAssembly are build
 output under `target/`, not committed.
+
+[GitHub release]: https://github.com/hiloopai/covalence/releases

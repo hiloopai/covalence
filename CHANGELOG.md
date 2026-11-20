@@ -30,15 +30,16 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
   derives from it; callers that do not know the CID hash the bytes first or
   have the client declare it.
 
-- `covalence-js`, JavaScript bindings built with wasm-bindgen: a `Cas` over
-  storage the host provides (such as an R2 bucket), with streamed `putFrom`
-  and `getStream` over `ReadableStream`s, a streaming `Verifier` and
-  `Hasher`, and CID helpers. It runs the Rust `KvCas`, so keys, CIDs and
+- `@hiloopai/covalence-js`, JavaScript bindings built with wasm-bindgen: a
+  `Cas` over storage the host provides (such as an R2 bucket), with streamed
+  `putFrom` and `getStream` over `ReadableStream`s, a streaming `Verifier`
+  and `Hasher`, and CID helpers. It runs the Rust `KvCas`, so keys, CIDs and
   checks match the Rust library, and `putFrom` takes BLAKE3 CIDs of any codec
   as the Python `put_from` does. Errors carry a `code` (`invalid`,
   `integrity`, `unsupported`, `store` or `io`) and, where the host or a body
-  threw, that value as their `cause`. `glu build` builds the package; it is
-  not published.
+  threw, that value as their `cause`. `glu build` builds the package, and
+  each GitHub release attaches it as `hiloopai-covalence-js-<version>.tgz`;
+  it is not on npm yet.
 
 - The store traits and `KvCas` build for `wasm32-unknown-unknown`; the
   `zstd` feature also needs a C compiler for that target, such as Clang.

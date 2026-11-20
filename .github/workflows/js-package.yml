@@ -1,0 +1,122 @@
+name: JavaScript package
+
+# A v<version> tag attaches the npm package to that GitHub release, next to
+# the Python wheels (python-wheels.yml) and the crates (crates.yml).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@b85815f71a6de0ddee80b8a80a98d43f4bcc66c7 # v31
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.34.8/install
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      # glu builds the package into target/glu/js and checks that
+      # crates/js/package.json gives the workspace version.
+      - name: Build and test the package
+        run: |
+          nix develop --no-update-lock-file --command ./bin/glu build --release
+          nix develop --no-update-lock-file --command \
+            sh -c 'COVALENCE_JS=target/glu/js node --test crates/js/tests/*.test.mjs'
+      - name: Pack the package
+        run: |
+          mkdir dist
+          nix develop --no-update-lock-file --command npm pack ./target/glu/js --pack-destination dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: js-package
+          path: dist/*.tgz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          sparse-checkout: Cargo.toml
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: js-package
+          path: dist
+      # The tag and the npm version are the workspace's Cargo version.
+      - name: Check the tag and file against the workspace version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(python3 -I -c \
+            'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["workspace"]["package"]["version"])' \
+            Cargo.toml)"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match the workspace version $version"
+            exit 1
+          fi
+          for file in dist/*; do
+            if [ "$(basename "$file")" != "hiloopai-covalence-js-$version.tgz" ]; then
+              echo "::error::$file does not match tag $TAG"
+              exit 1
+            fi
+          done
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      # python-wheels.yml may create the release at the same time; whichever
+      # job loses the race uploads to the release the other created.
+      - name: Attach the package to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          elif ! gh release create "$TAG" dist/* --verify-tag --title "covalence $VERSION" --notes "covalence $VERSION."; then
+            gh release upload "$TAG" dist/* --clobber
+          fi
+
+  # Off until the repository variable NPM_PUBLISH is 'true'. Only
+  # hiloopai/covalence publishes. npm authenticates the upload by trusted
+  # publishing (no token): the @hiloopai/covalence-js package on npmjs.com
+  # must name this repository, this workflow file and the npm environment.
+  npm:
+    if: >-
+      startsWith(github.ref, 'refs/tags/v')
+      && github.repository == 'hiloopai/covalence'
+      && vars.NPM_PUBLISH == 'true'
+    needs: [package, release]
+    # Provenance needs a GitHub-hosted runner.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@hiloopai/covalence-js
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: js-package
+          path: dist
+      # Trusted publishing needs npm 11.5.1 or later; the runner's npm can be
+      # older, and its global prefix is root-owned.
+      - name: Install npm 11.5.1
+        run: sudo npm install --global npm@11.5.1 && npm --version
+      # Every 0.1.0-dev release is the newest, so it takes the latest tag.
+      - name: Publish to npm
+        run: npm publish --provenance --access public --tag latest dist/*.tgz

@@ -94,8 +94,9 @@ Stores:
 Bindings:
 
 - [`crates/python`](crates/python/README.md): the `covalence` Python package.
-- [`crates/js`](crates/js/README.md): a JavaScript package of a CAS over
-  host-provided storage, built with wasm-bindgen. It is not published.
+- [`crates/js`](crates/js/README.md): the `@hiloopai/covalence-js` package, a
+  CAS over host-provided storage built with wasm-bindgen. Releases attach it;
+  it is not on npm yet.
 
 Configuration:
 

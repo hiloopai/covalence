@@ -1,8 +1,13 @@
 {
-  "name": "covalence-js",
-  "private": true,
+  "name": "@hiloopai/covalence-js",
+  "version": "0.1.0-dev.10",
   "description": "JavaScript bindings for Covalence content-addressed stores",
   "license": "CC0-1.0 OR MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hiloopai/covalence.git",
+    "directory": "crates/js"
+  },
   "type": "module",
   "main": "covalence_js.js",
   "types": "covalence_js.d.ts",
@@ -18,5 +23,8 @@
     "covalence_js.d.ts",
     "covalence_js_bg.wasm",
     "covalence_js_bg.wasm.d.ts"
-  ]
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
 }
