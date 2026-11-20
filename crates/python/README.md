@@ -259,12 +259,12 @@ True
 - `Cas.put_file(path)` stores a file and returns its raw BLAKE3 `Cid`, as
   `put` does.
 - `Cas.put_from(cid, chunks, length)` stores a block from an iterable of
-  bytes, such as a request body, and returns its raw BLAKE3 `Cid`. Before a
-  new block is stored, its bytes must match `length` and the BLAKE3 `cid`,
-  and `chunks` must end there. A store may return an existing block without
-  consuming all the input; unread bytes and source errors are not checked.
-  While consuming input, a hash mismatch (`IntegrityError`), too few or too
-  many bytes (`ValueError`), or a source exception publish no new block.
+  bytes, such as a request body, and returns its raw BLAKE3 `Cid`. It reads
+  and checks every byte, even if the block already exists, so success shows
+  the caller had the bytes, not only the CID. Its bytes must match `length`
+  and the BLAKE3 `cid`, and `chunks` must end there. A hash mismatch
+  (`IntegrityError`), too few or too many bytes (`ValueError`), or a source
+  exception publish no new block.
   Source exceptions propagate unchanged unless cleanup also fails, in which
   case `StoreError` reports that failure with the source as its `__cause__`.
 - `Cas.get_file(cid, path)` writes the block to a file and returns its

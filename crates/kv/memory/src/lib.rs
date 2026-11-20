@@ -1,7 +1,8 @@
 //! An in-memory key-value store.
 //!
 //! [`MemoryKv`] keeps values in an ordered map in memory. It accepts every
-//! key, including the empty one, and its async methods return ready futures.
+//! key, including the empty one, and its async methods return ready futures,
+//! except that [`Kv::aput_new_from`] waits for its stream.
 //!
 //! ```
 //! use covalence_kv_memory::MemoryKv;
@@ -19,15 +20,25 @@
 
 use std::{
     collections::BTreeMap,
+    future::poll_fn,
     io::{self, Read},
+    pin::Pin,
     sync::RwLock,
+    task::{Context, Poll},
 };
 
 use covalence_kv_trait::{Error, Kv, KvFuture, ready};
 use covalence_lib_dasl::Value;
-use covalence_lib_data::Bytes;
+use covalence_lib_data::{ByteStream, Bytes, BytesMut, Stream};
+
+/// The largest chunk [`Kv::aget_stream`] yields.
+const CHUNK: usize = 64 << 10;
 
 /// An in-memory store. It accepts every key, and [`Kv::put_new`] is atomic.
+///
+/// [`Kv::aput_new_from`] reads the whole stream into memory before it stores
+/// it, and [`Kv::aget_stream`] yields slices of the stored value of at most
+/// 64 KiB, without copying it.
 ///
 /// [`Kv::info`] is `{"name": "memory"}`, and [`Kv::stats`] counts `keys` and
 /// the `bytes` of their values.
@@ -81,6 +92,48 @@ impl Kv for MemoryKv {
         ready(self.put_new(key, value))
     }
 
+    fn aput_new_from<'a>(
+        &'a self,
+        key: &'a [u8],
+        mut stream: ByteStream<'static>,
+        len: u64,
+    ) -> KvFuture<'a, bool> {
+        Box::pin(async move {
+            let mut value = BytesMut::new();
+            while let Some(chunk) = poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+                let chunk = chunk.map_err(|source| Error::Io { source })?;
+                if chunk.len() as u64 > len - value.len() as u64 {
+                    return Err(Error::Io {
+                        source: io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "stream is longer than its length",
+                        ),
+                    });
+                }
+                value.extend_from_slice(&chunk);
+            }
+            if (value.len() as u64) < len {
+                return Err(Error::Io {
+                    source: io::ErrorKind::UnexpectedEof.into(),
+                });
+            }
+            self.put_new(key, value.freeze())
+        })
+    }
+
+    fn aget_stream<'a>(
+        &'a self,
+        key: &'a [u8],
+    ) -> KvFuture<'a, Option<(u64, ByteStream<'static>)>> {
+        ready(self.get(key).map(|value| {
+            value.map(|value| {
+                let len = value.len() as u64;
+                let chunks: ByteStream<'static> = Box::pin(Chunks(value));
+                (len, chunks)
+            })
+        }))
+    }
+
     fn exists(&self, key: &[u8]) -> Result<bool, Error> {
         Ok(self.0.read().unwrap().contains_key(key))
     }
@@ -103,5 +156,21 @@ impl Kv for MemoryKv {
             ("keys".into(), Value::Integer(map.len() as i64)),
             ("bytes".into(), Value::Integer(bytes as i64)),
         ])))
+    }
+}
+
+/// The rest of a value, yielded in chunks of at most `CHUNK` bytes.
+struct Chunks(Bytes);
+
+impl Stream for Chunks {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let rest = &mut self.get_mut().0;
+        if rest.is_empty() {
+            return Poll::Ready(None);
+        }
+        let chunk = rest.split_to(rest.len().min(CHUNK));
+        Poll::Ready(Some(Ok(chunk)))
     }
 }

@@ -459,9 +459,12 @@ fn writes_require_atomic_create_support_with_or_without_compression() {
                 .unwrap_err(),
         ] {
             assert!(
-                matches!(&error, Error::Backend { source }
-                    if matches!(source.downcast_ref::<covalence_kv_trait::Error>(),
-                        Some(covalence_kv_trait::Error::Unsupported { op: Op::PutNew }))),
+                matches!(
+                    &error,
+                    Error::Unsupported {
+                        op: covalence_cas_trait::Op::Put
+                    }
+                ),
                 "{error}"
             );
         }

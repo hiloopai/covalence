@@ -1,10 +1,11 @@
 use std::{
-    io::Read,
+    io::{self, Read},
+    pin::Pin,
     task::{Context, Poll, Waker},
 };
 
 use covalence_kv_trait::{Error, Kv, KvFuture, Op};
-use covalence_lib_data::Bytes;
+use covalence_lib_data::{Bytes, Stream};
 
 /// Ordinary operations must never be used to imitate an atomic write.
 struct Ordinary;
@@ -32,6 +33,16 @@ impl Read for Unread {
     }
 }
 
+struct Unpolled;
+
+impl Stream for Unpolled {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        panic!("unsupported write must not poll its stream")
+    }
+}
+
 #[test]
 fn atomic_defaults_are_unsupported_without_side_effects() {
     let store = Ordinary.into_dyn();
@@ -48,5 +59,21 @@ fn atomic_defaults_are_unsupported_without_side_effects() {
     assert!(matches!(
         future.as_mut().poll(&mut context),
         Poll::Ready(Err(Error::Unsupported { op: Op::PutNew }))
+    ));
+}
+
+#[test]
+fn stream_defaults_are_unsupported_without_side_effects() {
+    let store = Ordinary.into_dyn();
+    let mut context = Context::from_waker(Waker::noop());
+    let mut put = store.aput_new_from(b"key", Box::pin(Unpolled), 5);
+    assert!(matches!(
+        put.as_mut().poll(&mut context),
+        Poll::Ready(Err(Error::Unsupported { op: Op::PutNew }))
+    ));
+    let mut get = store.aget_stream(b"key");
+    assert!(matches!(
+        get.as_mut().poll(&mut context),
+        Poll::Ready(Err(Error::Unsupported { op: Op::Get }))
     ));
 }

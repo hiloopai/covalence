@@ -45,6 +45,7 @@ mod brotli;
 mod deflate;
 #[cfg(feature = "deflate")]
 mod gzip;
+mod stream;
 #[cfg(feature = "zstd")]
 mod zstd;
 
@@ -60,9 +61,10 @@ use covalence_cas_trait::{
 use covalence_kv_trait::Kv;
 use covalence_lib_cid::{Blake3, Cid};
 use covalence_lib_dasl::Value;
-use covalence_lib_data::Bytes;
+use covalence_lib_data::{ByteStream, Bytes};
 use covalence_lib_error::snafu::Snafu;
 use data_encoding::BASE32_NOPAD;
+use stream::{Checked, Lent};
 
 /// The stored representation of a block: identity by default.
 #[derive(Clone, Debug, Default)]
@@ -259,25 +261,40 @@ impl Compression {
 ///   are not checked.
 /// - `has` asks the key-value store whether the key exists, without reading
 ///   the bytes.
-/// - `put`, `aput` and `put_from` never replace a block: they store through
-///   the key-value store's [`Kv::put_new`], [`Kv::aput_new`] and
-///   [`Kv::put_new_from`], so concurrent writers of one block race safely.
-///   Writes fail if the backend does not implement atomic create-only writes.
+/// - `put`, `aput`, `put_from` and `aput_from` never replace a block: they
+///   store through the key-value store's [`Kv::put_new`], [`Kv::aput_new`],
+///   [`Kv::put_new_from`] and [`Kv::aput_new_from`], so concurrent writers of
+///   one block race safely. Writes fail with [`Error::Unsupported`] if the
+///   backend does not implement atomic create-only writes.
+/// - `put_from` and `aput_from` read and check every byte, even if the block
+///   already exists, so success shows the caller had the bytes, not only the
+///   CID. A mismatch fails with [`Error::Check`]. Too few bytes, a failing
+///   source or, for `aput_from`, a stream that goes on past `len` bytes fail
+///   with [`Error::Io`]. Either way nothing is stored.
+/// - The key is derived from the CID, so `put_from` and `aput_from` need the
+///   CID before the first byte; they never stage or buffer a block to
+///   compute it.
 /// - Compression keeps CIDs of the uncompressed bytes. Streaming writes
 ///   finish and check a compressed temporary file before publishing it;
 ///   streamed reads decode and hash the bytes as they pass. Sizes and ranges
 ///   scan the complete frame, retaining only the requested output. Async
-///   reads fetch the encoded value whole, as the key-value trait requires.
+///   reads fetch the encoded value whole, and `aput_from` and `aget_stream`
+///   return [`Error::Unsupported`] without reading the stream or the
+///   backend.
 /// - Without compression, `put_from` and `get_to` stream through the
-///   key-value store's `put_new_from` and `get_to`, hashing the bytes as they
-///   pass.
-///   If the backend skips an existing block, `put_from` returns without
-///   consuming or checking any remaining input.
-/// - Without compression, if the bytes `put_from` reads do not hash to the
-///   CID, the read that would hand over the last byte fails instead. The
-///   key-value store's `put_new_from` then fails, storing nothing, and
-///   `put_from` fails with [`Error::Check`]; or with [`Error::Backend`] if the
-///   key-value store reports a further failure, such as failing to clean up.
+///   key-value store's [`Kv::put_new_from`] and [`Kv::get_to`], and
+///   `aput_from` and `aget_stream` through [`Kv::aput_new_from`] and
+///   [`Kv::aget_stream`], checking the bytes as they pass. The last byte, or
+///   chunk, is held back until the bytes match the CID, the length is exact
+///   and, for streams, the source has ended, so the key-value store never
+///   completes a write of other bytes and a corrupt block fails in place of
+///   its last chunk.
+/// - If a write's bytes do not match and the key-value store reports a
+///   further failure, such as failing to clean up, the write fails with
+///   [`Error::Backend`] rather than [`Error::Check`].
+/// - The key-value store's own errors are [`Error::Backend`], except that its
+///   I/O errors are [`Error::Io`] and its unsupported operations
+///   [`Error::Unsupported`].
 /// - [`Cas::info`] is `{"name": "kv", "prefix": <prefix>, "kv": <the
 ///   key-value store's info>}`, with `compression` and `level` fields when
 ///   compressed; [`Cas::stats`] is the key-value store's.
@@ -291,8 +308,7 @@ impl Compression {
 /// a client that may not list the bucket.
 ///
 /// For uncompressed blocks, S3 may consume the source before discovering that
-/// a block already exists. Once the backend skips insertion, `put_from`
-/// leaves any remaining input unread.
+/// a block already exists. `put_from` then reads and checks the rest.
 pub struct KvCas {
     kv: Arc<dyn Kv>,
     prefix: String,
@@ -413,9 +429,16 @@ fn io_error(source: io::Error) -> Error {
     Error::Io { source }
 }
 
+/// A key-value store error as this store's: I/O errors stay I/O errors and
+/// unsupported operations stay unsupported, for the same kind of operation.
 fn backend(error: covalence_kv_trait::Error) -> Error {
+    use covalence_kv_trait::{Error as KvError, Op as KvOp};
     match error {
-        covalence_kv_trait::Error::Io { source } => Error::Io { source },
+        KvError::Io { source } => Error::Io { source },
+        KvError::Unsupported { op: KvOp::Get } => Op::Get.unsupported(),
+        KvError::Unsupported {
+            op: KvOp::Put | KvOp::PutNew,
+        } => Op::Put.unsupported(),
         error => Error::Backend {
             source: Box::new(error),
         },
@@ -751,7 +774,20 @@ impl Cas for KvCas {
         let mut checked = VerifyingReader::new(reader, expected(&cid, len));
         let key = self.key(&cid);
         match self.kv.put_new_from(key.as_bytes(), &mut checked, len) {
-            Ok(_) => Ok(cid.into()),
+            Ok(true) => Ok(cid.into()),
+            // A store that finds the block may stop reading. Read and check
+            // the rest anyway, so that success shows the caller had the bytes
+            // rather than only their CID.
+            Ok(false) => match io::copy(&mut checked, &mut io::sink()) {
+                Ok(_) if checked.verified().is_some() => Ok(cid.into()),
+                Ok(_) => Err(Error::Io {
+                    source: io::ErrorKind::UnexpectedEof.into(),
+                }),
+                Err(_) if matches!(checked.error(), Some(VerifyError::Mismatch { .. })) => {
+                    Err(corrupt())
+                }
+                Err(source) => Err(Error::Io { source }),
+            },
             // The store failed as asked; a store error beyond that, such as a
             // failed cleanup, is the one to report.
             Err(covalence_kv_trait::Error::Io { .. })
@@ -769,5 +805,81 @@ impl Cas for KvCas {
             return Ok(None);
         };
         self.read_to(&cid, writer, true)
+    }
+
+    fn aput_from<'a>(
+        &'a self,
+        cid: Blake3,
+        stream: ByteStream<'static>,
+        len: u64,
+    ) -> CasFuture<'a, Cid> {
+        Box::pin(async move {
+            if !self.compression.is_identity() {
+                return Err(Op::Put.unsupported());
+            }
+            // The last chunk is withheld unless the bytes match, so the store
+            // never completes a write of other bytes.
+            let mut checked = Checked::new(stream, expected(&cid, len));
+            // A store may commit an empty value without reading the stream,
+            // so check that it is empty and ends first.
+            if len == 0 {
+                checked
+                    .finish()
+                    .await
+                    .map_err(|source| match checked.failure() {
+                        Some(VerifyError::Mismatch { .. }) => corrupt(),
+                        _ => Error::Io { source },
+                    })?;
+            }
+            let lent = Lent::new(checked);
+            let key = self.key(&cid);
+            let result = self
+                .kv
+                .aput_new_from(key.as_bytes(), Box::pin(lent.clone()), len)
+                .await;
+            // The store is done with the stream, even if it still holds it.
+            let mut checked = lent.take().expect("only this write takes the stream back");
+            match result {
+                // A store that finds the block may stop reading. Read and
+                // check the rest anyway, so that success shows the caller had
+                // the bytes rather than only their CID.
+                Ok(_) => match checked.finish().await {
+                    Ok(()) => Ok(cid.into()),
+                    Err(_) if matches!(checked.failure(), Some(VerifyError::Mismatch { .. })) => {
+                        Err(corrupt())
+                    }
+                    Err(source) => Err(Error::Io { source }),
+                },
+                // As `put_from`: the store failed as asked, unless it reports
+                // a further failure.
+                Err(covalence_kv_trait::Error::Io { .. })
+                    if matches!(checked.failure(), Some(VerifyError::Mismatch { .. })) =>
+                {
+                    Err(corrupt())
+                }
+                Err(error) => Err(backend(error)),
+            }
+        })
+    }
+
+    fn aget_stream<'a>(
+        &'a self,
+        key: &'a Cid,
+    ) -> CasFuture<'a, Option<(u64, ByteStream<'static>)>> {
+        Box::pin(async move {
+            if !self.compression.is_identity() {
+                return Err(Op::Get.unsupported());
+            }
+            let Some(cid) = key.raw_blake3() else {
+                return Ok(None);
+            };
+            let key = self.key(&cid);
+            let found = self.kv.aget_stream(key.as_bytes()).await;
+            let Some((len, stream)) = found.map_err(backend)? else {
+                return Ok(None);
+            };
+            let checked: ByteStream<'static> = Box::pin(Checked::new(stream, expected(&cid, len)));
+            Ok(Some((len, checked)))
+        })
     }
 }

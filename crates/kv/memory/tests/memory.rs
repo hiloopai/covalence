@@ -1,8 +1,16 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    future::poll_fn,
+    io,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use covalence_kv_memory::MemoryKv;
 use covalence_kv_trait::{Error, Kv};
 use covalence_lib_dasl::Value;
+use covalence_lib_data::{ByteStream, Bytes, Stream};
 use pollster::block_on;
 
 fn map<const N: usize>(entries: [(&str, Value); N]) -> Value {
@@ -114,5 +122,104 @@ fn info_and_stats() -> Result<(), Error> {
     assert_eq!(store.stats()?, stats);
     let info = map([("name", Value::String("memory".into()))]);
     assert_eq!(store.info()?, info);
+    Ok(())
+}
+
+/// A stream of the given chunks and errors.
+struct Parts(VecDeque<io::Result<Bytes>>);
+
+impl Stream for Parts {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.get_mut().0.pop_front())
+    }
+}
+
+fn parts<const N: usize>(parts: [io::Result<&'static str>; N]) -> ByteStream<'static> {
+    Box::pin(Parts(
+        parts
+            .into_iter()
+            .map(|part| part.map(Bytes::from))
+            .collect(),
+    ))
+}
+
+/// A streamed value goes only under a free key, and only if the stream
+/// succeeds with exactly the length given.
+#[test]
+fn streamed_values_are_new_and_exact() -> Result<(), Error> {
+    let store = store();
+    assert!(block_on(store.aput_new_from(
+        b"a",
+        parts([Ok("he"), Ok(""), Ok("llo")]),
+        5
+    ))?);
+    assert_eq!(store.get(b"a")?.unwrap(), "hello");
+    assert!(!block_on(store.aput_new_from(
+        b"a",
+        parts([Ok("world")]),
+        5
+    ))?);
+    assert_eq!(store.get(b"a")?.unwrap(), "hello");
+    let failing = [
+        (parts([Ok("hel")]), io::ErrorKind::UnexpectedEof),
+        (parts([Ok("hello!")]), io::ErrorKind::InvalidData),
+        (parts([Ok("hello"), Ok("!")]), io::ErrorKind::InvalidData),
+        (
+            parts([Ok("he"), Err(io::Error::other("source aborted"))]),
+            io::ErrorKind::Other,
+        ),
+    ];
+    for (stream, kind) in failing {
+        let error = block_on(store.aput_new_from(b"b", stream, 5)).unwrap_err();
+        let Error::Io { source } = &error else {
+            panic!("{error}")
+        };
+        assert_eq!(source.kind(), kind, "{error}");
+        assert!(!store.exists(b"b")?);
+    }
+    let error =
+        block_on(store.aput_new_from(b"b", parts([Err(io::Error::other("source aborted"))]), 5))
+            .unwrap_err();
+    assert_eq!(error.to_string(), "source aborted");
+    Ok(())
+}
+
+/// An empty value streams in and out like any other, and a stream for an
+/// empty value must be empty.
+#[test]
+fn empty_streamed_values_round_trip() -> Result<(), Error> {
+    let store = store();
+    let error = block_on(store.aput_new_from(b"e", parts([Ok("x")]), 0)).unwrap_err();
+    assert!(
+        matches!(&error, Error::Io { source } if source.kind() == io::ErrorKind::InvalidData),
+        "{error}"
+    );
+    assert!(!store.exists(b"e")?);
+    assert!(block_on(store.aput_new_from(b"e", parts([]), 0))?);
+    assert_eq!(store.get(b"e")?.unwrap(), "");
+    let (len, mut stream) = block_on(store.aget_stream(b"e"))?.unwrap();
+    assert_eq!(len, 0);
+    assert!(block_on(poll_fn(|cx| stream.as_mut().poll_next(cx))).is_none());
+    Ok(())
+}
+
+/// Streamed reads yield the stored value in slices of at most 64 KiB.
+#[test]
+fn streamed_reads_yield_chunks() -> Result<(), Error> {
+    let store = store();
+    let value: Bytes = (0..200_000u32).map(|i| i as u8).collect::<Vec<_>>().into();
+    store.put(b"big", value.clone())?;
+    let (len, mut stream) = block_on(store.aget_stream(b"big"))?.unwrap();
+    assert_eq!(len, 200_000);
+    let mut chunks = Vec::new();
+    while let Some(chunk) = block_on(poll_fn(|cx| stream.as_mut().poll_next(cx))) {
+        chunks.push(chunk.unwrap());
+    }
+    let sizes: Vec<_> = chunks.iter().map(Bytes::len).collect();
+    assert_eq!(sizes, [65_536, 65_536, 65_536, 3_392]);
+    assert_eq!(chunks.concat(), value);
+    assert!(block_on(store.aget_stream(b"missing"))?.is_none());
     Ok(())
 }

@@ -1,15 +1,18 @@
 use std::{
     collections::HashMap,
+    io,
+    pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, RwLock},
+    task::{Context, Poll, Waker},
 };
 
 use covalence_cas_trait::{
-    AsyncGet, AsyncGetExt, AsyncPut, Cas, CasFuture, Error, Get, GetExt, Put, ready,
+    AsyncGet, AsyncGetExt, AsyncPut, Cas, CasFuture, Error, Get, GetExt, Op, Put, ready,
 };
 use covalence_lib_cid::{Blake3, Cid, Fact, Format};
 use covalence_lib_dasl::Value;
-use covalence_lib_data::Bytes;
+use covalence_lib_data::{Bytes, Stream};
 use pollster::block_on;
 
 fn key(bytes: &[u8]) -> Cid {
@@ -47,6 +50,64 @@ impl AsyncPut for Map {
 }
 
 impl Cas for Map {}
+
+struct Unpolled;
+
+impl Stream for Unpolled {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        panic!("unsupported write must not poll its stream")
+    }
+}
+
+/// A store that panics if any of its methods runs.
+struct Untouched;
+
+impl Get for Untouched {
+    fn get_unchecked(&self, _: &Cid) -> Result<Option<Bytes>, Error> {
+        panic!("the store was read")
+    }
+}
+
+impl AsyncGet for Untouched {
+    fn aget_unchecked<'a>(&'a self, _: &'a Cid) -> CasFuture<'a, Option<Bytes>> {
+        panic!("the store was read")
+    }
+}
+
+impl Put for Untouched {
+    fn put(&self, _: Bytes) -> Result<Cid, Error> {
+        panic!("the store was written")
+    }
+}
+
+impl AsyncPut for Untouched {
+    fn aput(&self, _: Bytes) -> CasFuture<'_, Cid> {
+        panic!("the store was written")
+    }
+}
+
+impl Cas for Untouched {}
+
+/// Async streaming has no in-memory default: it is unsupported, also through
+/// `Arc<dyn Cas>`, and neither the store nor the stream is touched.
+#[test]
+fn default_async_streams_are_unsupported_without_touching_store_or_stream() {
+    let store = Untouched.into_dyn();
+    let cid: Cid = Blake3::of(b"hello").into();
+    let mut context = Context::from_waker(Waker::noop());
+    let mut put = store.aput_from(Blake3::of(b"hello"), Box::pin(Unpolled), 5);
+    assert!(matches!(
+        put.as_mut().poll(&mut context),
+        Poll::Ready(Err(Error::Unsupported { op: Op::Put }))
+    ));
+    let mut get = store.aget_stream(&cid);
+    assert!(matches!(
+        get.as_mut().poll(&mut context),
+        Poll::Ready(Err(Error::Unsupported { op: Op::Get }))
+    ));
+}
 
 /// A store that returns the same fact for every key.
 struct Liar(Fact);

@@ -46,7 +46,14 @@
 //!
 //! [`Cas::put_from`] and [`Cas::get_to`] move a block between the store and a
 //! reader or writer, checked; by default they hold it in memory, and stores
-//! that can stream override them.
+//! that can stream override them. Readers and writers block, so their async
+//! counterparts, [`Cas::aput_from`] and [`Cas::aget_stream`], move a
+//! [`ByteStream`] of chunks instead; by default they return
+//! [`Error::Unsupported`] rather than hold the block in memory.
+//!
+//! Futures and streams are `Send`, and stores `Send` and `Sync`, except on
+//! `wasm32`, where stores backed by JavaScript are neither (see
+//! [`MaybeSend`]).
 //!
 //! A store needs only `get_unchecked`, `aget_unchecked`, `put` and `aput`;
 //! the defaults supply the rest. Here a store answers with corrupted bytes:
@@ -110,17 +117,22 @@ use std::{
 
 use covalence_lib_cid::{Blake3, Cid, CidFormat, Claim, Fact};
 use covalence_lib_dasl::Value;
-use covalence_lib_data::Bytes;
+use covalence_lib_data::{ByteStream, Bytes, MaybeSend, MaybeSync};
 use covalence_lib_error::{
     BoxError,
     snafu::{Snafu, ensure},
 };
 
-/// The future an async store method returns.
+/// The future an async store method returns: `Send`, except on `wasm32`.
+#[cfg(not(target_arch = "wasm32"))]
 pub type CasFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
 
+/// The future an async store method returns: `Send`, except on `wasm32`.
+#[cfg(target_arch = "wasm32")]
+pub type CasFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + 'a>>;
+
 /// A [`CasFuture`] already holding `result`.
-pub fn ready<'a, T: Send + 'a>(result: Result<T, Error>) -> CasFuture<'a, T> {
+pub fn ready<'a, T: MaybeSend + 'a>(result: Result<T, Error>) -> CasFuture<'a, T> {
     Box::pin(std::future::ready(result))
 }
 
@@ -132,7 +144,7 @@ pub fn map<const N: usize>(entries: [(&str, Value); N]) -> Value {
 }
 
 /// A key stores can be asked for.
-pub trait Key: Claim<Error = covalence_lib_cid::Error> + Clone + Send + Sync {
+pub trait Key: Claim<Error = covalence_lib_cid::Error> + Clone + MaybeSend + MaybeSync {
     /// Whether a fact for `self` also proves `key` (for CIDs: the same hash
     /// and digest).
     fn same_multihash(&self, key: &Self) -> bool;
@@ -146,7 +158,7 @@ pub trait Key: Claim<Error = covalence_lib_cid::Error> + Clone + Send + Sync {
 /// same ones, and relabelling only changes the codec.
 impl<S: CidFormat> Key for Cid<S>
 where
-    Self: Send + Sync,
+    Self: MaybeSend + MaybeSync,
 {
     fn same_multihash(&self, key: &Self) -> bool {
         Cid::same_multihash(self, key)
@@ -205,7 +217,7 @@ pub trait Get<K: Key = Cid> {
 }
 
 /// Reads, async.
-pub trait AsyncGet<K: Key = Cid>: Send + Sync {
+pub trait AsyncGet<K: Key = Cid>: MaybeSend + MaybeSync {
     /// The bytes under `key`, or `None` if missing. Not checked.
     fn aget_unchecked<'a>(&'a self, key: &'a K) -> CasFuture<'a, Option<Bytes>>;
 
@@ -286,7 +298,7 @@ pub trait Put<K = Cid> {
 }
 
 /// Writes, async.
-pub trait AsyncPut<K = Cid>: Send + Sync {
+pub trait AsyncPut<K = Cid>: MaybeSend + MaybeSync {
     /// Store `bytes` and return their key.
     fn aput(&self, bytes: Bytes) -> CasFuture<'_, K>;
 
@@ -359,12 +371,19 @@ pub trait Cas: Get + Put + AsyncGet + AsyncPut {
     /// Store the next `len` bytes of `reader`, whose raw BLAKE3 CID is `cid`,
     /// and return the key [`Put::put_fact`] would.
     ///
-    /// - A store may return an existing block without consuming all of
-    ///   `reader`; unread bytes are not checked.
-    /// - Otherwise, reads exactly `len` bytes and no further. Stores nothing
-    ///   and fails with [`Error::Check`] if the bytes have another CID, or
-    ///   with [`Error::Io`] if `reader` fails or ends early.
+    /// - Reads and checks every byte, even if the block already exists, so
+    ///   success shows the caller had the bytes, not only the CID.
+    /// - Reads exactly `len` bytes and no further. Stores nothing and fails
+    ///   with [`Error::Check`] if the bytes have another CID, or with
+    ///   [`Error::Io`] if `reader` fails or ends early.
     /// - Reads into memory by default; stores that can stream override it.
+    ///
+    /// The CID comes first because a store may derive where it writes from
+    /// it before the first byte arrives, as `KvCas` derives its key. A caller
+    /// that does not know the CID must learn it before calling: from a client
+    /// that declares it, which this method then checks, or by hashing the
+    /// bytes in an earlier pass over them. This method does not compute an
+    /// unknown CID.
     fn put_from(&self, cid: Blake3, reader: &mut dyn Read, len: u64) -> Result<Cid, Error> {
         let mut bytes = Vec::new();
         let read = reader
@@ -393,6 +412,51 @@ pub trait Cas: Get + Put + AsyncGet + AsyncPut {
             .write_all(fact.bytes())
             .map_err(|source| Error::Io { source })?;
         Ok(Some(fact.bytes().len() as u64))
+    }
+
+    /// As [`Cas::put_from`], async: store the `len` bytes of `stream`, whose
+    /// raw BLAKE3 CID is `cid`, and return the key [`Put::put_fact`] would.
+    ///
+    /// - Reads and checks every byte, even if the block already exists, so
+    ///   success shows the caller had the bytes, not only the CID.
+    /// - Reads `stream` to its end. Stores nothing and fails with
+    ///   [`Error::Check`] if the bytes have another CID, or with
+    ///   [`Error::Io`], carrying the stream's own error where it gave one, if
+    ///   `stream` fails or does not yield exactly `len` bytes.
+    /// - The CID comes first, as for [`Cas::put_from`].
+    ///
+    /// The default returns [`Error::Unsupported`] without reading `stream`;
+    /// stores that can stream override it.
+    fn aput_from<'a>(
+        &'a self,
+        _cid: Blake3,
+        _stream: ByteStream<'static>,
+        _len: u64,
+    ) -> CasFuture<'a, Cid> {
+        ready(Err(Op::Put.unsupported()))
+    }
+
+    /// The length of the block under `key` and a stream of its bytes, checked
+    /// as [`GetExt::get_fact`] checks them, or `None` if missing.
+    ///
+    /// - The stream yields the block in chunks, but holds back the last one
+    ///   until every byte has arrived, the source has ended and the bytes
+    ///   match `key`.
+    /// - If they do not, the stream yields an error of kind
+    ///   [`io::ErrorKind::InvalidData`] in place of the last chunk (the only
+    ///   item, for an empty block), or one of
+    ///   kind [`io::ErrorKind::UnexpectedEof`] if the source ended early,
+    ///   and then ends. A failure of the store also ends it with an error.
+    ///   After an error, discard the chunks it yielded before.
+    ///
+    /// The default returns [`Error::Unsupported`] without reading the store,
+    /// rather than holding the block in memory; stores that can stream
+    /// override it.
+    fn aget_stream<'a>(
+        &'a self,
+        _key: &'a Cid,
+    ) -> CasFuture<'a, Option<(u64, ByteStream<'static>)>> {
+        ready(Err(Op::Get.unsupported()))
     }
 
     /// This store as an `Arc<dyn Cas>`: wrapped in a new `Arc`, except that an
@@ -528,6 +592,20 @@ impl Cas for Arc<dyn Cas> {
     fn get_to(&self, key: &Cid, writer: &mut dyn Write) -> Result<Option<u64>, Error> {
         (**self).get_to(key, writer)
     }
+    fn aput_from<'a>(
+        &'a self,
+        cid: Blake3,
+        stream: ByteStream<'static>,
+        len: u64,
+    ) -> CasFuture<'a, Cid> {
+        (**self).aput_from(cid, stream, len)
+    }
+    fn aget_stream<'a>(
+        &'a self,
+        key: &'a Cid,
+    ) -> CasFuture<'a, Option<(u64, ByteStream<'static>)>> {
+        (**self).aget_stream(key)
+    }
     fn into_dyn(self) -> Arc<dyn Cas> {
         self
     }
@@ -578,8 +656,9 @@ pub enum Error {
         /// The store's own error.
         source: BoxError,
     },
-    /// The reader [`Cas::put_from`] reads or the writer [`Cas::get_to`]
-    /// writes failed, or the reader ended early.
+    /// The reader [`Cas::put_from`] reads, the writer [`Cas::get_to`] writes
+    /// or the stream [`Cas::aput_from`] reads failed, or the reader or stream
+    /// had the wrong length.
     #[snafu(display("{source}"))]
     Io {
         /// The I/O error.

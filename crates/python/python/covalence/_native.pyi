@@ -523,13 +523,13 @@ class Cas:
 
         - `cid` must be a BLAKE3 CID of any codec; another hash raises
           ValueError.
-        - `chunks` yields bytes or bytearray. Before a new block is stored,
-          its bytes must match `length` and `cid`, and the iterable must end there.
-        - A store may return an existing block without consuming all of
-          `chunks`. Unread bytes and source errors are not checked.
-        - While consuming input, a hash mismatch raises IntegrityError; too
-          few or too many bytes raises ValueError; a source exception propagates
-          unchanged. These failures publish no new block.
+        - Reads and checks every byte, even if the block already exists, so
+          success shows the caller had the bytes, not only the CID.
+        - `chunks` yields bytes or bytearray. Its bytes must match `length` and
+          `cid`, and the iterable must end there.
+        - A hash mismatch raises IntegrityError; too few or too many bytes
+          raises ValueError; a source exception propagates unchanged. These
+          failures publish no new block.
           If cleanup also fails, raises StoreError with the source exception
           as its `__cause__` and the cleanup failure in its message.
         - `Cas.kv` over `Kv.s3` streams the bytes up in parts, holding about as

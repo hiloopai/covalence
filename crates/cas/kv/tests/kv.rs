@@ -6,7 +6,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use covalence_cas_kv::{Compression, KvCas};
+use covalence_cas_kv::KvCas;
 use covalence_cas_trait::{AsyncGet, AsyncGetExt, AsyncPut, Cas, Error, Get, GetExt, Put};
 use covalence_kv_memory::MemoryKv;
 use covalence_kv_s3::{Credentials, S3Kv};
@@ -118,26 +118,40 @@ impl Kv for Blind {
     }
 }
 
-/// An existing block may succeed with invalid or failing input left unread.
+/// `put_from` reads and checks the whole input even when the store finds the
+/// block after reading none or part of it: correct bytes succeed, and other,
+/// too few or failing bytes fail, leaving the block as it was.
 #[test]
-fn existing_blocks_leave_unused_stream_bytes_unchecked() {
+fn existing_blocks_still_check_the_whole_input() {
     for consumed in [0, 2] {
-        for compression in [Compression::default(), Compression::identity()] {
-            // A backend may skip immediately or after reading part of the source.
-            let store = KvCas::new(Blind(MemoryKv::default(), consumed).into_dyn())
-                .with_compression(compression);
-            let cid: Cid = store.put("hello".into()).unwrap();
-            let claim = Blake3::of(b"hello");
-            for data in [&b"wrong"[..], &b"bad"[..]] {
-                let mut source = std::io::Cursor::new(data);
-                assert_eq!(store.put_from(claim, &mut source, 5).unwrap(), cid);
-                assert_eq!(source.position(), consumed as u64);
-            }
-            // An error beyond the consumed prefix must not be observed either.
-            let mut source = std::io::Read::chain(std::io::Cursor::new(b"he"), FailingReader);
-            assert_eq!(store.put_from(claim, &mut source, 5).unwrap(), cid);
-            assert_eq!(source.get_ref().0.position(), consumed as u64);
+        // A backend may skip immediately or after reading part of the source.
+        let kv = Arc::new(Blind(MemoryKv::default(), consumed));
+        let store = KvCas::new(kv.clone());
+        let cid: Cid = store.put("hello".into()).unwrap();
+        let claim = Blake3::of(b"hello");
+        let mut source = std::io::Cursor::new(b"hello tail");
+        assert_eq!(store.put_from(claim, &mut source, 5).unwrap(), cid);
+        assert_eq!(source.position(), 5);
+        for data in [&b"wrong"[..], &b"jello"[..]] {
+            let error = store
+                .put_from(claim, &mut std::io::Cursor::new(data), 5)
+                .unwrap_err();
+            assert!(matches!(error, Error::Check { .. }), "{error}");
         }
+        let error = store
+            .put_from(claim, &mut std::io::Cursor::new(b"hell"), 5)
+            .unwrap_err();
+        let Error::Io { source } = &error else {
+            panic!("{error}")
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
+        let mut source = std::io::Read::chain(std::io::Cursor::new(b"he"), FailingReader);
+        let error = store.put_from(claim, &mut source, 5).unwrap_err();
+        assert!(
+            matches!(&error, Error::Io { source } if source.to_string() == "source failed"),
+            "{error}"
+        );
+        assert_eq!(kv.0.get(HELLO.as_bytes()).unwrap().unwrap(), "hello");
     }
 }
 

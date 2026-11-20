@@ -10,13 +10,22 @@
 //!   `&dyn Kv`) rather than being generic; [`Kv::into_dyn`] makes one.
 //! - [`Kv::size`] and [`Kv::get_range`] fetch the whole value and measure or
 //!   slice it by default; stores with native ranges override them.
-//! - [`Kv::put_from`] and [`Kv::get_to`] move a value between the store and a
-//!   reader or writer. By default they hold it in memory; stores that can
-//!   stream override them. They have no async twins: readers and writers block.
-//! - [`Kv::put_new`], [`Kv::put_new_from`] and [`Kv::aput_new`] store a value
-//!   atomically only under a key that holds none. Their defaults return
-//!   [`Error::Unsupported`] without reading or writing; stores that can create
-//!   atomically override them.
+//! - [`Kv::put_from`], [`Kv::put_new_from`] and [`Kv::get_to`] move a value
+//!   between the store and a reader or writer. By default `put_from` and
+//!   `get_to` hold it in memory; stores that can stream override them.
+//!   Readers and writers block, so the async counterparts of
+//!   [`Kv::put_new_from`] and [`Kv::get_to`] take and return a
+//!   [`ByteStream`] of chunks instead: [`Kv::aput_new_from`] and
+//!   [`Kv::aget_stream`]. There is no async `put_from`.
+//! - [`Kv::put_new`], [`Kv::put_new_from`], [`Kv::aput_new`] and
+//!   [`Kv::aput_new_from`] store a value atomically only under a key that
+//!   holds none. Their defaults return [`Error::Unsupported`] without reading
+//!   or writing; stores that can create atomically override them.
+//! - [`Kv::aget_stream`] returns [`Error::Unsupported`] by default, rather
+//!   than holding the value in memory; stores that can stream override it.
+//! - Futures and streams are `Send`, and stores `Send` and `Sync`, except on
+//!   `wasm32`, where stores backed by JavaScript are neither (see
+//!   [`MaybeSend`]).
 //! - Stores live in their own crates, such as `covalence-kv-memory` and
 //!   `covalence-kv-s3`.
 //!
@@ -68,14 +77,19 @@ use std::{
 };
 
 use covalence_lib_dasl::Value;
-use covalence_lib_data::Bytes;
+use covalence_lib_data::{ByteStream, Bytes, MaybeSend, MaybeSync};
 use covalence_lib_error::{BoxError, snafu::Snafu};
 
-/// The future an async store method returns.
+/// The future an async store method returns: `Send`, except on `wasm32`.
+#[cfg(not(target_arch = "wasm32"))]
 pub type KvFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
 
+/// The future an async store method returns: `Send`, except on `wasm32`.
+#[cfg(target_arch = "wasm32")]
+pub type KvFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + 'a>>;
+
 /// A [`KvFuture`] already holding `result`.
-pub fn ready<'a, T: Send + 'a>(result: Result<T, Error>) -> KvFuture<'a, T> {
+pub fn ready<'a, T: MaybeSend + 'a>(result: Result<T, Error>) -> KvFuture<'a, T> {
     Box::pin(std::future::ready(result))
 }
 
@@ -84,7 +98,7 @@ pub fn ready<'a, T: Send + 'a>(result: Result<T, Error>) -> KvFuture<'a, T> {
 /// A store rejects keys it cannot hold with an error. Sync and async methods
 /// may see different data (sync might read only a local cache). Do not call
 /// the sync methods on an async runtime thread: they may block.
-pub trait Kv: Send + Sync {
+pub trait Kv: MaybeSend + MaybeSync {
     /// The value under `key`, or `None` if missing.
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>, Error>;
 
@@ -184,6 +198,45 @@ pub trait Kv: Send + Sync {
         ready(Err(Op::PutNew.unsupported()))
     }
 
+    /// As [`Kv::put_new_from`], async: atomically store the `len` bytes of
+    /// `stream` only if the key holds no value, and return whether it stored.
+    ///
+    /// - Never replaces a value, including when writers race. When the key
+    ///   holds one, `stream` may have been read or not.
+    /// - Otherwise reads `stream` to its end. Stores nothing and fails with
+    ///   [`Error::Io`], carrying the stream's own error where it gave one, if
+    ///   `stream` fails or does not yield exactly `len` bytes.
+    /// - Holds no more of the value in memory than the store needs, so that
+    ///   a slow store slows the stream.
+    ///
+    /// The default returns [`Error::Unsupported`] without reading `stream`
+    /// or the store.
+    fn aput_new_from<'a>(
+        &'a self,
+        _key: &'a [u8],
+        _stream: ByteStream<'static>,
+        _len: u64,
+    ) -> KvFuture<'a, bool> {
+        ready(Err(Op::PutNew.unsupported()))
+    }
+
+    /// The length of the value under `key` and a stream of its bytes, or
+    /// `None` if missing.
+    ///
+    /// - The stream yields the value in chunks, then ends. A failure partway
+    ///   is an error item, after which the stream ends.
+    /// - The length is what the store reports; nothing here checks that the
+    ///   stream has it.
+    ///
+    /// The default returns [`Error::Unsupported`] without reading, rather than
+    /// holding the value in memory; stores that can stream override it.
+    fn aget_stream<'a>(
+        &'a self,
+        _key: &'a [u8],
+    ) -> KvFuture<'a, Option<(u64, ByteStream<'static>)>> {
+        ready(Err(Op::Get.unsupported()))
+    }
+
     /// Whether there is a value under `key`. [`Kv::get`] by default; stores
     /// override it to avoid reading the value.
     fn exists(&self, key: &[u8]) -> Result<bool, Error> {
@@ -272,6 +325,20 @@ impl Kv for Arc<dyn Kv> {
     fn aput_new<'a>(&'a self, key: &'a [u8], value: Bytes) -> KvFuture<'a, bool> {
         (**self).aput_new(key, value)
     }
+    fn aput_new_from<'a>(
+        &'a self,
+        key: &'a [u8],
+        stream: ByteStream<'static>,
+        len: u64,
+    ) -> KvFuture<'a, bool> {
+        (**self).aput_new_from(key, stream, len)
+    }
+    fn aget_stream<'a>(
+        &'a self,
+        key: &'a [u8],
+    ) -> KvFuture<'a, Option<(u64, ByteStream<'static>)>> {
+        (**self).aget_stream(key)
+    }
     fn exists(&self, key: &[u8]) -> Result<bool, Error> {
         (**self).exists(key)
     }
@@ -325,8 +392,9 @@ pub enum Error {
         /// The store's own error.
         source: BoxError,
     },
-    /// The reader [`Kv::put_from`] reads or the writer [`Kv::get_to`] writes
-    /// failed, or the reader ended early.
+    /// The reader [`Kv::put_from`] or [`Kv::put_new_from`] reads, the writer
+    /// [`Kv::get_to`] writes or the stream [`Kv::aput_new_from`] reads failed,
+    /// or the reader or stream had the wrong length.
     #[snafu(display("{source}"))]
     Io {
         /// The I/O error.

@@ -975,6 +975,26 @@ class CasTests(ApiCase):
                     cas.put_from(three, [b"three"], -1)
                 self.assertFalse(cas.has(three))
 
+    def test_put_from_checks_the_bytes_of_existing_blocks(self):
+        def failing():
+            yield b"thr"
+            raise RuntimeError("the client went away")
+
+        three = Cid.of(b"three")
+        for name, cas in self.stores().items():
+            with self.subTest(store=name):
+                self.assertEqual(cas.put(b"three"), three)
+                self.assertEqual(cas.put_from(three, [b"thr", b"ee"], 5), three)
+                with self.assertRaises(IntegrityError):
+                    cas.put_from(three, [b"threE"], 5)
+                with self.assertRaisesRegex(ValueError, "fewer"):
+                    cas.put_from(three, [b"thr"], 5)
+                with self.assertRaisesRegex(ValueError, "more"):
+                    cas.put_from(three, [b"three", b"!"], 5)
+                with self.assertRaisesRegex(RuntimeError, "went away"):
+                    cas.put_from(three, failing(), 5)
+                self.assertEqual(cas.get(three), b"three")
+
     def test_get_file_keeps_the_permissions_it_replaces(self):
         cas = Cas.memory()
         cid = cas.put(b"one")

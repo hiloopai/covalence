@@ -1,4 +1,8 @@
-use std::io::{self, Read};
+use std::{
+    io::{self, Read, Write},
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use covalence_cas_kv::{Compression, KvCas};
 use covalence_cas_trait::{Cas, Error, Op};
@@ -6,7 +10,7 @@ use covalence_kv_memory::MemoryKv;
 use covalence_kv_trait::{Error as KvError, Kv, KvFuture};
 use covalence_lib_cid::{Blake3, Cid};
 use covalence_lib_dasl::Value;
-use covalence_lib_data::Bytes;
+use covalence_lib_data::{ByteStream, Bytes, Stream};
 use pollster::block_on;
 
 /// Disabled codecs must fail before touching the backend or consuming input.
@@ -30,6 +34,23 @@ impl Kv for Untouched {
     fn aput_new<'a>(&'a self, _: &'a [u8], _: Bytes) -> KvFuture<'a, bool> {
         panic!("disabled codec accessed the backend")
     }
+    fn put_new_from(&self, _: &[u8], _: &mut dyn Read, _: u64) -> Result<bool, KvError> {
+        panic!("disabled codec accessed the backend")
+    }
+    fn get_to(&self, _: &[u8], _: &mut dyn Write) -> Result<Option<u64>, KvError> {
+        panic!("disabled codec accessed the backend")
+    }
+    fn aput_new_from<'a>(
+        &'a self,
+        _: &'a [u8],
+        _: ByteStream<'static>,
+        _: u64,
+    ) -> KvFuture<'a, bool> {
+        panic!("disabled codec accessed the backend")
+    }
+    fn aget_stream<'a>(&'a self, _: &'a [u8]) -> KvFuture<'a, Option<(u64, ByteStream<'static>)>> {
+        panic!("disabled codec accessed the backend")
+    }
     fn info(&self) -> Result<Value, KvError> {
         panic!("disabled codec accessed the backend")
     }
@@ -39,6 +60,13 @@ impl Kv for Untouched {
 }
 impl Read for Untouched {
     fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        panic!("disabled codec consumed input")
+    }
+}
+impl Stream for Untouched {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         panic!("disabled codec consumed input")
     }
 }
@@ -91,6 +119,12 @@ fn selected_codecs_follow_their_features_and_disabled_codecs_are_explicit() {
         unsupported_put(store.put("hello".into()));
         unsupported_put(block_on(store.aput("hello".into())));
         unsupported_put(store.put_from(Blake3::of(b"hello"), &mut Untouched, 5));
+        unsupported_put(block_on(store.aput_from(
+            Blake3::of(b"hello"),
+            Box::pin(Untouched),
+            5,
+        )));
+        unsupported_get(block_on(store.aget_stream(&cid)));
     }
 }
 

@@ -15,6 +15,41 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+### Added
+
+- Async streaming for Rust stores, for bodies too large to hold in memory.
+  `Kv::aput_new_from` and `Kv::aget_stream` move a value as a stream of byte
+  chunks, and `MemoryKv` implements both. `Cas::aput_from` and
+  `Cas::aget_stream` move a block, checked: uncompressed `KvCas` stores verify
+  the BLAKE3 digest and exact length as chunks pass and hold back the last
+  chunk until they match. A mismatched, short or long upload stores nothing
+  and fails, also when the block already exists, and a corrupt block fails in
+  place of its last chunk. The trait defaults, `S3Kv` and compressed `KvCas`
+  stores return `Unsupported` rather than buffering whole values.
+  `Cas::aput_from` takes the block's CID before its bytes, because the key
+  derives from it; callers that do not know the CID hash the bytes first or
+  have the client declare it.
+
+- The store traits and `KvCas` build for `wasm32-unknown-unknown`; the
+  `zstd` feature also needs a C compiler for that target, such as Clang.
+  There, futures, streams and stores need not be `Send` or `Sync`, so a store
+  can wrap a JavaScript object. Native targets keep the `Send` and `Sync`
+  bounds.
+
+### Changed
+
+- `Cas::put_from` reads and checks every byte, even if the block already
+  exists, so success shows the caller had the bytes, not only the CID.
+  `KvCas` over a store that finds the block early, such as `S3Kv`, used to
+  return without reading the rest. Python: `Cas.put_from` raises
+  `IntegrityError`, `ValueError` or the source's exception for such an
+  upload too.
+
+- **Breaking:** `KvCas` reports an operation its key-value store does not
+  support as `Error::Unsupported`, not `Error::Backend`. Python raises
+  `UnsupportedError` rather than `StoreError`. Match `Error::Unsupported`
+  to fall back to another method.
+
 ### Fixed
 
 - `cov-lake-cache put` no longer fails when the pool holds other bytes for an
