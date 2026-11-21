@@ -12,7 +12,7 @@ permissions:
 jobs:
   # Only hiloopai/covalence publishes; forks and other copies never do.
   publish:
-    if: github.repository == 'hiloopai/covalence'
+    if: github.repository_id == '1419632160'
     runs-on: ubuntu-24.04
     # A first release of 17 new crates waits about 2 hours for crates.io's
     # rate limit; see .github/scripts/publish-crates.py.
