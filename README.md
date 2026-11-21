@@ -80,6 +80,8 @@ Content addressing:
 - `crates/blob/trait`: the blob trait: bytes read by range.
 - [`crates/blob/verify`](crates/blob/verify/README.md): measure byte streams
   or check them against an expected size and digest, in constant memory.
+- [Checked ranges and streaming](docs/checked-range-streaming.md): a proposed
+  design for authenticating parts of a blob.
 
 Stores:
 
