@@ -837,6 +837,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "covalence-cas-fs"
+version = "0.1.0-dev.12"
+dependencies = [
+ "covalence-cas-memory",
+ "covalence-cas-trait",
+ "covalence-lib-cid",
+ "covalence-lib-dasl",
+ "covalence-lib-data",
+ "covalence-lib-error",
+]
+
+[[package]]
 name = "covalence-cas-kv"
 version = "0.1.0-dev.12"
 dependencies = [
