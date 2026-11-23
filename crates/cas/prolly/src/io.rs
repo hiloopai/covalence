@@ -4,47 +4,46 @@ use std::sync::Arc;
 
 use covalence_cas_trait::Cas;
 use covalence_lib_cid::{Bdasl, Cid};
-use covalence_lib_data::Bytes;
 use covalence_lib_error::snafu::ensure;
 
 use crate::{
-    Error, MalformedSnafu, RekeyedSnafu,
+    Child, Error, Layout, MalformedSnafu, Node, NodeOf, RekeyedSnafu,
     build::MAX_HEIGHT,
     cache::Cache,
-    node::{Child, Node, upper_of},
+    node::{Block, upper_of},
 };
 
 /// Store an encoded node, checking that the store finds it by its CID.
-pub(crate) fn store(cas: &dyn Cas, (cid, bytes): (Cid<Bdasl>, Bytes)) -> Result<(), Error> {
+pub(crate) fn store(cas: &dyn Cas, (cid, bytes): Block) -> Result<(), Error> {
     let key = cas.put(bytes)?;
     ensure!(key.same_multihash(&cid.into()), RekeyedSnafu { cid });
     Ok(())
 }
 
-/// Loads nodes of one tree, checking each against its path: as [`Node::decode`] and [`Node::fits`] check it, that it is
-/// a leaf exactly at the tree's height, and that the boundary rule cuts it at
-/// its level, the height minus its depth. The height is known once a leaf is
-/// loaded or [`Loader::assume_height`] sets it; nodes loaded before then are
-/// checked then.
-pub(crate) struct Loader {
+/// Loads nodes and checks their key bounds, counts and levels in the tree.
+///
+/// A leaf gives the tree's height. [`Loader::assume_height`] can also set it.
+/// Once the height is known, the loader checks that each node is cut at its
+/// level and that leaves occur at level zero.
+pub(crate) struct Loader<L: Layout> {
     cas: Arc<dyn Cas>,
-    cache: Arc<Cache>,
+    cache: Arc<Cache<L>>,
     height: Option<usize>,
-    waiting: Vec<Waiting>,
+    waiting: Vec<Waiting<L>>,
 }
 
 /// A loaded node whose level is not yet known.
-struct Waiting {
+struct Waiting<L: Layout> {
     cid: Cid<Bdasl>,
-    node: Arc<Node>,
+    node: Arc<NodeOf<L>>,
     depth: usize,
     leaf: bool,
     /// Whether the node is not the last of its level.
     closed: bool,
 }
 
-impl Loader {
-    pub(crate) fn new(cas: Arc<dyn Cas>, cache: Arc<Cache>) -> Self {
+impl<L: Layout> Loader<L> {
+    pub(crate) fn new(cas: Arc<dyn Cas>, cache: Arc<Cache<L>>) -> Self {
         Self {
             cas,
             cache,
@@ -58,7 +57,7 @@ impl Loader {
     }
 
     /// Load the root at `cid`: a leaf, or a branch of at least two children.
-    pub(crate) fn root(&mut self, cid: Cid<Bdasl>) -> Result<Arc<Node>, Error> {
+    pub(crate) fn root(&mut self, cid: Cid<Bdasl>) -> Result<Arc<NodeOf<L>>, Error> {
         let node = self.cache.load(&*self.cas, cid)?;
         let one_child = matches!(&*node, Node::Branch(children) if children.len() < 2);
         ensure!(!one_child, MalformedSnafu { cid });
@@ -70,10 +69,10 @@ impl Loader {
     /// last node of a level has no `upper`.
     pub(crate) fn child(
         &mut self,
-        child: &Child,
-        upper: &Option<Bytes>,
+        child: &Child<L::Key>,
+        upper: &Option<L::Key>,
         depth: usize,
-    ) -> Result<Arc<Node>, Error> {
+    ) -> Result<Arc<NodeOf<L>>, Error> {
         let node = self.cache.load(&*self.cas, child.cid)?;
         ensure!(node.fits(child, upper), MalformedSnafu { cid: child.cid });
         self.check(child.cid, &node, depth, upper.is_some())?;
@@ -82,7 +81,7 @@ impl Loader {
 
     /// Load the leftmost path below `root`, which this loaded, and return
     /// the height.
-    pub(crate) fn spine(&mut self, root: &Arc<Node>) -> Result<usize, Error> {
+    pub(crate) fn spine(&mut self, root: &Arc<NodeOf<L>>) -> Result<usize, Error> {
         let (mut node, mut upper, mut depth) = (root.clone(), None, 0);
         while let Node::Branch(children) = &*node {
             upper = upper_of(children, 0, &upper);
@@ -101,7 +100,7 @@ impl Loader {
     fn check(
         &mut self,
         cid: Cid<Bdasl>,
-        node: &Arc<Node>,
+        node: &Arc<NodeOf<L>>,
         depth: usize,
         closed: bool,
     ) -> Result<(), Error> {

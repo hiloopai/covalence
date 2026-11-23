@@ -4,13 +4,11 @@
 use std::mem;
 
 use covalence_lib_cid::{Bdasl, Cid, HashFn};
-use covalence_lib_dasl::Value;
-use covalence_lib_data::Bytes;
 use covalence_lib_error::snafu::OptionExt;
 
 use crate::{
-    Error, TooLargeSnafu,
-    node::{Child, Node},
+    Child, Entry, Error, Layout, Node, NodeOf, TooLargeSnafu,
+    node::{Block, encode},
 };
 
 /// Expected node width.
@@ -44,7 +42,7 @@ fn ends_node(level: usize, key: &[u8], width: usize) -> bool {
 /// Whether the rule cuts a node of `level` with items keyed `keys`: no item
 /// but the last ends a node, and the last does if `closed`, that is, if the
 /// node is not the last of its level.
-pub(crate) fn is_chunk(level: usize, keys: &[Bytes], closed: bool) -> bool {
+pub(crate) fn is_chunk(level: usize, keys: &[&[u8]], closed: bool) -> bool {
     let Some((last, init)) = keys.split_last() else {
         return false;
     };
@@ -53,27 +51,33 @@ pub(crate) fn is_chunk(level: usize, keys: &[Bytes], closed: bool) -> bool {
         && (!closed || ends_node(level, last, keys.len()))
 }
 
-/// An encoded node and its CID, waiting to be stored.
-pub(crate) type Block = (Cid<Bdasl>, Bytes);
-
 /// Builds a tree from items fed in key order.
 ///
 /// Feeding a whole node is the same as feeding its entries when the levels
 /// up to the node's own are empty, and either the node ended at a boundary
 /// (it is not the last node of its level) or nothing follows it.
-#[derive(Default)]
-pub(crate) struct Builder {
-    entries: Vec<(Bytes, Value)>,
+pub(crate) struct Builder<L: Layout> {
+    entries: Vec<Entry<L>>,
     /// `children[l - 1]` holds the pending items of level `l`.
-    children: Vec<Vec<Child>>,
+    children: Vec<Vec<Child<L::Key>>>,
     /// Closed nodes not yet taken by [`Builder::drain`].
     blocks: Vec<Block>,
 }
 
-impl Builder {
+impl<L: Layout> Default for Builder<L> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            children: Vec::new(),
+            blocks: Vec::new(),
+        }
+    }
+}
+
+impl<L: Layout> Builder<L> {
     /// Feed an entry. Keys must be fed in strictly increasing order.
-    pub(crate) fn push_entry(&mut self, key: Bytes, value: Value) -> Result<(), Error> {
-        let end = ends_node(0, &key, self.entries.len() + 1);
+    pub(crate) fn push_entry(&mut self, key: L::Key, value: L::Value) -> Result<(), Error> {
+        let end = ends_node(0, key.as_ref(), self.entries.len() + 1);
         self.entries.push((key, value));
         if end {
             let child = self.close_leaf()?;
@@ -83,12 +87,12 @@ impl Builder {
     }
 
     /// Feed a node of level `level - 1` as an item of `level`.
-    pub(crate) fn push_child(&mut self, level: usize, child: Child) -> Result<(), Error> {
+    pub(crate) fn push_child(&mut self, level: usize, child: Child<L::Key>) -> Result<(), Error> {
         if self.children.len() < level {
             self.children.resize_with(level, Vec::new);
         }
         let items = &mut self.children[level - 1];
-        let end = ends_node(level, &child.key, items.len() + 1);
+        let end = ends_node(level, child.key.as_ref(), items.len() + 1);
         items.push(child);
         if end {
             let child = self.close_branch(level)?;
@@ -107,30 +111,30 @@ impl Builder {
         self.blocks.drain(..)
     }
 
-    fn close_leaf(&mut self) -> Result<Child, Error> {
+    fn close_leaf(&mut self) -> Result<Child<L::Key>, Error> {
         let node = Node::Leaf(mem::take(&mut self.entries));
         self.close(node)
     }
 
-    fn close_branch(&mut self, level: usize) -> Result<Child, Error> {
+    fn close_branch(&mut self, level: usize) -> Result<Child<L::Key>, Error> {
         let node = Node::Branch(mem::take(&mut self.children[level - 1]));
         self.close(node)
     }
 
-    fn close(&mut self, node: Node) -> Result<Child, Error> {
+    fn close(&mut self, node: NodeOf<L>) -> Result<Child<L::Key>, Error> {
         let key = match &node {
             Node::Leaf(entries) => entries[0].0.clone(),
             Node::Branch(children) => children[0].key.clone(),
         };
         let count = node.count().context(TooLargeSnafu)?;
-        let block = node.encode()?;
+        let block = encode::<L>(&node)?;
         let cid = block.0;
         self.blocks.push(block);
         Ok(Child { key, count, cid })
     }
 
     /// Close the last node of every level and return the top one. It may be
-    /// a branch with one child, if that was fed whole; see [`crate::apply`].
+    /// a branch with one child, if that was fed whole; see [`Tree::apply`](crate::Tree::apply).
     pub(crate) fn finish(&mut self) -> Result<Cid<Bdasl>, Error> {
         if !self.entries.is_empty() {
             let child = self.close_leaf()?;
@@ -151,7 +155,7 @@ impl Builder {
             }
             self.children[level].push(child);
         }
-        let block = Node::Leaf(Vec::new()).encode()?;
+        let block = encode::<L>(&Node::Leaf(Vec::new()))?;
         let cid = block.0;
         self.blocks.push(block);
         Ok(cid)

@@ -30,7 +30,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use covalence_cas_prolly::Map;
+use covalence_cas_prolly::LexiconTree;
 use covalence_lib_cid::{Bdasl, Cid};
 use covalence_lib_serde::Serialize;
 use serde_json::Value;
@@ -182,7 +182,7 @@ impl Reach {
             }
         }
         for (package, root) in roots {
-            for (input, entry) in pool::entries(&Map::open(local.nodes(), root))? {
+            for (input, entry) in pool::entries(&LexiconTree::open(local.nodes(), root))? {
                 self.names.extend(entry.artifacts.into_keys());
                 self.inputs.insert((package.clone(), input));
             }

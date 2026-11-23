@@ -1,20 +1,14 @@
-//! Node records: their DRISL encoding and the checks made on decoding. No I/O.
-
-use std::collections::BTreeMap;
+//! Logical node records and checks that apply to every layout.
 
 use covalence_lib_cid::{Bdasl, Cid, Codec, Format, HashFn};
 use covalence_lib_dasl::Value;
 use covalence_lib_data::Bytes;
-use covalence_lib_error::snafu::OptionExt;
 
-use crate::{Error, TooLargeSnafu};
-
-const LEAF: &str = "vc.cov.prolly.leaf";
-const BRANCH: &str = "vc.cov.prolly.branch";
+use crate::{Error, Layout, NodeOf};
 
 /// The bound on the keys of child `i` of a branch whose keys are below
 /// `upper`: the next child's key, or `upper` for the last child.
-pub(crate) fn upper_of(children: &[Child], i: usize, upper: &Option<Bytes>) -> Option<Bytes> {
+pub(crate) fn upper_of<K: Clone>(children: &[Child<K>], i: usize, upper: &Option<K>) -> Option<K> {
     children
         .get(i + 1)
         .map(|next| next.key.clone())
@@ -28,51 +22,66 @@ pub(crate) fn names_node(cid: Cid<Bdasl>) -> bool {
 
 /// A link to a subtree: its first key, its number of keys and its CID.
 #[derive(Clone, Debug)]
-pub(crate) struct Child {
-    pub(crate) key: Bytes,
-    pub(crate) count: u64,
-    pub(crate) cid: Cid<Bdasl>,
+pub struct Child<K = Bytes> {
+    /// The child's first key.
+    pub key: K,
+    /// The number of entries below the child.
+    pub count: u64,
+    /// The CID of the child node.
+    pub cid: Cid<Bdasl>,
 }
 
-#[derive(Clone)]
-pub(crate) enum Node {
-    Leaf(Vec<(Bytes, Value)>),
-    Branch(Vec<Child>),
+/// The logical contents of one tree node.
+pub enum Node<K = Bytes, V = Value> {
+    /// Entries in key order.
+    Leaf(Vec<(K, V)>),
+    /// Links to child nodes in key order.
+    Branch(Vec<Child<K>>),
 }
 
-impl Node {
-    /// Decode a node from DRISL `bytes`. Keys must be strictly increasing,
-    /// branches nonempty, child counts positive with a total that fits a
-    /// `u64`, and child links DRISL BLAKE3 CIDs.
-    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
-        Self::from_value(Value::decode(bytes).ok()?)
+impl<K: AsRef<[u8]>, V> Node<K, V> {
+    /// Whether the decoded node obeys the rules independent of its location.
+    pub(crate) fn valid(&self) -> bool {
+        match self {
+            Node::Leaf(entries) => entries.is_sorted_by(|a, b| a.0.as_ref() < b.0.as_ref()),
+            Node::Branch(children) => {
+                !children.is_empty()
+                    && children.is_sorted_by(|a, b| a.key.as_ref() < b.key.as_ref())
+                    && children
+                        .iter()
+                        .all(|child| child.count > 0 && names_node(child.cid))
+                    && self.count().is_some()
+            }
+        }
     }
 
     /// Whether this node can be `child`, whose keys must be below `upper`: it
     /// starts at the child's key and holds its count.
-    pub(crate) fn fits(&self, child: &Child, upper: &Option<Bytes>) -> bool {
+    pub(crate) fn fits(&self, child: &Child<K>, upper: &Option<K>) -> bool {
         let (first, last) = self.bounds();
-        first == Some(&child.key)
+        first == Some(child.key.as_ref())
             && self.count() == Some(child.count)
-            && upper.as_ref().is_none_or(|upper| last < Some(upper))
+            && upper
+                .as_ref()
+                .is_none_or(|upper| last < Some(upper.as_ref()))
     }
 
     /// The first and last keys of this node's items.
-    fn bounds(&self) -> (Option<&Bytes>, Option<&Bytes>) {
+    fn bounds(&self) -> (Option<&[u8]>, Option<&[u8]>) {
         match self {
             Node::Leaf(entries) => (
-                entries.first().map(|(key, _)| key),
-                entries.last().map(|(key, _)| key),
+                entries.first().map(|(key, _)| key.as_ref()),
+                entries.last().map(|(key, _)| key.as_ref()),
             ),
             Node::Branch(children) => (
-                children.first().map(|child| &child.key),
-                children.last().map(|child| &child.key),
+                children.first().map(|child| child.key.as_ref()),
+                children.last().map(|child| child.key.as_ref()),
             ),
         }
     }
 
     /// A leaf's entries; none for a branch.
-    pub(crate) fn entries(&self) -> &[(Bytes, Value)] {
+    pub(crate) fn entries(&self) -> &[(K, V)] {
         match self {
             Node::Leaf(entries) => entries,
             Node::Branch(_) => &[],
@@ -80,7 +89,7 @@ impl Node {
     }
 
     /// A branch's children; none for a leaf.
-    pub(crate) fn children(&self) -> &[Child] {
+    pub(crate) fn children(&self) -> &[Child<K>] {
         match self {
             Node::Leaf(_) => &[],
             Node::Branch(children) => children,
@@ -88,10 +97,10 @@ impl Node {
     }
 
     /// The keys of this node's items.
-    pub(crate) fn keys(&self) -> Vec<Bytes> {
+    pub(crate) fn keys(&self) -> Vec<&[u8]> {
         match self {
-            Node::Leaf(entries) => entries.iter().map(|(key, _)| key.clone()).collect(),
-            Node::Branch(children) => children.iter().map(|child| child.key.clone()).collect(),
+            Node::Leaf(entries) => entries.iter().map(|(key, _)| key.as_ref()).collect(),
+            Node::Branch(children) => children.iter().map(|child| child.key.as_ref()).collect(),
         }
     }
 
@@ -104,94 +113,20 @@ impl Node {
                 .try_fold(0u64, |sum, child| sum.checked_add(child.count)),
         }
     }
+}
 
-    /// The DRISL encoding and its CID. Counts must be DASL integers.
-    pub(crate) fn encode(&self) -> Result<(Cid<Bdasl>, Bytes), Error> {
-        let (kind, field, items) = match self {
-            Node::Leaf(entries) => (
-                LEAF,
-                "entries",
-                entries
-                    .iter()
-                    .map(|(key, value)| Value::List(vec![Value::Bytes(key.clone()), value.clone()]))
-                    .collect(),
-            ),
-            Node::Branch(children) => (
-                BRANCH,
-                "children",
-                children
-                    .iter()
-                    .map(|child| {
-                        let count = i64::try_from(child.count).ok().context(TooLargeSnafu)?;
-                        Ok(Value::List(vec![
-                            Value::Bytes(child.key.clone()),
-                            Value::Integer(count),
-                            Value::Link(child.cid),
-                        ]))
-                    })
-                    .collect::<Result<_, Error>>()?,
-            ),
-        };
-        let record = BTreeMap::from([
-            ("$type".to_owned(), Value::String(kind.to_owned())),
-            (field.to_owned(), Value::List(items)),
-        ]);
-        let bytes = Value::Map(record).encode()?;
-        let cid = Cid::<Bdasl>::of(Codec::Drisl, HashFn::Blake3, &bytes);
-        Ok((cid, bytes.into()))
-    }
+/// An encoded node and its CID, waiting to be stored.
+pub(crate) type Block = (Cid<Bdasl>, Bytes);
 
-    fn from_value(value: Value) -> Option<Self> {
-        let Value::Map(mut record) = value else {
-            return None;
-        };
-        let Some(Value::String(kind)) = record.remove("$type") else {
-            return None;
-        };
-        let field = match kind.as_str() {
-            LEAF => "entries",
-            BRANCH => "children",
-            _ => return None,
-        };
-        let Some(Value::List(items)) = record.remove(field) else {
-            return None;
-        };
-        if !record.is_empty() {
-            return None;
-        }
-        let items = items.into_iter().map(|item| match item {
-            Value::List(fields) => Some(fields),
-            _ => None,
-        });
-        let node = if field == "entries" {
-            let entries = items.map(|fields| match <[Value; 2]>::try_from(fields?) {
-                Ok([Value::Bytes(key), value]) => Some((key, value)),
-                _ => None,
-            });
-            let entries: Vec<_> = entries.collect::<Option<_>>()?;
-            if !entries.is_sorted_by(|a, b| a.0 < b.0) {
-                return None;
-            }
-            Node::Leaf(entries)
-        } else {
-            let children = items.map(|fields| match <[Value; 3]>::try_from(fields?) {
-                Ok([Value::Bytes(key), Value::Integer(count), Value::Link(cid)])
-                    if count > 0 && names_node(cid) =>
-                {
-                    Some(Child {
-                        key,
-                        count: count.unsigned_abs(),
-                        cid,
-                    })
-                }
-                _ => None,
-            });
-            let children: Vec<_> = children.collect::<Option<_>>()?;
-            if children.is_empty() || !children.is_sorted_by(|a, b| a.key < b.key) {
-                return None;
-            }
-            Node::Branch(children)
-        };
-        node.count().is_some().then_some(node)
-    }
+/// Encode a logical node as DRISL and compute its CID.
+pub(crate) fn encode<L: Layout>(node: &NodeOf<L>) -> Result<Block, Error> {
+    let bytes = L::encode(node)?.encode()?;
+    let cid = Cid::<Bdasl>::of(Codec::Drisl, HashFn::Blake3, &bytes);
+    Ok((cid, bytes.into()))
+}
+
+/// Decode a DRISL record and check the resulting node's structure.
+pub(crate) fn decode<L: Layout>(bytes: &[u8]) -> Option<NodeOf<L>> {
+    let node = L::decode(Value::decode(bytes).ok()?)?;
+    node.valid().then_some(node)
 }

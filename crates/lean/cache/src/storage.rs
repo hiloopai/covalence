@@ -11,7 +11,7 @@ use std::{
     time::Instant,
 };
 
-use covalence_cas_prolly::Map;
+use covalence_cas_prolly::LexiconTree;
 use covalence_cas_trait::Cas;
 use covalence_kv_s3::{AwsOptions, S3Kv, S3Location};
 use covalence_kv_trait::Kv;
@@ -289,7 +289,7 @@ fn publish_package(publisher: &Publisher, package: &Package) -> Result<Option<Pu
             let mut upstream = BTreeMap::new();
             if let Some(root) = existing {
                 pool::copy_nodes(remote, &*local.nodes(), root)?;
-                upstream = pool::entries(&Map::open(local.nodes(), root))?;
+                upstream = pool::entries(&LexiconTree::open(local.nodes(), root))?;
             }
             let known = cids(upstream.values());
             // Fold in the upstream snapshots Lake fetched for this package, so
@@ -311,7 +311,7 @@ fn publish_package(publisher: &Publisher, package: &Package) -> Result<Option<Pu
     let parent_map = match &parent {
         Some((_, root)) => {
             pool::copy_nodes(remote, &*local.nodes(), *root)?;
-            Some(Map::open(local.nodes(), *root))
+            Some(LexiconTree::open(local.nodes(), *root))
         }
         None => None,
     };

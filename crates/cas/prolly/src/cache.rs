@@ -13,9 +13,9 @@ use covalence_lib_error::snafu::{OptionExt, ensure};
 use hashlink::LruCache;
 
 use crate::{
-    Error, MalformedSnafu, MissingSnafu,
+    Error, Layout, MalformedSnafu, MissingSnafu, NodeOf,
     build::is_chunk,
-    node::{Node, names_node},
+    node::{decode, names_node},
 };
 
 /// The most encoded bytes a [`Cache`] keeps.
@@ -32,41 +32,46 @@ const BUDGET: usize = 16 << 20;
 /// found to end it: the level, and whether the node was closed (not the last
 /// of its level). Checks that depend on the node's place in a tree are not
 /// cached; the caller makes them at every load.
-#[derive(Default)]
-pub(crate) struct Cache(Mutex<Nodes>);
+pub(crate) struct Cache<L: Layout>(Mutex<Nodes<L>>);
 
-struct Nodes {
-    lru: LruCache<Cid<Bdasl>, Kept>,
+impl<L: Layout> Default for Cache<L> {
+    fn default() -> Self {
+        Self(Mutex::default())
+    }
+}
+
+struct Nodes<L: Layout> {
+    lru: LruCache<Cid<Bdasl>, Kept<L>>,
     bytes: usize,
 }
 
-impl Default for Nodes {
+impl<L: Layout> Default for Nodes<L> {
     fn default() -> Self {
         let lru = LruCache::new_unbounded();
         Self { lru, bytes: 0 }
     }
 }
 
-struct Kept {
-    node: Arc<Node>,
+struct Kept<L: Layout> {
+    node: Arc<NodeOf<L>>,
     size: usize,
     /// Each level where the rule ends the node, and whether closed there.
     ends: Vec<(usize, bool)>,
 }
 
-impl Cache {
-    fn nodes(&self) -> MutexGuard<'_, Nodes> {
+impl<L: Layout> Cache<L> {
+    fn nodes(&self) -> MutexGuard<'_, Nodes<L>> {
         self.0.lock().unwrap()
     }
 
-    /// The node at `cid`, checked as [`Node::decode`] checks it.
-    pub(crate) fn load(&self, cas: &dyn Cas, cid: Cid<Bdasl>) -> Result<Arc<Node>, Error> {
+    /// The node at `cid`, checked as [`decode`] checks it.
+    pub(crate) fn load(&self, cas: &dyn Cas, cid: Cid<Bdasl>) -> Result<Arc<NodeOf<L>>, Error> {
         if let Some(kept) = self.nodes().lru.get(&cid) {
             return Ok(kept.node.clone());
         }
         ensure!(names_node(cid), MalformedSnafu { cid });
         let fact = cas.get_fact(&cid.into())?.context(MissingSnafu { cid })?;
-        let node = Arc::new(Node::decode(fact.bytes()).context(MalformedSnafu { cid })?);
+        let node = Arc::new(decode::<L>(fact.bytes()).context(MalformedSnafu { cid })?);
         let size = fact.bytes().len();
         if size <= BUDGET {
             self.nodes().keep(cid, node.clone(), size);
@@ -79,7 +84,7 @@ impl Cache {
     pub(crate) fn is_chunk(
         &self,
         cid: Cid<Bdasl>,
-        node: &Node,
+        node: &NodeOf<L>,
         level: usize,
         closed: bool,
     ) -> bool {
@@ -99,8 +104,8 @@ impl Cache {
     }
 }
 
-impl Nodes {
-    fn keep(&mut self, cid: Cid<Bdasl>, node: Arc<Node>, size: usize) {
+impl<L: Layout> Nodes<L> {
+    fn keep(&mut self, cid: Cid<Bdasl>, node: Arc<NodeOf<L>>, size: usize) {
         let ends = Vec::new();
         if let Some(old) = self.lru.insert(cid, Kept { node, size, ends }) {
             self.bytes -= old.size;

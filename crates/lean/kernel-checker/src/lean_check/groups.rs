@@ -1,6 +1,6 @@
 //! Proof replacements against a pinned baseline, not full-source equivalence.
 use super::*;
-use covalence_cas_prolly::{Edit, Map};
+use covalence_cas_prolly::{Edit, LexiconTree};
 use covalence_lib_dasl::Value as Dasl;
 use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
@@ -485,7 +485,7 @@ pub(super) fn run(args: ProofGroups) -> Result<()> {
             );
             return Ok(());
         }
-        let history = Map::open(cas.clone(), revision.history.parse().into_diagnostic()?);
+        let history = LexiconTree::open(cas.clone(), revision.history.parse().into_diagnostic()?);
         if let Some(value) = history.get(source_hash.as_bytes()).into_diagnostic()? {
             let Dasl::String(root) = value else {
                 return Err(miette!("invalid revision index"));
@@ -527,7 +527,7 @@ pub(super) fn run(args: ProofGroups) -> Result<()> {
             })?;
             return Err(miette!("imports changed; create a new baseline"));
         }
-        let map = Map::open(cas.clone(), revision.root.parse().into_diagnostic()?);
+        let map = LexiconTree::open(cas.clone(), revision.root.parse().into_diagnostic()?);
         let mut entries = map.range(..).into_diagnostic()?;
         let mut bridge: Option<Bridge> = None;
         let mut loaded = 0;
@@ -669,7 +669,7 @@ pub(super) fn run(args: ProofGroups) -> Result<()> {
             child.finish()?;
         }
         let map = map.apply(edits).into_diagnostic()?;
-        let history = Map::open(cas.clone(), revision.history.parse().into_diagnostic()?);
+        let history = LexiconTree::open(cas.clone(), revision.history.parse().into_diagnostic()?);
         (
             revision.baseline.clone(),
             map,
@@ -745,11 +745,11 @@ pub(super) fn run(args: ProofGroups) -> Result<()> {
         };
         let count = baseline.groups.len();
         let id = put(&*cas, &baseline)?;
-        let map = Map::empty(cas.clone())
+        let map = LexiconTree::empty(cas.clone())
             .into_diagnostic()?
             .apply(edits)
             .into_diagnostic()?;
-        let history = Map::empty(cas.clone()).into_diagnostic()?;
+        let history = LexiconTree::empty(cas.clone()).into_diagnostic()?;
         (
             id,
             map,
@@ -859,7 +859,7 @@ mod tests {
         let file = dir.path().join("Proof.lean");
         fs::write(&file, "theorem p : True := True.intro\n").unwrap();
         let environment = Blake3::of(b"environment");
-        let root = Map::empty(Arc::new(SqliteCas::open(&cache).unwrap()))
+        let root = LexiconTree::empty(Arc::new(SqliteCas::open(&cache).unwrap()))
             .unwrap()
             .root()
             .to_string();
@@ -886,7 +886,7 @@ mod tests {
                     baseline,
                     root: root.clone(),
                     source: digest(&read(&file).unwrap()),
-                    history: Map::empty(Arc::new(SqliteCas::open(&cache).unwrap()))
+                    history: LexiconTree::empty(Arc::new(SqliteCas::open(&cache).unwrap()))
                         .unwrap()
                         .root()
                         .to_string(),
