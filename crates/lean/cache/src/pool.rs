@@ -282,7 +282,6 @@ pub fn copy_nodes(from: &dyn Cas, to: &dyn Cas, root: Cid<Bdasl>) -> Result<usiz
 mod tests {
     use super::*;
     use covalence_cas_memory::MemoryCas;
-    use covalence_cas_trait::Put;
     use covalence_kv_memory::MemoryKv;
 
     fn entry(output: &str, artifact: &[u8]) -> Entry {
@@ -368,8 +367,8 @@ mod tests {
 
     #[test]
     fn copying_nodes_rejects_a_raw_block_as_a_child() {
-        let from = MemoryCas::default();
-        let to = MemoryCas::default();
+        let from = MemoryCas::default().into_dyn();
+        let to = MemoryCas::default().into_dyn();
         let raw = from.put(Bytes::from_static(b"artifact")).unwrap();
         let branch = Node::Branch(vec![covalence_cas_prolly::Child {
             key: "key".into(),
@@ -380,7 +379,7 @@ mod tests {
         let root = record.cid().unwrap();
         from.put(record.encode().unwrap().into()).unwrap();
 
-        assert!(copy_nodes(&from, &to, root).is_err());
+        assert!(copy_nodes(&*from, &*to, root).is_err());
         assert!(!to.has(&raw).unwrap());
         assert!(!to.has(&root.into()).unwrap());
     }
