@@ -1,7 +1,7 @@
 //! Experimental compiled-declaration replay over a trusted CAS.
 use super::*;
 pub(super) mod built;
-use covalence_cas_prolly::{Edit, Map};
+use covalence_cas_prolly::{Edit, LexiconTree};
 use covalence_lib_dasl::Value as Dasl;
 use std::{
     collections::VecDeque,
@@ -492,7 +492,7 @@ fn check_module(args: &Invocation, inputs: Option<&built::Inputs>) -> Result<Val
         if previous.kind != FORMAT {
             return Err(miette!("not a successful kernel replay manifest"));
         }
-        let map = Map::open(cas.clone(), previous.root.parse().into_diagnostic()?);
+        let map = LexiconTree::open(cas.clone(), previous.root.parse().into_diagnostic()?);
         for entry in map.range(..).into_diagnostic()? {
             let (key, value) = entry.into_diagnostic()?;
             let Dasl::String(query) = value else {
@@ -502,7 +502,7 @@ fn check_module(args: &Invocation, inputs: Option<&built::Inputs>) -> Result<Val
         }
         map
     } else {
-        Map::empty(cas.clone()).into_diagnostic()?
+        LexiconTree::empty(cas.clone()).into_diagnostic()?
     };
     let reuse: Vec<_> = records
         .iter()
@@ -535,7 +535,7 @@ fn check_module(args: &Invocation, inputs: Option<&built::Inputs>) -> Result<Val
             inputs.digest(path)?;
         }
     }
-    let mut edits = Vec::new();
+    let mut edits: Vec<Edit> = Vec::new();
     let mut fresh_theorems = 0;
     let mut fresh_other = 0;
     let mut excluded = 0;

@@ -8,7 +8,7 @@ use std::{
 };
 
 use covalence_cas_memory::MemoryCas;
-use covalence_cas_prolly::{Change, Edit, Error, Map};
+use covalence_cas_prolly::{Change, Edit, Error, LexiconTree, Map};
 use covalence_cas_trait::{
     AsyncGet, AsyncPut, Cas, CasFuture, Error as CasError, Get, GetExt, Put, ready,
 };
@@ -367,6 +367,82 @@ fn golden_root() {
         build(&cas, &model).root().to_string(),
         "bafyr4idaucrnpulmucff2ca3xvtw6uj74fh24sp3fjzhlhyrgblcanwfku"
     );
+}
+
+#[test]
+fn lexicon_opens_and_rebuilds_original_blocks() {
+    // The original writer emitted the root, its two leaves, and the empty leaf.
+    let blocks: [(&str, &[u8]); 4] = [
+        (
+            "bafyr4iapjmb6hogfnfk7ewj2auehfb7zbpueowewuvqhai2jryzu7cm53u",
+            b"\xa2e$typetvc.cov.prolly.branchhchildren\x82\x83Aa\x02\xd8*X%\x00\x01\
+             q\x1e\x20\xc0\x807I\x82\x8d\xc6\xb4d5[\x8bla\xb6\x9f\xe0\xb7W\x12}\
+             \xa7Q\x83$e\xb0\x87\xa4_\xe1\x0e\x83Az\x01\xd8*X%\x00\x01q\x1e\x20\
+             \x8aE$j\x91\xb9\xff\xd4\x07~\x8f\xe8\xf48\x14d0\x1a\x8c|ka\xc8qs\x99\
+             \xff\x8fi\xfa]G",
+        ),
+        (
+            "bafyr4igaqa3utauny22gink3rnwgdnu74c3voet5u5iygjdfwcd2ix7bby",
+            b"\xa2e$typervc.cov.prolly.leafgentries\x82\x82Aa\x07\x82Db066\xf6",
+        ),
+        (
+            "bafyr4iekiusgvenz77kao7up5d2dqfdeganiy7dlmhehc44z76hwt6s5i4",
+            b"\xa2e$typervc.cov.prolly.leafgentries\x81\x82Azdlast",
+        ),
+        (
+            "bafyr4igwxhvnbxoq5v24u6xmxozyk7xltf2gl6jdoycjlz7mmvfmfe3tie",
+            b"\xa2e$typervc.cov.prolly.leafgentries\x80",
+        ),
+    ];
+    let original = MemoryCas::default().into_dyn();
+    for (cid, bytes) in blocks {
+        let cid: Cid<Bdasl> = cid.parse().unwrap();
+        assert!(
+            original
+                .put(Bytes::from_static(bytes))
+                .unwrap()
+                .same_multihash(&cid.into())
+        );
+    }
+
+    let entries = [
+        (Bytes::from("a"), Value::Integer(7)),
+        (Bytes::from("b066"), Value::Null),
+        (Bytes::from("z"), Value::String("last".into())),
+    ];
+    let root = blocks[0].0.parse().unwrap();
+    let empty = blocks[3].0.parse().unwrap();
+    let opened = LexiconTree::open(original, root);
+    opened.verify().unwrap();
+    assert!(opened.at(empty).is_empty());
+    assert_eq!(
+        opened
+            .range(..)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        entries
+    );
+    let edited = opened
+        .remove("z".into())
+        .unwrap()
+        .insert(entries[2].0.clone(), entries[2].1.clone())
+        .unwrap();
+    assert_eq!(edited.root(), root);
+
+    let fresh = MemoryCas::default().into_dyn();
+    assert_eq!(
+        LexiconTree::build(fresh.clone(), entries).unwrap().root(),
+        root
+    );
+    assert_eq!(LexiconTree::empty(fresh.clone()).unwrap().root(), empty);
+    for (cid, bytes) in blocks {
+        let fact = fresh
+            .get_fact(&cid.parse::<Cid32>().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(fact.bytes().as_ref(), bytes);
+    }
 }
 
 /// Keys out of order are an error, also across a leaf closed at the maximum

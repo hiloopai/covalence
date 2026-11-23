@@ -2,7 +2,7 @@
 //!
 //! Git revisions locate candidates; only the caller's ledger and the checker's
 //! complete input fingerprints authorize reuse. No native working state travels.
-use covalence_cas_prolly::{Edit, Map};
+use covalence_cas_prolly::{Edit, LexiconTree};
 use covalence_cas_sqlite::SqliteCas;
 use covalence_cas_trait::{Cas, GetExt};
 use covalence_kv_s3::{AwsOptions, S3Kv};
@@ -267,7 +267,7 @@ fn export_module(state: &Path, name: &str) -> Result<Option<Module>> {
     if manifest.kind != REPLAY {
         return Err(miette!("not a successful replay manifest"));
     }
-    let map = Map::open(cas, manifest.root.parse().into_diagnostic()?);
+    let map = LexiconTree::open(cas, manifest.root.parse().into_diagnostic()?);
     let mut entries = BTreeMap::new();
     for entry in map.range(..).into_diagnostic()? {
         let (key, value) = entry.into_diagnostic()?;
@@ -293,7 +293,7 @@ fn import_module(state: &Path, module: &Module) -> Result<()> {
     fs::create_dir_all(&directory).into_diagnostic()?;
     let cas: Arc<dyn Cas> =
         Arc::new(SqliteCas::open(directory.join("cache.db")).into_diagnostic()?);
-    let map = Map::empty(cas.clone())
+    let map = LexiconTree::empty(cas.clone())
         .into_diagnostic()?
         .apply(
             module
@@ -1077,21 +1077,14 @@ mod tests {
     const LEDGER: &str = "successful ledger\n";
 
     fn fixture() -> Module {
-        let cas: Arc<dyn Cas> = Arc::new(SqliteCas::open_in_memory().unwrap());
-        let entries: BTreeMap<String, String> = (0..30_000)
+        let entries = (0..30_000)
             .map(|n| (format!("proof{n}"), format!("query{n}")))
             .collect();
-        let map =
-            Map::empty(cas)
-                .unwrap()
-                .apply(entries.iter().map(|(k, v)| {
-                    Edit::Insert(k.as_bytes().to_vec().into(), Dasl::String(v.clone()))
-                }))
-                .unwrap();
         let manifest = Manifest {
             kind: REPLAY.into(),
             context: "context".into(),
-            root: map.root().to_string(),
+            // Root recorded by the original writer for these entries.
+            root: "bafyr4id742of24lsylmccm4rttm3dhvyj24q3hmncqprgxvg4mc2365jaq".into(),
         };
         let receipt =
             covalence_lib_cid::Blake3::of(&serde_json::to_vec(&manifest).unwrap()).to_string();
@@ -1141,7 +1134,7 @@ mod tests {
             .map(|n| (format!("proof{n}"), format!("{version}{n}")))
             .collect();
         let map =
-            Map::empty(cas)
+            LexiconTree::empty(cas)
                 .unwrap()
                 .apply(entries.iter().map(|(k, v)| {
                     Edit::Insert(k.as_bytes().to_vec().into(), Dasl::String(v.clone()))
@@ -1725,7 +1718,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(exported.receipt, expected);
-        assert_eq!(exported.entries.len(), 30_000);
+        assert_eq!(exported.entries, fixture().entries);
         let pointer = args.state.join("modules/Fixture/Proofs.json");
         fs::write(&pointer, "existing local pointer").unwrap();
         unpack(&mut [pack(&args, &[fixture()])], &args, LEDGER).unwrap();

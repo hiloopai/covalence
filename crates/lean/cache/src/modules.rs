@@ -552,7 +552,11 @@ fn pool_entries(
         return Ok(None);
     };
     crate::pool::copy_nodes(remote, &*local.nodes(), root)?;
-    crate::pool::entries(&covalence_cas_prolly::Map::open(local.nodes(), root)).map(Some)
+    crate::pool::entries(&covalence_cas_prolly::LexiconTree::open(
+        local.nodes(),
+        root,
+    ))
+    .map(Some)
 }
 
 /// The mapping a replay of Git dependency `package` would record, when the

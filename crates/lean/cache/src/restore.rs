@@ -17,7 +17,7 @@ use std::{
 };
 
 use covalence_cas_kv::KvCas;
-use covalence_cas_prolly::Map;
+use covalence_cas_prolly::LexiconTree;
 use covalence_kv_trait::Kv;
 use covalence_lib_cid::{Bdasl, Cid, Sha256};
 use covalence_lib_serde::{Deserialize, Serialize};
@@ -139,7 +139,7 @@ impl Session {
         for (package, root_package, root) in installs {
             let local = &self.local;
             let nodes = pool::copy_nodes(&self.remote, &*local.nodes(), *root)?;
-            let target = Map::open(local.nodes(), *root);
+            let target = LexiconTree::open(local.nodes(), *root);
             let mut base = local
                 .installed(level, &self.scope, &package.name)?
                 .map(|root| target.at(root));

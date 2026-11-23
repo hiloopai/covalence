@@ -1,24 +1,30 @@
-//! Prolly maps: canonical ordered maps from bytes to DASL values, stored in a
-//! content-addressed store.
+//! Canonical ordered trees stored in a content-addressed store.
 //!
 //! A [Prolly tree](https://www.dolthub.com/docs/architecture/storage-engine/prolly-tree)
 //! ("probabilistic B-tree") is a search tree whose node boundaries are chosen
 //! by hashing keys, so the same entries make the same tree whatever edits
-//! produced them. A [`Map`] is one stored on a [`Cas`]:
+//! produced them. A [`Tree`] stores typed keys and values on a [`Cas`]. Its
+//! [`Layout`] defines how its nodes become DASL records.
+//!
+//! [`LexiconTree`] selects the original node records and fixed parameters:
 //!
 //! - Keys are byte strings, ordered bytewise; values are DASL values.
 //! - Each node is a DRISL record named by its DRISL BLAKE3 CID, so the root
 //!   CID depends only on the entries.
-//! - Maps are values: [`Map::insert`], [`Map::remove`], [`Map::apply`] and
-//!   [`Map::union`] return new maps, sharing unchanged nodes with the old one.
-//! - [`Map::diff`] skips subtrees the two maps share without reading them.
+//!
+//! Edits such as [`Tree::insert`] and [`Tree::remove`] return a new tree that
+//! shares unchanged nodes with the original. [`Tree::diff`] skips shared
+//! subtrees without reading them.
 //!
 //! Terms:
 //!
+//! - [CAS](https://en.wikipedia.org/wiki/Content-addressable_storage) is a
+//!   content-addressed store, which retrieves bytes by their content identifier
+//!   ([CID](https://dasl.ing/cid.html)).
 //! - [DASL](https://dasl.ing/) (Data-Addressed Structures & Links) is a small
 //!   set of specs for content-addressed data. A DASL value is null, a
 //!   boolean, an integer, bytes, a string, a list, a map with string keys, or
-//!   a [CID](https://dasl.ing/cid.html) link.
+//!   a CID link.
 //! - [DRISL](https://dasl.ing/drisl.html) is DASL's deterministic CBOR
 //!   encoding, so equal values encode to equal bytes and get equal CIDs.
 //!
@@ -26,25 +32,30 @@
 //! use covalence_cas_memory::MemoryCas;
 //! use covalence_cas_trait::Cas;
 //! use covalence_lib_dasl::Value;
-//! use covalence_cas_prolly::{Error, Map};
+//! use covalence_cas_prolly::{Error, LexiconTree};
 //! let cas = MemoryCas::default().into_dyn();
-//! let map = Map::build(cas.clone(), [("a".into(), Value::Integer(1))])?;
+//! let map = LexiconTree::build(cas.clone(), [("a".into(), Value::Integer(1))])?;
 //! let map = map.insert("b".into(), Value::Null)?;
 //! assert_eq!(map.get(b"a")?, Some(Value::Integer(1)));
 //! assert_eq!(map.rank(b"b")?, 1);
 //! // The root depends only on the entries, not on how they were made.
-//! let built = Map::build(cas, [("a".into(), Value::Integer(1)), ("b".into(), Value::Null)])?;
+//! let built = LexiconTree::build(cas, [("a".into(), Value::Integer(1)), ("b".into(), Value::Null)])?;
 //! assert_eq!(map.root(), built.root());
 //! # Ok::<(), Error>(())
 //! ```
 //!
 //! # Nodes
 //!
+//! In the Lexicon layout:
+//!
 //! - A leaf is `{"$type": "vc.cov.prolly.leaf", "entries": [[key, value],
 //!   ...]}`.
 //! - A branch is `{"$type": "vc.cov.prolly.branch", "children": [[first_key,
 //!   count, link], ...]}`, where `count` is the number of entries under the
 //!   child and `link` its CID.
+//!
+//! In every tree:
+//!
 //! - A node's level is 0 for a leaf and one more than its children's for a
 //!   branch. All leaves are at level 0, and a tree has at most 64 levels of
 //!   branches.
@@ -67,7 +78,7 @@
 //! - Its bytes hash to its CID, else [`Error::Cas`]. The other checks fail
 //!   with [`Error::Malformed`].
 //! - Its CID is a DRISL BLAKE3 CID, as are its child links.
-//! - It is a leaf or branch record and nothing else. Its keys strictly
+//! - The layout recognizes it as a leaf or branch. Its keys strictly
 //!   increase, a branch has children, and child counts are positive with a
 //!   total that fits a `u64`.
 //! - Its first key and count are those its parent records, and its keys stay
@@ -77,15 +88,15 @@
 //! - A root branch has at least two children.
 //!
 //! A read learns the tree's height at the first leaf it reaches, or in
-//! [`Map::diff`] from a subtree both trees share, and checks the levels of the
+//! [`Tree::diff`] from a subtree both trees share, and checks the levels of the
 //! nodes it loaded before then.
 //!
 //! What is not loaded is trusted: the counts, chunking and heights of skipped
-//! subtrees, which [`Map::len`], [`Map::nth`] and [`Map::rank`] sum and
-//! [`Map::apply`] reuses. [`Map::verify`] loads every node, deciding whether
+//! subtrees, which [`Tree::len`], [`Tree::nth`] and [`Tree::rank`] sum and
+//! [`Tree::apply`] reuses. [`Tree::verify`] loads every node, deciding whether
 //! the whole tree is canonical.
 //!
-//! Maps derived from one another, by an edit, [`Map::at`] or `clone`, share a
+//! Trees derived from one another, by an edit, [`Tree::at`] or `clone`, share a
 //! cache of checked nodes. A cached node's hash and decoding are not checked
 //! again, nor the chunking rule at a level where it already passed; checks
 //! that depend on the node's place in the tree run at every load.
@@ -94,6 +105,7 @@
 mod build;
 mod cache;
 mod io;
+mod layout;
 mod node;
 
 use std::{
@@ -113,9 +125,22 @@ use covalence_lib_error::snafu::{OptionExt, Snafu, ensure};
 use build::Builder;
 use cache::Cache;
 use io::{Loader, store};
-use node::{Child, Node, upper_of};
+use node::{encode, upper_of};
 
-/// Errors from reading and storing maps.
+pub use layout::{Layout, LexiconLayout};
+pub use node::{Child, Node};
+
+type Entry<L> = (<L as Layout>::Key, <L as Layout>::Value);
+type NodeOf<L> = Node<<L as Layout>::Key, <L as Layout>::Value>;
+type TreeChange<L> = Change<<L as Layout>::Key, <L as Layout>::Value>;
+
+/// A tree using the original Lexicon records and fixed chunking parameters.
+pub type LexiconTree = Tree<LexiconLayout>;
+
+/// The original name for [`LexiconTree`].
+pub type Map = LexiconTree;
+
+/// Errors from reading and storing trees.
 #[derive(Debug, Snafu)]
 #[snafu(crate_root(covalence_lib_error::snafu))]
 #[non_exhaustive]
@@ -164,16 +189,16 @@ pub enum Error {
 
 /// One change to a map.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Edit {
+pub enum Edit<K = Bytes, V = Value> {
     /// Insert or replace.
-    Insert(Bytes, Value),
+    Insert(K, V),
     /// Remove if present.
-    Remove(Bytes),
+    Remove(K),
 }
 
-impl Edit {
+impl<K, V> Edit<K, V> {
     /// The key this edit changes.
-    pub fn key(&self) -> &Bytes {
+    pub fn key(&self) -> &K {
         match self {
             Edit::Insert(key, _) | Edit::Remove(key) => key,
         }
@@ -183,30 +208,38 @@ impl Edit {
 /// A key whose value differs between two maps: added if `old` is `None`,
 /// removed if `new` is.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Change {
+pub struct Change<K = Bytes, V = Value> {
     /// The key.
-    pub key: Bytes,
+    pub key: K,
     /// The value in the first map, if any.
-    pub old: Option<Value>,
+    pub old: Option<V>,
     /// The value in the second map, if any.
-    pub new: Option<Value>,
+    pub new: Option<V>,
 }
 
-/// A map stored on a [`Cas`], named by its root.
-#[derive(Clone)]
-pub struct Map {
+/// A tree stored on a [`Cas`], named by its root CID.
+///
+/// Select the same layout when opening a root again. The root identifies
+/// the stored bytes, and the caller supplies the layout that interprets them.
+pub struct Tree<L: Layout> {
     cas: Arc<dyn Cas>,
-    cache: Arc<Cache>,
+    cache: Arc<Cache<L>>,
     root: Cid<Bdasl>,
 }
 
-impl fmt::Debug for Map {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Map").field(&self.root).finish()
+impl<L: Layout> Clone for Tree<L> {
+    fn clone(&self) -> Self {
+        self.at(self.root)
     }
 }
 
-impl Map {
+impl<L: Layout> fmt::Debug for Tree<L> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Tree").field(&self.root).finish()
+    }
+}
+
+impl<L: Layout> Tree<L> {
     /// The map with root `root`, with a new cache. Its nodes are checked as
     /// they are read, so this does no I/O and cannot fail.
     pub fn open(cas: Arc<dyn Cas>, root: Cid<Bdasl>) -> Self {
@@ -220,7 +253,7 @@ impl Map {
         Self { cas, cache, root }
     }
 
-    fn loader(&self) -> Loader {
+    fn loader(&self) -> Loader<L> {
         Loader::new(self.cas.clone(), self.cache.clone())
     }
 
@@ -233,12 +266,17 @@ impl Map {
     /// with [`Error::Unsorted`] at the first key out of order.
     pub fn build(
         cas: Arc<dyn Cas>,
-        entries: impl IntoIterator<Item = (Bytes, Value)>,
+        entries: impl IntoIterator<Item = Entry<L>>,
     ) -> Result<Self, Error> {
         let mut builder = Builder::default();
-        let mut last: Option<Bytes> = None;
+        let mut last: Option<L::Key> = None;
         for (key, value) in entries {
-            ensure!(last.is_none_or(|last| last < key), UnsortedSnafu { key });
+            ensure!(
+                last.is_none_or(|last| last.as_ref() < key.as_ref()),
+                UnsortedSnafu {
+                    key: Bytes::copy_from_slice(key.as_ref())
+                }
+            );
             last = Some(key.clone());
             builder.push_entry(key, value)?;
             flush(&*cas, &mut builder)?;
@@ -253,31 +291,37 @@ impl Map {
 
     /// The value under `key`, or `None` if missing. Reads one path from the
     /// root to a leaf.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Value>, Error> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<L::Value>, Error> {
         let leaf = self.walk(|children| child_for(children, key).unwrap_or(0))?;
         let entries = leaf.entries();
-        let found = entries.binary_search_by(|(k, _)| k[..].cmp(key));
+        let found = entries.binary_search_by(|(k, _)| k.as_ref().cmp(key));
         Ok(found.ok().map(|i| entries[i].1.clone()))
     }
 
     /// Insert or replace an entry.
-    pub fn insert(&self, key: Bytes, value: Value) -> Result<Self, Error> {
+    pub fn insert(&self, key: L::Key, value: L::Value) -> Result<Self, Error> {
         self.apply([Edit::Insert(key, value)])
     }
 
     /// Remove `key`'s entry, if any.
-    pub fn remove(&self, key: Bytes) -> Result<Self, Error> {
+    pub fn remove(&self, key: L::Key) -> Result<Self, Error> {
         self.apply([Edit::Remove(key)])
     }
 
     /// Apply edits in strictly increasing key order, or fail with
     /// [`Error::Unsorted`]. Only the paths to the edited keys are rewritten,
     /// with the nodes after them that chunking must cut again.
-    pub fn apply(&self, edits: impl IntoIterator<Item = Edit>) -> Result<Self, Error> {
-        let edits: Vec<Edit> = edits.into_iter().collect();
-        if let Some(pair) = edits.windows(2).find(|pair| pair[0].key() >= pair[1].key()) {
+    pub fn apply(
+        &self,
+        edits: impl IntoIterator<Item = Edit<L::Key, L::Value>>,
+    ) -> Result<Self, Error> {
+        let edits: Vec<_> = edits.into_iter().collect();
+        if let Some(pair) = edits
+            .windows(2)
+            .find(|pair| pair[0].key().as_ref() >= pair[1].key().as_ref())
+        {
             return UnsortedSnafu {
-                key: pair[1].key().clone(),
+                key: Bytes::copy_from_slice(pair[1].key().as_ref()),
             }
             .fail();
         }
@@ -309,12 +353,12 @@ impl Map {
 
     /// Whether the root is the empty leaf. Reads nothing.
     pub fn is_empty(&self) -> bool {
-        self.root == empty_root()
+        encode::<L>(&Node::Leaf(Vec::new())).is_ok_and(|(cid, _)| cid == self.root)
     }
 
     /// The entry at position `index` in key order, or `None` if there are
     /// not that many.
-    pub fn nth(&self, mut index: u64) -> Result<Option<(Bytes, Value)>, Error> {
+    pub fn nth(&self, mut index: u64) -> Result<Option<Entry<L>>, Error> {
         let leaf = self.walk(|children| {
             // Skip whole children until `index` falls inside one, or the
             // last.
@@ -338,12 +382,15 @@ impl Map {
             before += children[..i].iter().map(|child| child.count).sum::<u64>();
             i
         })?;
-        Ok(before + leaf.entries().partition_point(|(k, _)| k[..] < *key) as u64)
+        Ok(before + leaf.entries().partition_point(|(k, _)| k.as_ref() < key) as u64)
     }
 
     /// Walk from the root to a leaf, taking the child `pick` chooses, and
     /// return the leaf.
-    fn walk(&self, mut pick: impl FnMut(&[Child]) -> usize) -> Result<Arc<Node>, Error> {
+    fn walk(
+        &self,
+        mut pick: impl FnMut(&[Child<L::Key>]) -> usize,
+    ) -> Result<Arc<NodeOf<L>>, Error> {
         let mut tree = self.loader();
         let (mut node, mut upper, mut depth) = (tree.root(self.root)?, None, 0);
         while let Node::Branch(children) = &*node {
@@ -364,10 +411,10 @@ impl Map {
     /// use covalence_cas_memory::MemoryCas;
     /// use covalence_cas_trait::Cas;
     /// use covalence_lib_dasl::Value;
-    /// use covalence_cas_prolly::{Error, Map};
+    /// use covalence_cas_prolly::{Error, LexiconTree};
     /// let cas = MemoryCas::default().into_dyn();
     /// let entries = ["a", "b", "c"].map(|key| (key.into(), Value::Null));
-    /// let map = Map::build(cas, entries)?;
+    /// let map = LexiconTree::build(cas, entries)?;
     /// let keys: Vec<_> = map
     ///     .range((Bound::Included(&b"b"[..]), Bound::Unbounded))?
     ///     .map(|entry| Ok(entry?.0))
@@ -375,7 +422,7 @@ impl Map {
     /// assert_eq!(keys, ["b", "c"]);
     /// # Ok::<(), Error>(())
     /// ```
-    pub fn range(&self, bounds: impl RangeBounds<[u8]>) -> Result<Range, Error> {
+    pub fn range(&self, bounds: impl RangeBounds<[u8]>) -> Result<Range<L>, Error> {
         let mut tree = self.loader();
         let root = tree.root(self.root)?;
         let mut range = Range {
@@ -397,9 +444,9 @@ impl Map {
     /// use covalence_cas_memory::MemoryCas;
     /// use covalence_cas_trait::Cas;
     /// use covalence_lib_dasl::Value;
-    /// use covalence_cas_prolly::{Change, Error, Map};
+    /// use covalence_cas_prolly::{Change, Error, LexiconTree};
     /// let cas = MemoryCas::default().into_dyn();
-    /// let old = Map::build(cas, [("a".into(), Value::Integer(1))])?;
+    /// let old = LexiconTree::build(cas, [("a".into(), Value::Integer(1))])?;
     /// let new = old.insert("a".into(), Value::Integer(2))?;
     /// let change = Change {
     ///     key: "a".into(),
@@ -409,7 +456,7 @@ impl Map {
     /// assert_eq!(old.diff(&new)?, [change]);
     /// # Ok::<(), Error>(())
     /// ```
-    pub fn diff(&self, other: &Map) -> Result<Vec<Change>, Error> {
+    pub fn diff(&self, other: &Self) -> Result<Vec<TreeChange<L>>, Error> {
         let mut changes = Vec::new();
         if self.root == other.root {
             return Ok(changes);
@@ -439,7 +486,7 @@ impl Map {
                     b.pop();
                     continue;
                 }
-                (Some(x), Some(y)) => match (x.key().cmp(y.key()), x, y) {
+                (Some(x), Some(y)) => match (x.key().as_ref().cmp(y.key().as_ref()), x, y) {
                     (Ordering::Less, ..) => 0,
                     (Ordering::Greater, ..) => 1,
                     // At the same key, open children first, the bigger one
@@ -508,8 +555,8 @@ impl Map {
     /// theirs)` gives the value. Subtrees the maps share are not read.
     pub fn union(
         &self,
-        other: &Map,
-        mut resolve: impl FnMut(&Bytes, Value, Value) -> Value,
+        other: &Self,
+        mut resolve: impl FnMut(&L::Key, L::Value, L::Value) -> L::Value,
     ) -> Result<Self, Error> {
         let edits = self.diff(other)?.into_iter().filter_map(|change| {
             let value = match (change.old, change.new?) {
@@ -531,10 +578,10 @@ impl Map {
     }
 }
 
-fn verify(
-    tree: &mut Loader,
-    node: &Node,
-    upper: &Option<Bytes>,
+fn verify<L: Layout>(
+    tree: &mut Loader<L>,
+    node: &NodeOf<L>,
+    upper: &Option<L::Key>,
     depth: usize,
 ) -> Result<(), Error> {
     if let Node::Branch(children) = node {
@@ -547,21 +594,17 @@ fn verify(
     Ok(())
 }
 
-/// The root of the empty map.
-fn empty_root() -> Cid<Bdasl> {
-    Node::Leaf(Vec::new())
-        .encode()
-        .expect("the empty leaf encodes")
-        .0
-}
-
-fn flush(cas: &dyn Cas, builder: &mut Builder) -> Result<(), Error> {
+fn flush<L: Layout>(cas: &dyn Cas, builder: &mut Builder<L>) -> Result<(), Error> {
     builder.drain().try_for_each(|block| store(cas, block))
 }
 
 /// Store the rest of the tree and return its root, skipping one-child
 /// branches at the root.
-fn finish(cas: Arc<dyn Cas>, cache: Arc<Cache>, mut builder: Builder) -> Result<Map, Error> {
+fn finish<L: Layout>(
+    cas: Arc<dyn Cas>,
+    cache: Arc<Cache<L>>,
+    mut builder: Builder<L>,
+) -> Result<Tree<L>, Error> {
     let mut root = builder.finish()?;
     flush(&*cas, &mut builder)?;
     while let Node::Branch(children) = &*cache.load(&*cas, root)?
@@ -569,25 +612,32 @@ fn finish(cas: Arc<dyn Cas>, cache: Arc<Cache>, mut builder: Builder) -> Result<
     {
         root = child.cid;
     }
-    Ok(Map { cas, cache, root })
+    Ok(Tree { cas, cache, root })
 }
 
-/// A rewrite of a tree of `height` by [`Map::apply`].
-struct Rewrite<'a, I: Iterator<Item = Edit>> {
+/// A rewrite of a tree of `height` by [`Tree::apply`].
+struct Rewrite<'a, L: Layout> {
     cas: &'a dyn Cas,
-    tree: Loader,
+    tree: Loader<L>,
     height: usize,
-    builder: Builder,
-    edits: Peekable<I>,
+    builder: Builder<L>,
+    edits: Peekable<std::vec::IntoIter<Edit<L::Key, L::Value>>>,
 }
 
-impl<I: Iterator<Item = Edit>> Rewrite<'_, I> {
+impl<L: Layout> Rewrite<'_, L> {
     /// Rebuild `node`, at `depth`, with the edits below `upper` applied.
     /// Untouched children are fed whole. Only the last node of a level has
     /// no `upper`, and it is untouched only when no edits follow.
-    fn node(&mut self, node: Arc<Node>, depth: usize, upper: &Option<Bytes>) -> Result<(), Error> {
-        let below = |edit: &Edit, upper: &Option<Bytes>| {
-            upper.as_ref().is_none_or(|upper| edit.key() < upper)
+    fn node(
+        &mut self,
+        node: Arc<NodeOf<L>>,
+        depth: usize,
+        upper: &Option<L::Key>,
+    ) -> Result<(), Error> {
+        let below = |edit: &Edit<L::Key, L::Value>, upper: &Option<L::Key>| {
+            upper
+                .as_ref()
+                .is_none_or(|upper| edit.key().as_ref() < upper.as_ref())
         };
         match &*node {
             Node::Leaf(entries) => {
@@ -595,11 +645,13 @@ impl<I: Iterator<Item = Edit>> Rewrite<'_, I> {
                 loop {
                     let edit = self.edits.next_if(|edit| {
                         below(edit, upper)
-                            && entries.peek().is_none_or(|(key, _)| edit.key() <= key)
+                            && entries
+                                .peek()
+                                .is_none_or(|(key, _)| edit.key().as_ref() <= key.as_ref())
                     });
                     match edit {
                         Some(edit) => {
-                            entries.next_if(|(key, _)| key == edit.key());
+                            entries.next_if(|(key, _)| key.as_ref() == edit.key().as_ref());
                             if let Edit::Insert(key, value) = edit {
                                 self.builder.push_entry(key, value)?;
                             }
@@ -634,42 +686,44 @@ impl<I: Iterator<Item = Edit>> Rewrite<'_, I> {
 }
 
 /// The child whose range holds `key`, or `None` if `key` is before them all.
-fn child_for(children: &[Child], key: &[u8]) -> Option<usize> {
+fn child_for<K: AsRef<[u8]>>(children: &[Child<K>], key: &[u8]) -> Option<usize> {
     children
-        .partition_point(|child| child.key[..] <= *key)
+        .partition_point(|child| child.key.as_ref() <= key)
         .checked_sub(1)
 }
 
 /// Whether `key` is within `end`.
-fn before_end(end: &Bound<Bytes>, key: &Bytes) -> bool {
+fn before_end(end: &Bound<Bytes>, key: &[u8]) -> bool {
     match end {
-        Bound::Included(end) => key <= end,
-        Bound::Excluded(end) => key < end,
+        Bound::Included(end) => key <= end.as_ref(),
+        Bound::Excluded(end) => key < end.as_ref(),
         Bound::Unbounded => true,
     }
 }
 
-/// An iterator over a key range of a map; see [`Map::range`].
+type RangeStep<L> = (Arc<NodeOf<L>>, usize, Option<<L as Layout>::Key>);
+
+/// An iterator over a key range of a map; see [`Tree::range`].
 ///
 /// It yields an error, then stops, if a node it loads fails.
-pub struct Range {
-    tree: Loader,
+pub struct Range<L: Layout = LexiconLayout> {
+    tree: Loader<L>,
     /// Branches from the root, each with the child being read and its bound.
-    path: Vec<(Arc<Node>, usize, Option<Bytes>)>,
+    path: Vec<RangeStep<L>>,
     /// The leaf being read, and the index of its next entry.
-    leaf: Arc<Node>,
+    leaf: Arc<NodeOf<L>>,
     next: usize,
     end: Bound<Bytes>,
     done: bool,
 }
 
-impl Range {
+impl<L: Layout> Range<L> {
     /// Walk down from `node`, at the end of the path and with keys below
     /// `upper`, to the leaf holding the first key after `start`.
     fn descend(
         &mut self,
-        mut node: Arc<Node>,
-        mut upper: Option<Bytes>,
+        mut node: Arc<NodeOf<L>>,
+        mut upper: Option<L::Key>,
         start: Bound<&[u8]>,
     ) -> Result<(), Error> {
         while let Node::Branch(children) = &*node {
@@ -686,8 +740,8 @@ impl Range {
             (node, upper) = (child, child_upper);
         }
         self.next = node.entries().partition_point(|(key, _)| match start {
-            Bound::Included(start) => key[..] < *start,
-            Bound::Excluded(start) => key[..] <= *start,
+            Bound::Included(start) => key.as_ref() < start,
+            Bound::Excluded(start) => key.as_ref() <= start,
             Bound::Unbounded => false,
         });
         self.leaf = node;
@@ -707,7 +761,7 @@ impl Range {
                 continue;
             }
             *i += 1;
-            if !before_end(&self.end, &children[*i].key) {
+            if !before_end(&self.end, children[*i].key.as_ref()) {
                 return Ok(false);
             }
             let child_upper = upper_of(children, *i, upper);
@@ -718,14 +772,14 @@ impl Range {
     }
 }
 
-impl Iterator for Range {
-    type Item = Result<(Bytes, Value), Error>;
+impl<L: Layout> Iterator for Range<L> {
+    type Item = Result<Entry<L>, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while !self.done {
             if let Some((key, value)) = self.leaf.entries().get(self.next).cloned() {
                 self.next += 1;
-                if before_end(&self.end, &key) {
+                if before_end(&self.end, key.as_ref()) {
                     return Some(Ok((key, value)));
                 }
                 self.done = true;
@@ -744,14 +798,14 @@ impl Iterator for Range {
     }
 }
 
-/// An item pending in [`Map::diff`]: an entry, or a child at its depth.
-enum Item {
-    Entry(Bytes, Value),
-    Child(Child, usize),
+/// An item pending in [`Tree::diff`]: an entry, or a child at its depth.
+enum Item<K, V> {
+    Entry(K, V),
+    Child(Child<K>, usize),
 }
 
-impl Item {
-    fn key(&self) -> &Bytes {
+impl<K, V> Item<K, V> {
+    fn key(&self) -> &K {
         match self {
             Item::Entry(key, _) => key,
             Item::Child(child, _) => &child.key,
@@ -760,7 +814,7 @@ impl Item {
 }
 
 /// Push the items of `node`, at `depth`, in reverse key order.
-fn expand(items: &mut Vec<Item>, node: &Node, depth: usize) {
+fn expand<K: Clone, V: Clone>(items: &mut Vec<Item<K, V>>, node: &Node<K, V>, depth: usize) {
     match node {
         Node::Leaf(entries) => items.extend(
             entries

@@ -8,7 +8,7 @@
 //! - `lake/<scope>/cas/blake3/<digest>/bytes.zst`: map nodes, in a [`KvCas`]
 //!   with Zstandard; Prolly names its nodes by BLAKE3.
 //! - `lake/<scope>/rev/<owner>/<repo>/<commit>/<package>`: the root CID of
-//!   that package's [`Map`] at that commit, as text.
+//!   that package's [`LexiconTree`] at that commit, as text.
 //!
 //! A revision map is a Prolly map from a Lake input hash, as 16 lowercase hex
 //! digits, to an [`Entry`]. An entry's `artifacts` are the only place Lake
@@ -21,10 +21,10 @@ use std::{
 };
 
 use covalence_cas_kv::{Compression, KvCas};
-use covalence_cas_prolly::Map;
+use covalence_cas_prolly::{Layout, LexiconLayout, LexiconTree, Node};
 use covalence_cas_trait::{Cas, GetExt};
 use covalence_kv_trait::Kv;
-use covalence_lib_cid::{Bdasl, Cid, Codec, Packed32, Sha256, storage};
+use covalence_lib_cid::{Bdasl, Cid, Format, Packed32, Sha256, storage};
 use covalence_lib_dasl::Value;
 use covalence_lib_data::Bytes;
 
@@ -153,7 +153,7 @@ fn input(key: &[u8]) -> Result<String> {
 }
 
 /// Store a revision map of `entries`, keyed by Lake input hash.
-pub fn build(cas: Arc<dyn Cas>, entries: &BTreeMap<String, Entry>) -> Result<Map> {
+pub fn build(cas: Arc<dyn Cas>, entries: &BTreeMap<String, Entry>) -> Result<LexiconTree> {
     let entries = entries
         .iter()
         .map(|(input, entry)| {
@@ -163,11 +163,11 @@ pub fn build(cas: Arc<dyn Cas>, entries: &BTreeMap<String, Entry>) -> Result<Map
             Ok((Bytes::copy_from_slice(input.as_bytes()), entry.to_value()?))
         })
         .collect::<Result<Vec<_>>>()?;
-    Map::build(cas, entries).map_err(map_error("build revision map"))
+    LexiconTree::build(cas, entries).map_err(map_error("build revision map"))
 }
 
 /// Every entry of a revision map.
-pub fn entries(map: &Map) -> Result<BTreeMap<String, Entry>> {
+pub fn entries(map: &LexiconTree) -> Result<BTreeMap<String, Entry>> {
     map.range(..)
         .map_err(map_error("read revision map"))?
         .map(|item| {
@@ -189,7 +189,7 @@ pub struct Transfer {
 
 /// The minimal transfer from the map at `from`, if any, to `to`: Prolly's
 /// root-to-root diff, which skips the subtrees both maps share unread.
-pub fn transfer(from: Option<&Map>, to: &Map) -> Result<Transfer> {
+pub fn transfer(from: Option<&LexiconTree>, to: &LexiconTree) -> Result<Transfer> {
     let mut transfer = Transfer::default();
     let mut replaced = BTreeSet::new();
     match from {
@@ -226,6 +226,9 @@ pub fn transfer(from: Option<&Map>, to: &Map) -> Result<Transfer> {
 /// are raw links, are not copied.
 pub fn copy_nodes(from: &dyn Cas, to: &dyn Cas, root: Cid<Bdasl>) -> Result<usize> {
     let node = |link: Cid<Bdasl>| {
+        if link.format() != Format::DRISL_BLAKE3 {
+            return Err(invalid(format!("invalid revision map node CID {link}")));
+        }
         link.cast::<Packed32>()
             .map_err(cid_error("address map node"))
     };
@@ -244,10 +247,13 @@ pub fn copy_nodes(from: &dyn Cas, to: &dyn Cas, root: Cid<Bdasl>) -> Result<usiz
                 operation: "decode map node".into(),
                 source,
             })?;
-            let children = value
-                .links()
-                .filter(|link| link.codec() == Codec::Drisl.code())
-                .collect::<Vec<_>>();
+            let children = match LexiconLayout::decode(value) {
+                Some(Node::Leaf(_)) => Vec::new(),
+                Some(Node::Branch(children)) => {
+                    children.into_iter().map(|child| child.cid).collect()
+                }
+                None => return Err(invalid(format!("invalid revision map node {cid}"))),
+            };
             Ok(Some((fact.bytes().clone(), children)))
         })?;
         let mut next = BTreeSet::new();
@@ -276,6 +282,7 @@ pub fn copy_nodes(from: &dyn Cas, to: &dyn Cas, root: Cid<Bdasl>) -> Result<usiz
 mod tests {
     use super::*;
     use covalence_cas_memory::MemoryCas;
+    use covalence_cas_trait::Put;
     use covalence_kv_memory::MemoryKv;
 
     fn entry(output: &str, artifact: &[u8]) -> Entry {
@@ -334,9 +341,18 @@ mod tests {
             Arc::new(store(MemoryKv::default().into_dyn(), "linux-x86_64/t").unwrap());
         let mut all = inputs(5000);
         let old = build(local.clone(), &all).unwrap();
-        let first = copy_nodes(&*local, &*remote, old.root()).unwrap();
+        // The revision pointer written by the original Lake pool writer.
+        let published = "bafyr4icwfdzakglr3qkg2h34fykz2pi54ltce43errkl2dcliottrsuvkm"
+            .parse()
+            .unwrap();
+        assert_eq!(old.root(), published);
+        let first = copy_nodes(&*local, &*remote, published).unwrap();
         assert!(first > 2);
-        assert_eq!(copy_nodes(&*local, &*remote, old.root()).unwrap(), 0);
+        assert_eq!(
+            entries(&LexiconTree::open(remote.clone(), published)).unwrap(),
+            all
+        );
+        assert_eq!(copy_nodes(&*local, &*remote, published).unwrap(), 0);
         all.insert(
             format!("{:016x}", 1),
             entry("00000000000000ee.ltar", b"edited"),
@@ -347,7 +363,26 @@ mod tests {
         let fresh = MemoryCas::default().into_dyn();
         let total = copy_nodes(&*remote, &*fresh, new.root()).unwrap();
         assert!(total >= first);
-        assert_eq!(entries(&Map::open(fresh, new.root())).unwrap(), all);
+        assert_eq!(entries(&LexiconTree::open(fresh, new.root())).unwrap(), all);
+    }
+
+    #[test]
+    fn copying_nodes_rejects_a_raw_block_as_a_child() {
+        let from = MemoryCas::default();
+        let to = MemoryCas::default();
+        let raw = from.put(Bytes::from_static(b"artifact")).unwrap();
+        let branch = Node::Branch(vec![covalence_cas_prolly::Child {
+            key: "key".into(),
+            count: 1,
+            cid: raw.cast().unwrap(),
+        }]);
+        let record = LexiconLayout::encode(&branch).unwrap();
+        let root = record.cid().unwrap();
+        from.put(record.encode().unwrap().into()).unwrap();
+
+        assert!(copy_nodes(&from, &to, root).is_err());
+        assert!(!to.has(&raw).unwrap());
+        assert!(!to.has(&root.into()).unwrap());
     }
 
     #[test]

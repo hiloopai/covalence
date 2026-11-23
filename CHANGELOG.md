@@ -15,6 +15,18 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+### Added
+
+- Rust Prolly trees support typed keys and values through a node layout.
+  `LexiconTree` selects the original layout used by Lake and the kernel checker,
+  preserving their stored nodes and root CIDs. `Map` remains an alias.
+
+### Changed
+
+- **Breaking:** Prolly `Edit` and `Change` now take key and value types.
+  If Rust cannot infer them, annotate with the bare type name to use byte
+  keys and DASL values.
+
 ## [0.1.0-dev.12] - 2026-11-20
 
 ### Added
