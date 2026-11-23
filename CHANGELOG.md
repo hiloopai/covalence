@@ -15,6 +15,11 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+### Added
+
+- Rust callers can use `covalence_cas_memory::Table` directly to store and
+  look up verified blocks by raw BLAKE3 CID without locking.
+
 ## [0.1.0-dev.12] - 2026-11-20
 
 ### Added

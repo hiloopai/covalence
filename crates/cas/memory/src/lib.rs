@@ -1,6 +1,8 @@
 //! An in-memory content-addressed store.
 //!
-//! [`MemoryCas`] keeps each block once, as a [`Fact`] for its raw BLAKE3 CID.
+//! [`Table`] keeps each block once, as a [`Fact`] for its raw BLAKE3
+//! [content identifier (CID)](https://github.com/multiformats/cid).
+//! [`MemoryCas`] wraps the table for shared access and implements the store traits.
 //!
 //! - A CID with a 32-byte [BLAKE3](https://github.com/BLAKE3-team/BLAKE3-specs)
 //!   digest finds its bytes whatever its codec; other CIDs find nothing.
@@ -43,9 +45,36 @@ use covalence_lib_data::{Bytes, HashTable};
 #[derive(Default)]
 pub struct MemoryCas(RwLock<Table>);
 
-/// Facts in insertion order, indexed by key.
+/// An in-memory table of verified blocks keyed by raw BLAKE3 CIDs.
+///
+/// Use [`Default`] to create an empty table. Inserts require exclusive access.
+/// For shared access through the store traits, use [`MemoryCas`].
+///
+/// Keys are raw [`Blake3`] CIDs. Internal positions are private. For other
+/// codecs, [`Cid::raw_blake3`] gives a key only for a 32-byte BLAKE3 digest.
+/// Lookups return facts with their raw CIDs.
+///
+/// ```
+/// use covalence_cas_memory::Table;
+/// use covalence_lib_cid::{Blake3, Cid, Fact, Format};
+///
+/// let mut table = Table::default();
+/// assert!(table.is_empty());
+/// let fact = Fact::<Blake3>::of("hello".into());
+/// let key = *fact.claim();
+/// assert!(table.find(&key).is_none());
+/// table.insert(fact.clone());
+/// table.insert(fact.clone());
+/// assert_eq!(table.len(), 1);
+///
+/// let cid: Cid = Cid::new(Format::DRISL_BLAKE3, key.digest())?;
+/// assert_eq!(table.find(&cid.raw_blake3().unwrap()), Some(&fact));
+/// let sha256: Cid = Cid::new(Format::SHA2_256, key.digest())?;
+/// assert!(sha256.raw_blake3().is_none());
+/// # Ok::<(), covalence_lib_cid::Error>(())
+/// ```
 #[derive(Default)]
-struct Table {
+pub struct Table {
     facts: Vec<Fact<Blake3>>,
     index: HashTable<u32>,
 }
@@ -56,7 +85,8 @@ fn hash(key: &Blake3) -> u64 {
 }
 
 impl Table {
-    fn find(&self, key: &Blake3) -> Option<&Fact<Blake3>> {
+    /// Returns the stored fact for `key` if present.
+    pub fn find(&self, key: &Blake3) -> Option<&Fact<Blake3>> {
         let facts = &self.facts;
         let i = self
             .index
@@ -64,7 +94,12 @@ impl Table {
         Some(&facts[*i as usize])
     }
 
-    fn insert(&mut self, fact: Fact<Blake3>) {
+    /// Stores `fact` without rehashing its bytes, keeping the existing fact if present.
+    ///
+    /// # Panics
+    ///
+    /// Inserting a new block panics if the table already holds 2³² blocks.
+    pub fn insert(&mut self, fact: Fact<Blake3>) {
         if self.find(fact.claim()).is_some() {
             return;
         }
@@ -73,12 +108,22 @@ impl Table {
         index.insert_unique(hash(fact.claim()), i, |&i| hash(facts[i as usize].claim()));
         facts.push(fact);
     }
+
+    /// Returns the number of stored blocks.
+    pub fn len(&self) -> usize {
+        self.facts.len()
+    }
+
+    /// Returns whether the table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl MemoryCas {
     /// The number of stored blocks.
     pub fn len(&self) -> usize {
-        self.0.read().unwrap().facts.len()
+        self.0.read().unwrap().len()
     }
 
     /// Whether the store is empty.
@@ -167,7 +212,7 @@ impl Cas for MemoryCas {
         let table = self.0.read().unwrap();
         let bytes = table.facts.iter().map(|f| f.bytes().len()).sum::<usize>();
         Ok(map([
-            ("blocks", Value::Integer(table.facts.len() as i64)),
+            ("blocks", Value::Integer(table.len() as i64)),
             ("bytes", Value::Integer(bytes as i64)),
         ]))
     }
