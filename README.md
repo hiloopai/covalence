@@ -88,6 +88,8 @@ Stores:
 - `crates/cas/sqlite`: a SQLite store.
 - `crates/cas/kv`: a content-addressed store over a key-value store.
 - `crates/cas/prolly`: Prolly maps on a CAS (not published yet).
+- [`crates/cas/fs`](crates/cas/fs/README.md): immutable filesystem trees by
+  CID (not published yet).
 - `crates/kv/trait`: the key-value store trait.
 - `crates/kv/memory`: an in-memory key-value store.
 - `crates/kv/s3`: a key-value store on S3.

@@ -15,6 +15,12 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
 
 ## [Unreleased]
 
+### Added
+
+- Rust workspace support for hashing and storing immutable filesystem
+  directories from child CIDs, with lossless byte names and raw or DASL
+  leaf links.
+
 ## [0.1.0-dev.12] - 2026-11-20
 
 ### Added
