@@ -8,9 +8,9 @@ use std::{
 };
 
 use covalence_cas_memory::MemoryCas;
-use covalence_cas_prolly::{Change, Edit, Error, LexiconTree, Map};
+use covalence_cas_prolly::{Arena, Change, Edit, Error, LexiconLayout, LexiconTree, Map};
 use covalence_cas_trait::{
-    AsyncGet, AsyncPut, Cas, CasFuture, Error as CasError, Get, GetExt, Put, ready,
+    AsyncGet, AsyncPut, Cas, CasFuture, Error as CasError, Get, GetExt, Op, Put, ready,
 };
 use covalence_lib_cid::{Bdasl, Blake3, Cid, Cid32, Codec, HashFn, Sha256};
 use covalence_lib_dasl::Value;
@@ -464,12 +464,13 @@ fn rejects_unsorted_keys() {
     assert!(matches!(map.apply(edits), Err(Error::Unsorted { .. })));
 }
 
-/// Counts reads and puts, and can lose blocks.
+/// Counts reads and puts, and can lose blocks or fail a specific put.
 #[derive(Default)]
 struct Counting {
     cas: MemoryCas,
     reads: AtomicUsize,
     puts: AtomicUsize,
+    fail_put: AtomicUsize,
     lost: Vec<Cid32>,
 }
 
@@ -497,7 +498,10 @@ impl AsyncGet for Counting {
 
 impl Put for Counting {
     fn put(&self, bytes: Bytes) -> Result<Cid32, CasError> {
-        self.puts.fetch_add(1, Relaxed);
+        let attempt = self.puts.fetch_add(1, Relaxed) + 1;
+        if attempt == self.fail_put.load(Relaxed) {
+            return Err(Op::Put.unsupported());
+        }
         self.cas.put(bytes)
     }
 }
@@ -509,6 +513,99 @@ impl AsyncPut for Counting {
 }
 
 impl Cas for Counting {}
+
+#[test]
+fn arena_build_paths_share_roots_and_only_insert_allocates() {
+    let cas = Arc::new(Counting::default());
+    let mut arena = Arena::<LexiconLayout>::new(cas.clone());
+    let mut other = Arena::<LexiconLayout>::new(MemoryCas::default().into_dyn());
+    let inputs = [
+        Vec::new(),
+        vec![("a".into(), Value::Null)],
+        (0..2000)
+            .map(|i| (Bytes::from(format!("key{i:05}")), Value::Integer(i)))
+            .collect(),
+    ];
+    for entries in inputs {
+        let next = other.insert_map([]).unwrap();
+        let want = LexiconTree::build(MemoryCas::default().into_dyn(), entries.clone())
+            .unwrap()
+            .root();
+
+        cas.fail_put.store(1, Relaxed);
+        assert_eq!(arena.map_cid(entries.clone()).unwrap(), want);
+        assert_eq!(cas.take(), (0, 0));
+        assert!(matches!(
+            arena.insert_map(entries.clone()),
+            Err(Error::Cas { .. })
+        ));
+        cas.take();
+        cas.fail_put.store(0, Relaxed);
+
+        assert_eq!(arena.store_map(entries.clone()).unwrap(), want);
+        LexiconTree::open(cas.clone(), want).verify().unwrap();
+        // The other arena's next index is still out of range here.
+        assert!(matches!(arena.get(next), Err(Error::InvalidMapId)));
+        let id = arena.insert_map(entries).unwrap();
+        cas.take();
+        assert_eq!(arena.get(id).unwrap().root(), want);
+        assert_eq!(arena.get(next).unwrap().root(), want);
+        assert_eq!(cas.take(), (0, 0));
+    }
+}
+
+#[test]
+fn arena_build_paths_report_the_same_input_errors() {
+    let cas = Arc::new(Counting::default());
+    let mut arena = Arena::<LexiconLayout>::new(cas.clone());
+    let mut deep = Value::Null;
+    for _ in 0..covalence_lib_dasl::MAX_DEPTH {
+        deep = Value::List(vec![deep]);
+    }
+    for entries in [
+        vec![("a".into(), Value::Null), ("a".into(), Value::Null)],
+        vec![("a".into(), deep)],
+    ] {
+        let want = LexiconTree::build(cas.clone(), entries.clone())
+            .unwrap_err()
+            .to_string();
+        cas.take();
+        assert_eq!(
+            arena.map_cid(entries.clone()).unwrap_err().to_string(),
+            want
+        );
+        assert_eq!(cas.take(), (0, 0));
+        assert_eq!(
+            arena.store_map(entries.clone()).unwrap_err().to_string(),
+            want
+        );
+        assert_eq!(arena.insert_map(entries).unwrap_err().to_string(), want);
+    }
+}
+
+#[test]
+fn arena_shares_decoded_nodes_between_distinct_roots() {
+    let cas = Arc::new(Counting::default());
+    let mut arena = Arena::<LexiconLayout>::new(cas.clone());
+    // b066 ends the first leaf, which is identical in both maps.
+    let entries = |z| {
+        [
+            ("a".into(), Value::Null),
+            ("b066".into(), Value::Null),
+            ("z".into(), Value::Integer(z)),
+        ]
+    };
+    let first = arena.insert_map(entries(1)).unwrap();
+    let second = arena.insert_map(entries(2)).unwrap();
+    let (first, second) = (arena.get(first).unwrap(), arena.get(second).unwrap());
+    assert_ne!(first.root(), second.root());
+    cas.take();
+    assert_eq!(first.get(b"a").unwrap(), Some(Value::Null));
+    assert_eq!(cas.take(), (1, 0));
+    assert_eq!(second.get(b"a").unwrap(), Some(Value::Null));
+    assert_eq!(cas.take(), (0, 0));
+    assert_eq!(second.get(b"z").unwrap(), Some(Value::Integer(2)));
+}
 
 /// Keys blocks by SHA-256, so it cannot find nodes by their CIDs.
 #[derive(Default)]

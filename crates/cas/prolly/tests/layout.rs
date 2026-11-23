@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, ops::Bound};
 
 use covalence_cas_memory::MemoryCas;
 use covalence_cas_prolly::{
-    Change, Child, Edit, Error, Layout, LexiconLayout, LexiconTree, Node, Tree,
+    Arena, Change, Child, Edit, Error, Layout, LexiconLayout, LexiconTree, Node, Tree,
 };
 use covalence_cas_trait::{Cas, GetExt};
 use covalence_lib_cid::{Bdasl, Cid, Codec, HashFn};
@@ -89,7 +89,10 @@ fn typed_set_builds_opens_and_edits_its_own_layout() {
     let cas = MemoryCas::default().into_dyn();
     let name = |i| Name(Bytes::from(format!("name{i:04}")));
     let entries = (0..1200).map(|i| (name(i), ()));
-    let built = NameSet::build(cas.clone(), entries.clone()).unwrap();
+    let mut arena = Arena::<Names>::new(cas.clone());
+    let id = arena.insert_map(entries.clone()).unwrap();
+    let built = arena.get(id).unwrap();
+    assert_eq!(arena.map_cid(entries.clone()).unwrap(), built.root());
     let lexicon =
         LexiconTree::build(cas.clone(), entries.map(|(name, ())| (name.0, Value::Null))).unwrap();
     let root = cas.get_fact(&built.root().into()).unwrap().unwrap();
