@@ -3,7 +3,7 @@ use std::{
     ops::{Bound, RangeBounds},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
     },
 };
 
@@ -464,12 +464,13 @@ fn rejects_unsorted_keys() {
     assert!(matches!(map.apply(edits), Err(Error::Unsorted { .. })));
 }
 
-/// Counts reads and puts, and can lose blocks or fail a specific put.
+/// Counts reads and puts, and can fail reads or a specific put.
 #[derive(Default)]
 struct Counting {
     cas: MemoryCas,
     reads: AtomicUsize,
     puts: AtomicUsize,
+    fail_reads: AtomicBool,
     fail_put: AtomicUsize,
     lost: Vec<Cid32>,
 }
@@ -483,6 +484,9 @@ impl Counting {
 impl Get for Counting {
     fn get_unchecked(&self, key: &Cid32) -> Result<Option<Bytes>, CasError> {
         self.reads.fetch_add(1, Relaxed);
+        if self.fail_reads.load(Relaxed) {
+            return Err(Op::Get.unsupported());
+        }
         if self.lost.contains(key) {
             return Ok(None);
         }
@@ -628,6 +632,7 @@ fn arena_apply_updates_one_slot_and_preserves_snapshots() {
     let sibling = arena.insert_map(entries(1, 2)).unwrap();
     assert_ne!(id, sibling);
     let snapshot = arena.get(id).unwrap();
+    snapshot.verify().unwrap();
     let want = arena.map_cid(entries(3, 4)).unwrap();
     let first_leaf = arena.map_cid(entries(3, 4).into_iter().take(2)).unwrap();
     assert!(!cas.has(&first_leaf.into()).unwrap());
@@ -645,7 +650,20 @@ fn arena_apply_updates_one_slot_and_preserves_snapshots() {
     assert!(cas.has(&first_leaf.into()).unwrap());
     assert_eq!(arena.get(id).unwrap().root(), snapshot.root());
 
+    // The old tree is warm. The rewrite writes all blocks before its first
+    // store read, which checks the new root.
     cas.fail_put.store(0, Relaxed);
+    cas.fail_reads.store(true, Relaxed);
+    assert!(matches!(
+        arena.apply(id, edits()),
+        Err(Error::Cas {
+            source: CasError::Unsupported { op: Op::Get }
+        })
+    ));
+    cas.fail_reads.store(false, Relaxed);
+    assert!(cas.has(&want.into()).unwrap());
+    assert_eq!(arena.get(id).unwrap().root(), snapshot.root());
+
     assert_eq!(arena.apply(id, edits()).unwrap(), want);
     assert_eq!(arena.get(id).unwrap().root(), want);
     assert_eq!(arena.get(sibling).unwrap().root(), snapshot.root());
