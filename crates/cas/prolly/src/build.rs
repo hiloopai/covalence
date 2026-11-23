@@ -4,10 +4,11 @@
 use std::mem;
 
 use covalence_lib_cid::{Bdasl, Cid, HashFn};
-use covalence_lib_error::snafu::OptionExt;
+use covalence_lib_data::Bytes;
+use covalence_lib_error::snafu::{OptionExt, ensure};
 
 use crate::{
-    Child, Entry, Error, Layout, Node, NodeOf, TooLargeSnafu,
+    Child, Entry, Error, Layout, Node, NodeOf, TooLargeSnafu, UnsortedSnafu,
     node::{Block, encode},
 };
 
@@ -49,6 +50,32 @@ pub(crate) fn is_chunk(level: usize, keys: &[&[u8]], closed: bool) -> bool {
     let mut init = init.iter().enumerate();
     init.all(|(i, key)| !ends_node(level, key, i + 1))
         && (!closed || ends_node(level, last, keys.len()))
+}
+
+/// Build a root from sorted entries, passing each encoded block to `emit`.
+///
+/// Feeding entries alone produces a canonical root. Only a rewrite can
+/// reuse a whole single-child branch as its root.
+pub(crate) fn build_root<L: Layout>(
+    entries: impl IntoIterator<Item = Entry<L>>,
+    mut emit: impl FnMut(Block) -> Result<(), Error>,
+) -> Result<Cid<Bdasl>, Error> {
+    let mut builder = Builder::<L>::default();
+    let mut last: Option<L::Key> = None;
+    for (key, value) in entries {
+        ensure!(
+            last.is_none_or(|last| last.as_ref() < key.as_ref()),
+            UnsortedSnafu {
+                key: Bytes::copy_from_slice(key.as_ref())
+            }
+        );
+        last = Some(key.clone());
+        builder.push_entry(key, value)?;
+        builder.drain().try_for_each(&mut emit)?;
+    }
+    let root = builder.finish()?;
+    builder.drain().try_for_each(emit)?;
+    Ok(root)
 }
 
 /// Builds a tree from items fed in key order.

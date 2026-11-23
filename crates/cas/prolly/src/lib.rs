@@ -15,6 +15,8 @@
 //! Edits such as [`Tree::insert`] and [`Tree::remove`] return a new tree that
 //! shares unchanged nodes with the original. [`Tree::diff`] skips shared
 //! subtrees without reading them.
+//! An [`Arena`] keeps local IDs for whole maps on one store, sharing a node
+//! cache across their roots.
 //!
 //! Terms:
 //!
@@ -97,11 +99,13 @@
 //! the whole tree is canonical.
 //!
 //! Trees derived from one another, by an edit, [`Tree::at`] or `clone`, share a
-//! cache of checked nodes. A cached node's hash and decoding are not checked
-//! again, nor the chunking rule at a level where it already passed; checks
-//! that depend on the node's place in the tree run at every load.
+//! cache of checked nodes, as do trees from one [`Arena`]. A cached node's
+//! hash and decoding are not checked again, nor the chunking rule at a level
+//! where it already passed; checks that depend on the node's place in the tree
+//! run at every load.
 #![deny(missing_docs)]
 
+mod arena;
 mod build;
 mod cache;
 mod io;
@@ -122,11 +126,12 @@ use covalence_lib_dasl::Value;
 use covalence_lib_data::Bytes;
 use covalence_lib_error::snafu::{OptionExt, Snafu, ensure};
 
-use build::Builder;
+use build::{Builder, build_root};
 use cache::Cache;
 use io::{Loader, store};
 use node::{encode, upper_of};
 
+pub use arena::{Arena, MapId};
 pub use layout::{Layout, LexiconLayout};
 pub use node::{Child, Node};
 
@@ -140,7 +145,7 @@ pub type LexiconTree = Tree<LexiconLayout>;
 /// The original name for [`LexiconTree`].
 pub type Map = LexiconTree;
 
-/// Errors from reading and storing trees.
+/// Errors from trees and their arenas.
 #[derive(Debug, Snafu)]
 #[snafu(crate_root(covalence_lib_error::snafu))]
 #[non_exhaustive]
@@ -185,6 +190,12 @@ pub enum Error {
         /// The first key out of order.
         key: Bytes,
     },
+    /// The next arena slot index does not fit in a `u32`.
+    #[snafu(display("the Prolly arena has no more map IDs"))]
+    ArenaFull,
+    /// The map ID is outside the range of slots in the arena.
+    #[snafu(display("the map ID has no slot in this Prolly arena"))]
+    InvalidMapId,
 }
 
 /// One change to a map.
@@ -268,20 +279,26 @@ impl<L: Layout> Tree<L> {
         cas: Arc<dyn Cas>,
         entries: impl IntoIterator<Item = Entry<L>>,
     ) -> Result<Self, Error> {
-        let mut builder = Builder::default();
-        let mut last: Option<L::Key> = None;
-        for (key, value) in entries {
-            ensure!(
-                last.is_none_or(|last| last.as_ref() < key.as_ref()),
-                UnsortedSnafu {
-                    key: Bytes::copy_from_slice(key.as_ref())
-                }
-            );
-            last = Some(key.clone());
-            builder.push_entry(key, value)?;
-            flush(&*cas, &mut builder)?;
+        Self::build_with_cache(cas, Arc::default(), entries)
+    }
+
+    fn build_with_cache(
+        cas: Arc<dyn Cas>,
+        cache: Arc<Cache<L>>,
+        entries: impl IntoIterator<Item = Entry<L>>,
+    ) -> Result<Self, Error> {
+        let root = build_root::<L>(entries, |block| store(&*cas, block))?;
+        Self { cas, cache, root }.collapse_root()
+    }
+
+    /// Check the stored root and skip any branches with only one child.
+    fn collapse_root(mut self) -> Result<Self, Error> {
+        while let Node::Branch(children) = &*self.cache.load(&*self.cas, self.root)?
+            && let [child] = &children[..]
+        {
+            self.root = child.cid;
         }
-        finish(cas, Arc::default(), builder)
+        Ok(self)
     }
 
     /// The root's CID, which names the map's entries.
@@ -339,7 +356,9 @@ impl<L: Layout> Tree<L> {
             edits: edits.into_iter().peekable(),
         };
         rewrite.node(top, 0, &None)?;
-        finish(self.cas.clone(), self.cache.clone(), rewrite.builder)
+        let root = rewrite.builder.finish()?;
+        flush(&*self.cas, &mut rewrite.builder)?;
+        self.at(root).collapse_root()
     }
 
     /// The number of entries, as the root records. Reads the leftmost path,
@@ -596,23 +615,6 @@ fn verify<L: Layout>(
 
 fn flush<L: Layout>(cas: &dyn Cas, builder: &mut Builder<L>) -> Result<(), Error> {
     builder.drain().try_for_each(|block| store(cas, block))
-}
-
-/// Store the rest of the tree and return its root, skipping one-child
-/// branches at the root.
-fn finish<L: Layout>(
-    cas: Arc<dyn Cas>,
-    cache: Arc<Cache<L>>,
-    mut builder: Builder<L>,
-) -> Result<Tree<L>, Error> {
-    let mut root = builder.finish()?;
-    flush(&*cas, &mut builder)?;
-    while let Node::Branch(children) = &*cache.load(&*cas, root)?
-        && let [child] = &children[..]
-    {
-        root = child.cid;
-    }
-    Ok(Tree { cas, cache, root })
 }
 
 /// A rewrite of a tree of `height` by [`Tree::apply`].
