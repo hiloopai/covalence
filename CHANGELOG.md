@@ -22,7 +22,8 @@ listed in the [GitHub releases]. Dev.1 was an earlier Python-only preview.
   preserving their stored nodes and root CIDs. `Map` remains an alias.
 - Rust Prolly arenas keep typed maps under stable local IDs and share decoded
   nodes between maps on one store. Compute a map's root CID without touching
-  the store, or store the map with or without assigning a local ID.
+  the store, or store the map with or without assigning a local ID. Edits
+  update a slot after success and leave earlier snapshots readable.
 
 ### Changed
 

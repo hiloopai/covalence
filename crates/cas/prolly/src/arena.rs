@@ -5,7 +5,7 @@ use covalence_lib_cid::{Bdasl, Cid};
 use covalence_lib_error::snafu::OptionExt;
 
 use crate::{
-    ArenaFullSnafu, Entry, Error, InvalidMapIdSnafu, Layout, LexiconLayout, Tree,
+    ArenaFullSnafu, Edit, Entry, Error, InvalidMapIdSnafu, Layout, LexiconLayout, Tree,
     build::build_root, cache::Cache,
 };
 
@@ -85,5 +85,21 @@ impl<L: Layout> Arena<L> {
             cache: self.cache.clone(),
             root,
         })
+    }
+
+    /// Apply edits to a slot and return its new root CID.
+    ///
+    /// Edits must be in strictly increasing bytewise key order.
+    /// Returns [`Error::InvalidMapId`] if the index is out of bounds.
+    /// The slot changes only on success. Earlier snapshots keep their roots,
+    /// and a failed edit can leave unreferenced blocks in the store.
+    pub fn apply(
+        &mut self,
+        id: MapId,
+        edits: impl IntoIterator<Item = Edit<L::Key, L::Value>>,
+    ) -> Result<Cid<Bdasl>, Error> {
+        let root = self.get(id)?.apply(edits)?.root();
+        self.roots[id.0 as usize] = root;
+        Ok(root)
     }
 }

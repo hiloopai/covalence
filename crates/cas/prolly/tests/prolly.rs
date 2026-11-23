@@ -545,7 +545,13 @@ fn arena_build_paths_share_roots_and_only_insert_allocates() {
         assert_eq!(arena.store_map(entries.clone()).unwrap(), want);
         LexiconTree::open(cas.clone(), want).verify().unwrap();
         // The other arena's next index is still out of range here.
+        cas.take();
         assert!(matches!(arena.get(next), Err(Error::InvalidMapId)));
+        assert!(matches!(
+            arena.apply(next, [Edit::Remove("a".into())]),
+            Err(Error::InvalidMapId)
+        ));
+        assert_eq!(cas.take(), (0, 0));
         let id = arena.insert_map(entries).unwrap();
         cas.take();
         assert_eq!(arena.get(id).unwrap().root(), want);
@@ -605,6 +611,55 @@ fn arena_shares_decoded_nodes_between_distinct_roots() {
     assert_eq!(second.get(b"a").unwrap(), Some(Value::Null));
     assert_eq!(cas.take(), (0, 0));
     assert_eq!(second.get(b"z").unwrap(), Some(Value::Integer(2)));
+}
+
+#[test]
+fn arena_apply_updates_one_slot_and_preserves_snapshots() {
+    let cas = Arc::new(Counting::default());
+    let mut arena = Arena::<LexiconLayout>::new(cas.clone());
+    let entries = |a, z| {
+        [
+            ("a".into(), Value::Integer(a)),
+            ("b066".into(), Value::Null),
+            ("z".into(), Value::Integer(z)),
+        ]
+    };
+    let id = arena.insert_map(entries(1, 2)).unwrap();
+    let sibling = arena.insert_map(entries(1, 2)).unwrap();
+    assert_ne!(id, sibling);
+    let snapshot = arena.get(id).unwrap();
+    let want = arena.map_cid(entries(3, 4)).unwrap();
+    let first_leaf = arena.map_cid(entries(3, 4).into_iter().take(2)).unwrap();
+    assert!(!cas.has(&first_leaf.into()).unwrap());
+    let edits = || {
+        [
+            Edit::Insert("a".into(), Value::Integer(3)),
+            Edit::Insert("z".into(), Value::Integer(4)),
+        ]
+    };
+
+    cas.take();
+    cas.fail_put.store(2, Relaxed);
+    assert!(matches!(arena.apply(id, edits()), Err(Error::Cas { .. })));
+    assert_eq!(cas.take().1, 2);
+    assert!(cas.has(&first_leaf.into()).unwrap());
+    assert_eq!(arena.get(id).unwrap().root(), snapshot.root());
+
+    cas.fail_put.store(0, Relaxed);
+    assert_eq!(arena.apply(id, edits()).unwrap(), want);
+    assert_eq!(arena.get(id).unwrap().root(), want);
+    assert_eq!(arena.get(sibling).unwrap().root(), snapshot.root());
+    drop(arena);
+
+    assert_eq!(snapshot.get(b"a").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(snapshot.get(b"z").unwrap(), Some(Value::Integer(2)));
+    LexiconTree::open(cas.clone(), snapshot.root())
+        .verify()
+        .unwrap();
+    let changed = LexiconTree::open(cas, want);
+    changed.verify().unwrap();
+    assert_eq!(changed.get(b"a").unwrap(), Some(Value::Integer(3)));
+    assert_eq!(changed.get(b"z").unwrap(), Some(Value::Integer(4)));
 }
 
 /// Keys blocks by SHA-256, so it cannot find nodes by their CIDs.
